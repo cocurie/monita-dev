@@ -1,0 +1,42 @@
+
+This directory is intended for PlatformIO Test Runner and project tests.
+
+Unit Testing is a software testing method by which individual units of
+source code, sets of one or more MCU program modules together with associated
+control data, usage procedures, and operating procedures, are tested to
+determine whether they are fit for use. Unit testing finds problems early
+in the development cycle.
+
+More information about PlatformIO Unit Testing:
+- https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
+# XIAO + SIM7080G LTE-M 通信 留意点まとめ
+
+## 配線・電源
+
+- UART は **D6(TX) / D7(RX)**。電源は **5V 必須**（3.3V では起動しない）。
+- **GND は必ず XIAO と共通**にする。
+- **アンテナ未接続**では AT は通ってもネットワーク接続はできない。
+- 送信ピーク電流が **約 2A** あり得るため、XIAO → SIM7080 間には **コンデンサ（例: 1000μF）** を入れる。
+
+## UART 通信
+
+- SIM7080G の **デフォルトボーレートは 115200bps**。
+- AT コマンドの改行は **`\r\n`**（Sigfox の `\r` とは異なる）。
+- **`AT+SHBOD` 後のボディは `sendAT()` 経由ではなく、`Serial1.print()` で直接送る。**
+
+## ネットワーク接続順序
+
+- **`AT+CNMP=38` → `AT+CMNB=1` → APN 設定 → `AT+CREG?` 確認 → `AT+CNACT=0,1`** の順を守る。
+- `AT+CNACT=0,1` は **すでにアクティブな場合 ERROR** を返してもよい。**`AT+CNACT?` で IP が取れていれば OK** と判断する。
+- 日本では **`+CREG: 0,5`（ローミング）** が正常な接続状態のことがある。
+
+## HTTPS 通信
+
+- **`AT+SHCONN` の前に `AT+CSSLCFG` で SSL 設定**が必要。
+- サイズ指定は **`BODYSIZE` / `HEADERSIZE` ではなく `BODYLEN` / `HEADERLEN` が正しい**コマンド名。
+- InfluxDB などでの書き込み成功レスポンスは **204 No Content**。
+
+## InfluxDB
+
+- データ形式は **Line Protocol**（`measurement,tag=value field=value`）。
+- **`AT+CNACT=0,1` で PDP を有効化しないと `AT+SHCONN` が ERROR** になり得る。
