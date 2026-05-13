@@ -504,25 +504,56 @@ static int measureMPU() {
 // nRF52840 XIAO: SDA=D4, SCL=D5
 // 戻り値: true = SDA が HIGH に戻った（通信可能）、false = SDA がまだ LOW（デバイス損傷等）
 static bool i2cRecover() {
+#if DEBUG_MODE
+  Serial.println("[I2C] step1: TWIM stop...");
+  Serial.flush();
+#endif
+  // nrfx ドライバより先にハード側で TWIM を強制停止（Wire.end() がハングする場合の対策）
+  NRF_TWIM0->TASKS_STOP = 1;
+  __DSB();
+  delayMicroseconds(200);
+  NRF_TWIM0->ENABLE = 0;  // TWIM 無効化
+  __DSB();
+#if DEBUG_MODE
+  Serial.println("[I2C] step2: Wire.end...");
+  Serial.flush();
+#endif
   Wire.end();
+#if DEBUG_MODE
+  Serial.println("[I2C] step3: GPIO clock...");
+  Serial.flush();
+#endif
   pinMode(5, OUTPUT);       // SCL
-  pinMode(4, INPUT_PULLUP); // SDA（デバイス側が解放するのを待つ）
+  pinMode(4, INPUT_PULLUP); // SDA
   for (int i = 0; i < 9; i++) {
     digitalWrite(5, HIGH); delayMicroseconds(5);
     digitalWrite(5, LOW);  delayMicroseconds(5);
   }
-  // STOP 条件: SCL HIGH 中に SDA LOW→HIGH
+  // STOP 条件
   pinMode(4, OUTPUT);
   digitalWrite(4, LOW);
   digitalWrite(5, HIGH); delayMicroseconds(5);
   digitalWrite(4, HIGH); delayMicroseconds(5);
-  // SDA がまだ LOW なら Wire.begin() 自体がハングするためスキップして false を返す
+  // SDA 確認
   pinMode(4, INPUT_PULLUP);
   delayMicroseconds(20);
+#if DEBUG_MODE
+  Serial.print("[I2C] step4: SDA=");
+  Serial.println(digitalRead(4));
+  Serial.flush();
+#endif
   if (digitalRead(4) == LOW) return false;
+#if DEBUG_MODE
+  Serial.println("[I2C] step5: Wire.begin...");
+  Serial.flush();
+#endif
   Wire.begin();
   Wire.setClock(100000);
   delay(5);
+#if DEBUG_MODE
+  Serial.println("[I2C] step6: done");
+  Serial.flush();
+#endif
   return true;
 }
 
