@@ -500,61 +500,95 @@ static int measureMPU() {
 // 戻り値: 温度×10 の int（例: 253 = 25.3℃）。MPU の pitch 値と同じ単位。
 // ============================================================
 
-// I2C バスリカバリ（SCL を 9 回クロックして SDA を解放し STOP を発行）
-// nRF52840 XIAO: SDA=D4, SCL=D5
-// 戻り値: true = SDA が HIGH に戻った（通信可能）、false = SDA がまだ LOW（デバイス損傷等）
-static bool i2cRecover() {
-#if DEBUG_MODE
-  Serial.println("[I2C] step1: TWIM stop...");
-  Serial.flush();
-#endif
-  // nrfx ドライバより先にハード側で TWIM を強制停止（Wire.end() がハングする場合の対策）
-  NRF_TWIM0->TASKS_STOP = 1;
-  __DSB();
-  delayMicroseconds(200);
-  NRF_TWIM0->ENABLE = 0;  // TWIM 無効化
-  __DSB();
-#if DEBUG_MODE
-  Serial.println("[I2C] step2: Wire.end...");
-  Serial.flush();
-#endif
-  Wire.end();
-#if DEBUG_MODE
-  Serial.println("[I2C] step3: GPIO clock...");
-  Serial.flush();
-#endif
-  pinMode(5, OUTPUT);       // SCL
-  pinMode(4, INPUT_PULLUP); // SDA
-  for (int i = 0; i < 9; i++) {
-    digitalWrite(5, HIGH); delayMicroseconds(5);
-    digitalWrite(5, LOW);  delayMicroseconds(5);
+// ============================================================
+// DS3231 用ビットバン I2C
+//
+// nRF52840 TWIM は clock stretch 中のデバイスを待ち続けてハングする。
+// Wire.endTransmission() を使わず GPIO で直接制御し、
+// SCL/SDA の各ビット操作にタイムアウトを設ける。
+// nRF52840 XIAO: SDA=D4(open-drain), SCL=D5(open-drain)
+// ============================================================
+
+#define BB_SDA_PIN     4
+#define BB_SCL_PIN     5
+#define BB_HALF_US     5       // half bit period（約 100 kHz 相当）
+#define BB_STRETCH_US  1000    // clock stretch タイムアウト
+
+static void bbSdaRelease() { pinMode(BB_SDA_PIN, INPUT_PULLUP); }
+static void bbSdaLow()     { pinMode(BB_SDA_PIN, OUTPUT); digitalWrite(BB_SDA_PIN, LOW); }
+static void bbSclLow()     { pinMode(BB_SCL_PIN, OUTPUT); digitalWrite(BB_SCL_PIN, LOW); }
+
+// SCL を解放し、スレーブが stretch を終えるまで待つ（タイムアウトあり）
+static bool bbSclHigh() {
+  pinMode(BB_SCL_PIN, INPUT_PULLUP);
+  unsigned long t = micros();
+  while (!digitalRead(BB_SCL_PIN)) {
+    if ((unsigned long)(micros() - t) > BB_STRETCH_US) return false;
   }
-  // STOP 条件
-  pinMode(4, OUTPUT);
-  digitalWrite(4, LOW);
-  digitalWrite(5, HIGH); delayMicroseconds(5);
-  digitalWrite(4, HIGH); delayMicroseconds(5);
-  // SDA 確認
-  pinMode(4, INPUT_PULLUP);
-  delayMicroseconds(20);
-#if DEBUG_MODE
-  Serial.print("[I2C] step4: SDA=");
-  Serial.println(digitalRead(4));
-  Serial.flush();
-#endif
-  if (digitalRead(4) == LOW) return false;
-#if DEBUG_MODE
-  Serial.println("[I2C] step5: Wire.begin...");
-  Serial.flush();
-#endif
-  Wire.begin();
-  Wire.setClock(100000);
-  delay(5);
-#if DEBUG_MODE
-  Serial.println("[I2C] step6: done");
-  Serial.flush();
-#endif
   return true;
+}
+
+// START 条件
+static bool bbStart() {
+  bbSdaRelease();
+  if (!bbSclHigh()) return false;
+  delayMicroseconds(BB_HALF_US);
+  if (!digitalRead(BB_SDA_PIN)) return false; // bus busy
+  bbSdaLow(); delayMicroseconds(BB_HALF_US);
+  bbSclLow();  delayMicroseconds(BB_HALF_US);
+  return true;
+}
+
+// Repeated START
+static bool bbRestart() {
+  bbSdaRelease(); delayMicroseconds(BB_HALF_US);
+  if (!bbSclHigh()) return false;
+  delayMicroseconds(BB_HALF_US);
+  bbSdaLow(); delayMicroseconds(BB_HALF_US);
+  bbSclLow();  delayMicroseconds(BB_HALF_US);
+  return true;
+}
+
+// STOP 条件
+static void bbStop() {
+  bbSdaLow(); delayMicroseconds(BB_HALF_US);
+  bbSclHigh(); delayMicroseconds(BB_HALF_US);
+  bbSdaRelease(); delayMicroseconds(BB_HALF_US);
+}
+
+// 1 バイト送信。ACK（LOW）が返れば true
+static bool bbWrite(uint8_t b) {
+  for (int i = 7; i >= 0; i--) {
+    if (b & (1 << i)) bbSdaRelease(); else bbSdaLow();
+    delayMicroseconds(BB_HALF_US);
+    if (!bbSclHigh()) { bbSdaRelease(); return false; }
+    delayMicroseconds(BB_HALF_US);
+    bbSclLow(); delayMicroseconds(BB_HALF_US);
+  }
+  bbSdaRelease(); delayMicroseconds(BB_HALF_US);
+  if (!bbSclHigh()) return false;
+  bool ack = (digitalRead(BB_SDA_PIN) == LOW);
+  delayMicroseconds(BB_HALF_US);
+  bbSclLow(); delayMicroseconds(BB_HALF_US);
+  return ack;
+}
+
+// 1 バイト受信。sendAck=false が最終バイト（NACK を返す）
+static uint8_t bbRead(bool sendAck) {
+  uint8_t b = 0;
+  bbSdaRelease();
+  for (int i = 7; i >= 0; i--) {
+    delayMicroseconds(BB_HALF_US);
+    bbSclHigh(); delayMicroseconds(BB_HALF_US);
+    if (digitalRead(BB_SDA_PIN)) b |= (1 << i);
+    bbSclLow(); delayMicroseconds(BB_HALF_US);
+  }
+  if (sendAck) bbSdaLow(); else bbSdaRelease();
+  delayMicroseconds(BB_HALF_US);
+  bbSclHigh(); delayMicroseconds(BB_HALF_US);
+  bbSclLow();  delayMicroseconds(BB_HALF_US);
+  bbSdaRelease();
+  return b;
 }
 
 static int measureDS3231() {
@@ -562,43 +596,42 @@ static int measureDS3231() {
   Serial.println("[DS3231] reading temperature ...");
   Serial.flush();
 #endif
-  if (!i2cRecover()) {
+  // TWIM を解放してビットバン I2C に切り替え（Wire.endTransmission がハングする問題を回避）
+  Wire.end();
+
+  bool ok = false;
+  int8_t  msb = 0;
+  uint8_t lsb = 0;
+
+  if (bbStart()
+   && bbWrite((0x68u << 1) | 0u)  // address + write
+   && bbWrite(0x11u))              // 温度 MSB レジスタ
+  {
+    if (bbRestart() && bbWrite((0x68u << 1) | 1u)) {  // address + read
+      msb = (int8_t)bbRead(true);   // ACK: 続きあり
+      lsb = bbRead(false);          // NACK: 最終バイト
+      ok  = true;
+    }
+  }
+  bbStop();
+
+  // Wire を復元（TCA の tcaDisable() 等が使えるように）
+  Wire.begin();
+  Wire.setClock(100000);
+  delay(5);
+
 #if DEBUG_MODE
-    Serial.println("[DS3231] SDA stuck LOW — device damaged or disconnected");
-    Serial.flush();
+  Serial.print("[DS3231] bb ok=");
+  Serial.println(ok);
+  Serial.flush();
 #endif
+
+  if (!ok) {
     s_errors |= ERR_DS3231_I2C;
     statusErrorRed();
     return 0;
   }
 
-  Wire.beginTransmission(0x68);
-  Wire.write(0x11);
-  uint8_t err = Wire.endTransmission(true);  // stop を出してバスを解放
-#if DEBUG_MODE
-  Serial.print("[DS3231] endTransmission=");
-  Serial.println(err);
-  Serial.flush();
-#endif
-  if (err != 0) {
-    s_errors |= ERR_DS3231_I2C;
-    statusErrorRed();
-    return 0;
-  }
-  // stop 後に requestFrom で改めて read start を発行
-  uint8_t n = Wire.requestFrom((uint8_t)0x68, (uint8_t)2, (uint8_t)true);
-#if DEBUG_MODE
-  Serial.print("[DS3231] requestFrom n=");
-  Serial.println(n);
-  Serial.flush();
-#endif
-  if (n < 2) {
-    s_errors |= ERR_DS3231_I2C;
-    statusErrorRed();
-    return 0;
-  }
-  int8_t  msb = (int8_t)Wire.read();
-  uint8_t lsb = Wire.read();
   float frac = ((lsb >> 6) & 0x03) * 0.25f;
   float tempC = (float)msb + (msb >= 0 ? frac : -frac);
   return (int)(tempC * 10.0f);
