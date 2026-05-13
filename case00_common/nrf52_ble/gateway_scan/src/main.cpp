@@ -40,6 +40,17 @@ uint32_t windowStart = 0;
 // ユーティリティ
 // ───────────────────────────────
 
+/** 起動からの経過時間を "HH:MM:SS" 形式で返す */
+void printTimestamp() {
+  uint32_t s = millis() / 1000UL;
+  uint32_t h = s / 3600;
+  uint32_t m = (s % 3600) / 60;
+  uint32_t sec = s % 60;
+  char buf[10];
+  snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu", h, m, sec);
+  Serial.print(buf);
+}
+
 int findDevice(uint8_t* mac) {
   for (int i = 0; i < deviceCount; i++) {
     if (memcmp(devices[i].mac, mac, 6) == 0) return i;
@@ -181,7 +192,9 @@ void loop() {
       int people = estimatePeople();
 
       Serial.println("==============================");
-      Serial.print("[People] ");
+      Serial.print("[");
+      printTimestamp();
+      Serial.print("] People=");
       Serial.print(people);
       Serial.print(" (devices=");
       Serial.print(deviceCount);
