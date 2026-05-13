@@ -516,15 +516,14 @@ static bool i2cRecover() {
   digitalWrite(4, LOW);
   digitalWrite(5, HIGH); delayMicroseconds(5);
   digitalWrite(4, HIGH); delayMicroseconds(5);
-  // Wire.begin() の前に SDA の状態を確認
-  // SDA がまだ LOW なら Wire を再初期化してもハングするため先に判断する
+  // SDA がまだ LOW なら Wire.begin() 自体がハングするためスキップして false を返す
   pinMode(4, INPUT_PULLUP);
   delayMicroseconds(20);
-  bool sdaOk = (digitalRead(4) == HIGH);
+  if (digitalRead(4) == LOW) return false;
   Wire.begin();
   Wire.setClock(100000);
   delay(5);
-  return sdaOk;
+  return true;
 }
 
 static int measureDS3231() {
