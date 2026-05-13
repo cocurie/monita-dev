@@ -86,7 +86,10 @@
 #define NEOPIXEL_COUNT 1
 #endif
 
-// 各スロット i（0〜3）が CH(i+1) に相当。1=HX711、2=TCA 経由で MPU6050 等（I2C 0x68）
+// 各スロット i（0〜3）が CH(i+1) に相当。
+//   1 = HX711（ロードセル）
+//   2 = TCA 経由 MPU6050（I2C 0x68）→ ピッチ角×10
+//   3 = TCA 経由 DS3231（I2C 0x68）→ 温度×10
 const uint8_t CH_ASSIGN[4] = {2, 2, 2, 2};
 
 // HX711 1ch あたりの生サンプル数（中央値をとる前の個数）
@@ -135,6 +138,7 @@ enum : uint32_t {
   ERR_MPU_I2C = 1u << 1,
   ERR_TCA_I2C = 1u << 2,
   ERR_SIGFOX_AT = 1u << 3,
+  ERR_DS3231_I2C = 1u << 4,
 };
 
 static uint32_t s_errors;
@@ -488,6 +492,50 @@ static int measureMPU() {
 }
 
 // ============================================================
+// DS3231（I2C 0x68）— 内蔵温度センサから温度×10（度×10）
+//
+// reg 0x11: 符号付き 8bit 整数部℃
+// reg 0x12: bit7-6 が 0.25℃ 単位の小数部（00=0, 01=0.25, 10=0.50, 11=0.75）
+// 戻り値: 温度×10 の int（例: 253 = 25.3℃）。MPU の pitch 値と同じ単位。
+// ============================================================
+
+static int measureDS3231() {
+#if DEBUG_MODE
+  Serial.println("[DS3231] reading temperature ...");
+  Serial.flush();
+#endif
+  Wire.beginTransmission(0x68);
+  Wire.write(0x11);
+  uint8_t err = Wire.endTransmission(false);
+#if DEBUG_MODE
+  Serial.print("[DS3231] endTransmission(false)=");
+  Serial.println(err);
+  Serial.flush();
+#endif
+  if (err != 0) {
+    s_errors |= ERR_DS3231_I2C;
+    statusErrorRed();
+    return 0;
+  }
+  uint8_t n = Wire.requestFrom((uint8_t)0x68, (uint8_t)2);
+#if DEBUG_MODE
+  Serial.print("[DS3231] requestFrom n=");
+  Serial.println(n);
+  Serial.flush();
+#endif
+  if (n < 2) {
+    s_errors |= ERR_DS3231_I2C;
+    statusErrorRed();
+    return 0;
+  }
+  int8_t  msb = (int8_t)Wire.read();
+  uint8_t lsb = Wire.read();
+  float frac = ((lsb >> 6) & 0x03) * 0.25f;
+  float tempC = (float)msb + (msb >= 0 ? frac : -frac);
+  return (int)(tempC * 10.0f);
+}
+
+// ============================================================
 // 1 サイクル分の計測結果（グローバル: Sigfox 組み立てで参照）
 // ============================================================
 
@@ -530,6 +578,28 @@ static void measureAll() {
         ch[i] = 0;
       } else {
         ch[i] = measureMPU();
+      }
+      tcaDisable();
+    } else if (CH_ASSIGN[i] == 3) {
+      // DS3231 温度センサ: TCA のチャネル i（0 origin）に切替
+#if DEBUG_MODE
+      Serial.print("[TCA] select ch");
+      Serial.print(i);
+      Serial.println(" for DS3231 ...");
+      Serial.flush();
+#endif
+      uint8_t tcaErr = tcaSelect((uint8_t)i);
+#if DEBUG_MODE
+      Serial.print("[TCA] endTransmission=");
+      Serial.println(tcaErr);
+      Serial.flush();
+#endif
+      if (tcaErr != 0) {
+        s_errors |= ERR_TCA_I2C;
+        statusErrorRed();
+        ch[i] = 0;
+      } else {
+        ch[i] = measureDS3231();
       }
       tcaDisable();
     }
