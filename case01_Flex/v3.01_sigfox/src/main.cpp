@@ -501,9 +501,10 @@ static int measureMPU() {
 
 // I2C バスリカバリ（SCL を 9 回クロックして SDA を解放し STOP を発行）
 // nRF52840 XIAO: SDA=D4, SCL=D5
-static void i2cRecover() {
+// 戻り値: true = SDA が HIGH に戻った（通信可能）、false = SDA がまだ LOW（デバイス損傷等）
+static bool i2cRecover() {
   Wire.end();
-  pinMode(5, OUTPUT);      // SCL
+  pinMode(5, OUTPUT);       // SCL
   pinMode(4, INPUT_PULLUP); // SDA（デバイス側が解放するのを待つ）
   for (int i = 0; i < 9; i++) {
     digitalWrite(5, HIGH); delayMicroseconds(5);
@@ -514,9 +515,15 @@ static void i2cRecover() {
   digitalWrite(4, LOW);
   digitalWrite(5, HIGH); delayMicroseconds(5);
   digitalWrite(4, HIGH); delayMicroseconds(5);
+  // Wire.begin() の前に SDA の状態を確認
+  // SDA がまだ LOW なら Wire を再初期化してもハングするため先に判断する
+  pinMode(4, INPUT_PULLUP);
+  delayMicroseconds(20);
+  bool sdaOk = (digitalRead(4) == HIGH);
   Wire.begin();
   Wire.setClock(100000);
   delay(5);
+  return sdaOk;
 }
 
 static int measureDS3231() {
@@ -524,7 +531,15 @@ static int measureDS3231() {
   Serial.println("[DS3231] reading temperature ...");
   Serial.flush();
 #endif
-  i2cRecover();
+  if (!i2cRecover()) {
+#if DEBUG_MODE
+    Serial.println("[DS3231] SDA stuck LOW — device damaged or disconnected");
+    Serial.flush();
+#endif
+    s_errors |= ERR_DS3231_I2C;
+    statusErrorRed();
+    return 0;
+  }
 
   Wire.beginTransmission(0x68);
   Wire.write(0x11);
