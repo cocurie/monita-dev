@@ -90,7 +90,7 @@
 //   1 = HX711（ロードセル）
 //   2 = TCA 経由 MPU6050（I2C 0x68）→ ピッチ角×10
 //   3 = TCA 経由 DS3231（I2C 0x68）→ 温度×10
-const uint8_t CH_ASSIGN[4] = {2, 2, 2, 2};
+const uint8_t CH_ASSIGN[4] = {3, 3, 3, 3};
 
 // HX711 1ch あたりの生サンプル数（中央値をとる前の個数）
 #define DATA_NUM 3
@@ -504,9 +504,16 @@ static int measureDS3231() {
   Serial.println("[DS3231] reading temperature ...");
   Serial.flush();
 #endif
+  // バスロック対策: 再初期化してから通信（発熱等で前回が途中終了した場合に有効）
+  Wire.end();
+  delay(5);
+  Wire.begin();
+  Wire.setClock(100000);
+  delay(5);
+
   Wire.beginTransmission(0x68);
   Wire.write(0x11);
-  uint8_t err = Wire.endTransmission(false);
+  uint8_t err = Wire.endTransmission(true);  // stop を出してバスを解放
 #if DEBUG_MODE
   Serial.print("[DS3231] endTransmission(false)=");
   Serial.println(err);
@@ -517,7 +524,8 @@ static int measureDS3231() {
     statusErrorRed();
     return 0;
   }
-  uint8_t n = Wire.requestFrom((uint8_t)0x68, (uint8_t)2);
+  // stop 後に requestFrom で改めて read start を発行
+  uint8_t n = Wire.requestFrom((uint8_t)0x68, (uint8_t)2, (uint8_t)true);
 #if DEBUG_MODE
   Serial.print("[DS3231] requestFrom n=");
   Serial.println(n);
