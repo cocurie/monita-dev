@@ -6,10 +6,17 @@
 #include <Adafruit_TinyUSB.h>
 #include <bluefruit.h>
 #include <string.h>
+#include <Adafruit_LittleFS.h>
+#include <InternalFileSystem.h>
+using namespace Adafruit_LittleFS_Namespace;
 
 // ── 出力 ─────────────────────────
 static bool const OUTPUT_RAW_LOG = false;
 static bool const OUTPUT_PEOPLE  = true;
+
+// ── ログ設定 ──────────────────────
+static bool const ENABLE_LOGGING = true;    // false にするとフラッシュ書き込みなし
+static char const* LOG_FILE      = "/log.csv";
 
 // ── パラメータ ───────────────────
 static uint32_t const WINDOW_MS   = 60000;
@@ -36,6 +43,9 @@ int deviceCount = 0;
 
 uint32_t windowStart = 0;
 
+// ── LittleFS ファイルハンドル ────
+File logFile(InternalFS);
+
 // ───────────────────────────────
 // ユーティリティ
 // ───────────────────────────────
@@ -49,6 +59,46 @@ void printTimestamp() {
   char buf[10];
   snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu", h, m, sec);
   Serial.print(buf);
+}
+
+/** 現在の経過時間を CSV 1行としてフラッシュに追記 */
+void logRecord(int people, int devCount) {
+  if (!ENABLE_LOGGING) return;
+
+  logFile.open(LOG_FILE, FILE_O_WRITE);
+  if (!logFile) return;
+  logFile.seek(0, SeekEnd);  // 末尾に追記
+
+  char ts[10];
+  uint32_t s = millis() / 1000UL;
+  snprintf(ts, sizeof(ts), "%02lu:%02lu:%02lu",
+           s / 3600, (s % 3600) / 60, s % 60);
+
+  logFile.print(ts);
+  logFile.print(",");
+  logFile.print(people);
+  logFile.print(",");
+  logFile.println(devCount);
+  logFile.close();
+}
+
+/** フラッシュに保存された全レコードをシリアルに出力 */
+void dumpLog() {
+  if (!ENABLE_LOGGING) {
+    Serial.println("[LOG] Logging is disabled.");
+    return;
+  }
+  logFile.open(LOG_FILE, FILE_O_READ);
+  if (!logFile) {
+    Serial.println("[LOG] No log file found.");
+    return;
+  }
+  Serial.println("=== LOG DUMP ===");
+  while (logFile.available()) {
+    Serial.write(logFile.read());
+  }
+  logFile.close();
+  Serial.println("=== END ===");
 }
 
 int findDevice(uint8_t* mac) {
@@ -164,6 +214,20 @@ void setup() {
 
   Serial.println("\n--- BLE People Counter (Clustering) ---");
 
+  // ── フラッシュ初期化 ─────────────
+  if (ENABLE_LOGGING) {
+    InternalFS.begin();
+    if (!InternalFS.exists(LOG_FILE)) {
+      logFile.open(LOG_FILE, FILE_O_WRITE);
+      logFile.println("timestamp,people,devices");
+      logFile.close();
+      Serial.println("[LOG] Created new log file.");
+    } else {
+      Serial.println("[LOG] Log file found. Appending.");
+    }
+    Serial.println("[LOG] Send 'd' to dump log.");
+  }
+
   Bluefruit.begin(1, 0);
   Bluefruit.setName("PeopleCounter");
 
@@ -186,6 +250,12 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
+  // ── Serial コマンド処理 ──────────
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    if (cmd == 'd' || cmd == 'D') dumpLog();
+  }
+
   if (now - windowStart >= WINDOW_MS) {
 
     if (OUTPUT_PEOPLE) {
@@ -199,6 +269,8 @@ void loop() {
       Serial.print(" (devices=");
       Serial.print(deviceCount);
       Serial.println(")");
+
+      logRecord(people, deviceCount);  // フラッシュに記録
     }
 
     // リセット
