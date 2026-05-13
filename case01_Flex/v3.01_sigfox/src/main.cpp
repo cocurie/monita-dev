@@ -87,10 +87,11 @@
 #endif
 
 // 各スロット i（0〜3）が CH(i+1) に相当。
+//   0 = 未使用（ch[i]=0 固定、エラーなし）
 //   1 = HX711（ロードセル）
 //   2 = TCA 経由 MPU6050（I2C 0x68）→ ピッチ角×10
 //   3 = TCA 経由 DS3231（I2C 0x68）→ 温度×10
-const uint8_t CH_ASSIGN[4] = {3, 3, 3, 3};
+const uint8_t CH_ASSIGN[4] = {3, 0, 0, 0};
 
 // HX711 1ch あたりの生サンプル数（中央値をとる前の個数）
 #define DATA_NUM 3
@@ -592,7 +593,9 @@ static void measureAll() {
 
   for (int i = 0; i < 4; i++) {
 
-    if (CH_ASSIGN[i] == 1) {
+    if (CH_ASSIGN[i] == 0) {
+      ch[i] = 0; // 未使用スロット
+    } else if (CH_ASSIGN[i] == 1) {
       // 物理 CH は 1 origin（MUX と正本 JP の対応）
       hxBegin((uint8_t)(i + 1));
       hxRead(&ch[i]);
