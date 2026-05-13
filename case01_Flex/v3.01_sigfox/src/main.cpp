@@ -499,23 +499,38 @@ static int measureMPU() {
 // 戻り値: 温度×10 の int（例: 253 = 25.3℃）。MPU の pitch 値と同じ単位。
 // ============================================================
 
+// I2C バスリカバリ（SCL を 9 回クロックして SDA を解放し STOP を発行）
+// nRF52840 XIAO: SDA=D4, SCL=D5
+static void i2cRecover() {
+  Wire.end();
+  pinMode(5, OUTPUT);      // SCL
+  pinMode(4, INPUT_PULLUP); // SDA（デバイス側が解放するのを待つ）
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(5, HIGH); delayMicroseconds(5);
+    digitalWrite(5, LOW);  delayMicroseconds(5);
+  }
+  // STOP 条件: SCL HIGH 中に SDA LOW→HIGH
+  pinMode(4, OUTPUT);
+  digitalWrite(4, LOW);
+  digitalWrite(5, HIGH); delayMicroseconds(5);
+  digitalWrite(4, HIGH); delayMicroseconds(5);
+  Wire.begin();
+  Wire.setClock(100000);
+  delay(5);
+}
+
 static int measureDS3231() {
 #if DEBUG_MODE
   Serial.println("[DS3231] reading temperature ...");
   Serial.flush();
 #endif
-  // バスロック対策: 再初期化してから通信（発熱等で前回が途中終了した場合に有効）
-  Wire.end();
-  delay(5);
-  Wire.begin();
-  Wire.setClock(100000);
-  delay(5);
+  i2cRecover();
 
   Wire.beginTransmission(0x68);
   Wire.write(0x11);
   uint8_t err = Wire.endTransmission(true);  // stop を出してバスを解放
 #if DEBUG_MODE
-  Serial.print("[DS3231] endTransmission(false)=");
+  Serial.print("[DS3231] endTransmission=");
   Serial.println(err);
   Serial.flush();
 #endif
