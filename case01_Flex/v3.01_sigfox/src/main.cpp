@@ -598,18 +598,44 @@ static int measureDS3231() {
 #endif
   // TWIM を解放してビットバン I2C に切り替え（Wire.endTransmission がハングする問題を回避）
   Wire.end();
+  delay(5);  // ピン安定待ち
+
+#if DEBUG_MODE
+  // Wire.end() 後のピン状態確認
+  pinMode(BB_SDA_PIN, INPUT_PULLUP);
+  pinMode(BB_SCL_PIN, INPUT_PULLUP);
+  delayMicroseconds(50);
+  Serial.print("[BB] SDA="); Serial.print(digitalRead(BB_SDA_PIN));
+  Serial.print(" SCL="); Serial.println(digitalRead(BB_SCL_PIN));
+  Serial.flush();
+#endif
 
   bool ok = false;
   int8_t  msb = 0;
   uint8_t lsb = 0;
 
-  if (bbStart()
-   && bbWrite((0x68u << 1) | 0u)  // address + write
-   && bbWrite(0x11u))              // 温度 MSB レジスタ
-  {
-    if (bbRestart() && bbWrite((0x68u << 1) | 1u)) {  // address + read
-      msb = (int8_t)bbRead(true);   // ACK: 続きあり
-      lsb = bbRead(false);          // NACK: 最終バイト
+  bool s1  = bbStart();
+#if DEBUG_MODE
+  Serial.print("[BB] start="); Serial.println(s1); Serial.flush();
+#endif
+  bool s2 = s1 && bbWrite((0x68u << 1) | 0u);
+#if DEBUG_MODE
+  Serial.print("[BB] addr_w="); Serial.println(s2); Serial.flush();
+#endif
+  bool s3 = s2 && bbWrite(0x11u);
+#if DEBUG_MODE
+  Serial.print("[BB] reg="); Serial.println(s3); Serial.flush();
+#endif
+  if (s3) {
+    bool s4 = bbRestart();
+    bool s5 = s4 && bbWrite((0x68u << 1) | 1u);
+#if DEBUG_MODE
+    Serial.print("[BB] restart="); Serial.print(s4);
+    Serial.print(" addr_r="); Serial.println(s5); Serial.flush();
+#endif
+    if (s5) {
+      msb = (int8_t)bbRead(true);
+      lsb = bbRead(false);
       ok  = true;
     }
   }
