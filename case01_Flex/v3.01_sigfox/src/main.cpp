@@ -501,164 +501,105 @@ static int measureMPU() {
 // ============================================================
 
 // ============================================================
-// DS3231 用ビットバン I2C
+// DS3231（I2C 0x68）— TWIM 直接操作でタイムアウト付き温度読み出し
 //
-// nRF52840 TWIM は clock stretch 中のデバイスを待ち続けてハングする。
-// Wire.endTransmission() を使わず GPIO で直接制御し、
-// SCL/SDA の各ビット操作にタイムアウトを設ける。
-// nRF52840 XIAO: SDA=D4(open-drain), SCL=D5(open-drain)
+// 問題: Wire.endTransmission() は nRF52840 TWIM が SCL を LOW に
+//       残したまま返るため、次の通信がハングする。
+// 対策: Wire.end() 前に PSEL レジスタ（NRF ピン番号）を保存し、
+//       Wire.end() 後に TWIM ハードを直接再起動してポーリング。
+//       100 ms 以内に完了しなければ TASKS_STOP で強制終了する。
 // ============================================================
-
-#define BB_SDA_PIN     4
-#define BB_SCL_PIN     5
-#define BB_HALF_US     5       // half bit period（約 100 kHz 相当）
-#define BB_STRETCH_US  1000    // clock stretch タイムアウト
-
-static void bbSdaRelease() { pinMode(BB_SDA_PIN, INPUT_PULLUP); }
-static void bbSdaLow()     { pinMode(BB_SDA_PIN, OUTPUT); digitalWrite(BB_SDA_PIN, LOW); }
-static void bbSclLow()     { pinMode(BB_SCL_PIN, OUTPUT); digitalWrite(BB_SCL_PIN, LOW); }
-
-// SCL を解放し、スレーブが stretch を終えるまで待つ（タイムアウトあり）
-static bool bbSclHigh() {
-  pinMode(BB_SCL_PIN, INPUT_PULLUP);
-  unsigned long t = micros();
-  while (!digitalRead(BB_SCL_PIN)) {
-    if ((unsigned long)(micros() - t) > BB_STRETCH_US) return false;
-  }
-  return true;
-}
-
-// START 条件
-static bool bbStart() {
-  bbSdaRelease();
-  if (!bbSclHigh()) return false;
-  delayMicroseconds(BB_HALF_US);
-  if (!digitalRead(BB_SDA_PIN)) return false; // bus busy
-  bbSdaLow(); delayMicroseconds(BB_HALF_US);
-  bbSclLow();  delayMicroseconds(BB_HALF_US);
-  return true;
-}
-
-// Repeated START
-static bool bbRestart() {
-  bbSdaRelease(); delayMicroseconds(BB_HALF_US);
-  if (!bbSclHigh()) return false;
-  delayMicroseconds(BB_HALF_US);
-  bbSdaLow(); delayMicroseconds(BB_HALF_US);
-  bbSclLow();  delayMicroseconds(BB_HALF_US);
-  return true;
-}
-
-// STOP 条件
-static void bbStop() {
-  bbSdaLow(); delayMicroseconds(BB_HALF_US);
-  bbSclHigh(); delayMicroseconds(BB_HALF_US);
-  bbSdaRelease(); delayMicroseconds(BB_HALF_US);
-}
-
-// 1 バイト送信。ACK（LOW）が返れば true
-static bool bbWrite(uint8_t b) {
-  for (int i = 7; i >= 0; i--) {
-    if (b & (1 << i)) bbSdaRelease(); else bbSdaLow();
-    delayMicroseconds(BB_HALF_US);
-    if (!bbSclHigh()) { bbSdaRelease(); return false; }
-    delayMicroseconds(BB_HALF_US);
-    bbSclLow(); delayMicroseconds(BB_HALF_US);
-  }
-  bbSdaRelease(); delayMicroseconds(BB_HALF_US);
-  if (!bbSclHigh()) return false;
-  bool ack = (digitalRead(BB_SDA_PIN) == LOW);
-  delayMicroseconds(BB_HALF_US);
-  bbSclLow(); delayMicroseconds(BB_HALF_US);
-  return ack;
-}
-
-// 1 バイト受信。sendAck=false が最終バイト（NACK を返す）
-static uint8_t bbRead(bool sendAck) {
-  uint8_t b = 0;
-  bbSdaRelease();
-  for (int i = 7; i >= 0; i--) {
-    delayMicroseconds(BB_HALF_US);
-    bbSclHigh(); delayMicroseconds(BB_HALF_US);
-    if (digitalRead(BB_SDA_PIN)) b |= (1 << i);
-    bbSclLow(); delayMicroseconds(BB_HALF_US);
-  }
-  if (sendAck) bbSdaLow(); else bbSdaRelease();
-  delayMicroseconds(BB_HALF_US);
-  bbSclHigh(); delayMicroseconds(BB_HALF_US);
-  bbSclLow();  delayMicroseconds(BB_HALF_US);
-  bbSdaRelease();
-  return b;
-}
 
 static int measureDS3231() {
 #if DEBUG_MODE
   Serial.println("[DS3231] reading temperature ...");
   Serial.flush();
 #endif
-  // TWIM を解放してビットバン I2C に切り替え（Wire.endTransmission がハングする問題を回避）
-  Wire.end();
-  delay(5);  // ピン安定待ち
 
-#if DEBUG_MODE
-  // Wire.end() 後のピン状態確認
-  pinMode(BB_SDA_PIN, INPUT_PULLUP);
-  pinMode(BB_SCL_PIN, INPUT_PULLUP);
-  delayMicroseconds(50);
-  Serial.print("[BB] SDA="); Serial.print(digitalRead(BB_SDA_PIN));
-  Serial.print(" SCL="); Serial.println(digitalRead(BB_SCL_PIN));
-  Serial.flush();
-#endif
+  // Wire が使っている TWIM インスタンスを PSEL で判別して保存
+  NRF_TWIM_Type *twim = nullptr;
+  if (NRF_TWIM0->PSEL.SCL != 0xFFFFFFFFu) {
+    twim = NRF_TWIM0;
+  } else if (NRF_TWIM1->PSEL.SCL != 0xFFFFFFFFu) {
+    twim = NRF_TWIM1;
+  }
 
-  bool ok = false;
-  int8_t  msb = 0;
-  uint8_t lsb = 0;
+  if (!twim) {
+#if DEBUG_MODE
+    Serial.println("[DS3231] TWIM not found"); Serial.flush();
+#endif
+    s_errors |= ERR_DS3231_I2C; statusErrorRed();
+    return 0;
+  }
 
-  bool s1  = bbStart();
+  const uint32_t psel_scl = twim->PSEL.SCL;
+  const uint32_t psel_sda = twim->PSEL.SDA;
+
+  Wire.end();  // nrfx 経由で TWIM 無効化（ハングなし確認済み）
+
+  // TWIM をハードウェアレベルで直接再有効化（Wire の IRQ ハンドラを経由しない）
+  twim->PSEL.SCL   = psel_scl;
+  twim->PSEL.SDA   = psel_sda;
+  twim->FREQUENCY  = 0x01980000UL;  // 100 kHz
+  twim->ADDRESS    = 0x68u;
+  twim->ENABLE     = 6u;            // TWIM_ENABLE_ENABLE_Enabled
+
+  // TX: レジスタアドレス 0x11 → RX: 2 バイト（EasyDMA バッファは static で RAM 固定）
+  static uint8_t txBuf[1] = {0x11};
+  static uint8_t rxBuf[2];
+  rxBuf[0] = rxBuf[1] = 0;
+
+  twim->TXD.PTR    = (uint32_t)txBuf;
+  twim->TXD.MAXCNT = 1u;
+  twim->RXD.PTR    = (uint32_t)rxBuf;
+  twim->RXD.MAXCNT = 2u;
+  // TX 完了後 RX 開始、RX 完了後 STOP を自動発行
+  twim->SHORTS = TWIM_SHORTS_LASTTX_STARTRX_Msk | TWIM_SHORTS_LASTRX_STOP_Msk;
+  twim->EVENTS_STOPPED = 0; (void)twim->EVENTS_STOPPED;
+  twim->EVENTS_ERROR   = 0; (void)twim->EVENTS_ERROR;
+
+  twim->TASKS_STARTTX = 1;
+
+  // 100 ms タイムアウト付きポーリング
+  unsigned long t = millis();
+  while (!twim->EVENTS_STOPPED && !twim->EVENTS_ERROR) {
+    if (millis() - t > 100u) {
+      twim->TASKS_STOP = 1;
+      delay(5);
+      twim->SHORTS = 0;
+      twim->ENABLE = 0;
+      Wire.begin(); Wire.setClock(100000);
 #if DEBUG_MODE
-  Serial.print("[BB] start="); Serial.println(s1); Serial.flush();
+      Serial.println("[DS3231] TWIM timeout"); Serial.flush();
 #endif
-  bool s2 = s1 && bbWrite((0x68u << 1) | 0u);
-#if DEBUG_MODE
-  Serial.print("[BB] addr_w="); Serial.println(s2); Serial.flush();
-#endif
-  bool s3 = s2 && bbWrite(0x11u);
-#if DEBUG_MODE
-  Serial.print("[BB] reg="); Serial.println(s3); Serial.flush();
-#endif
-  if (s3) {
-    bool s4 = bbRestart();
-    bool s5 = s4 && bbWrite((0x68u << 1) | 1u);
-#if DEBUG_MODE
-    Serial.print("[BB] restart="); Serial.print(s4);
-    Serial.print(" addr_r="); Serial.println(s5); Serial.flush();
-#endif
-    if (s5) {
-      msb = (int8_t)bbRead(true);
-      lsb = bbRead(false);
-      ok  = true;
+      s_errors |= ERR_DS3231_I2C; statusErrorRed();
+      return 0;
     }
   }
-  bbStop();
 
-  // Wire を復元（TCA の tcaDisable() 等が使えるように）
+  twim->SHORTS = 0;
+  const bool ok = (!twim->EVENTS_ERROR) && (twim->RXD.AMOUNT == 2u);
+  twim->ENABLE = 0;
+
+  // Wire を復元（TCA 操作などに必要）
   Wire.begin();
   Wire.setClock(100000);
   delay(5);
 
 #if DEBUG_MODE
-  Serial.print("[DS3231] bb ok=");
-  Serial.println(ok);
+  Serial.print("[DS3231] ok="); Serial.print(ok);
+  if (ok) {
+    Serial.print("  raw=0x"); Serial.print(rxBuf[0], HEX);
+    Serial.print(" 0x");      Serial.println(rxBuf[1], HEX);
+  } else { Serial.println(); }
   Serial.flush();
 #endif
 
-  if (!ok) {
-    s_errors |= ERR_DS3231_I2C;
-    statusErrorRed();
-    return 0;
-  }
+  if (!ok) { s_errors |= ERR_DS3231_I2C; statusErrorRed(); return 0; }
 
-  float frac = ((lsb >> 6) & 0x03) * 0.25f;
+  int8_t  msb = (int8_t)rxBuf[0];
+  uint8_t lsb = rxBuf[1];
+  float frac  = ((lsb >> 6) & 0x03u) * 0.25f;
   float tempC = (float)msb + (msb >= 0 ? frac : -frac);
   return (int)(tempC * 10.0f);
 }
