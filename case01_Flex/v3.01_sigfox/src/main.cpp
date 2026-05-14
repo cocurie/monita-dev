@@ -91,7 +91,10 @@
 //   1 = HX711（ロードセル）
 //   2 = TCA 経由 MPU6050（I2C 0x68）→ ピッチ角×10
 //   3 = TCA 経由 DS3231（I2C 0x68）→ 温度×10
-const uint8_t CH_ASSIGN[4] = {3, 0, 0, 0};
+const uint8_t CH_ASSIGN[4] = {0, 3, 3, 3};
+
+// MCP9700T の温度オフセット補正（℃）。実測との差を加算する。正値で高め補正。
+#define TEMP_OFFSET_C 4.5f
 
 // HX711 1ch あたりの生サンプル数（中央値をとる前の個数）
 #define DATA_NUM 3
@@ -424,10 +427,10 @@ static bool hxRead(int *out) {
 
 static int measureTemp() {
   int raw = analogRead(TEMP_ANALOG_PIN);
-  float v = raw * (3.3 / 4095.0);
-  // MCP9700 近似: 10mV/℃, 0℃で 500mV
-  float t = (v - 0.5) / 0.01;
-  return (int)(t * 10);
+  float v = raw * (3.3f / 4095.0f);
+  // MCP9700T: 10mV/℃, 0℃で 500mV
+  float t = (v - 0.5f) / 0.01f + TEMP_OFFSET_C;
+  return (int)(t * 10.0f);
 }
 
 // ============================================================
