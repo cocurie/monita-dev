@@ -113,7 +113,7 @@ const uint8_t CH_ASSIGN[4] = {1, 1, 1, 1};
 #define TEMP_ANALOG_PIN A2
 
 // 4052 の A/B は **TCA9534 の GPIO**（主バス D4/D5 の Wire 上、U6 と並列）。回路図の A0〜A2 で 7bit アドレスを決める。
-#define TCA9534_ADDR 0x27
+#define TCA9534_ADDR 0x20  // A0=A1=A2=GND（ネットリスト U6 確認済み）
 // 4052 側の対応（リビジョン案）: TCA9534 **P0 → B**、**P1 → A**（`muxSelect` の 2bit 写像）。回路図で変更した場合は `muxSelect` を合わせる。
 
 // D0 = ゼロ点／リセット判読用タクト（GND ショート、内部プルアップ）。長押し・短押しのポリシーは正本 §6（本スケッチでは計測ループ前のスタブのみ）。
