@@ -1,5 +1,9 @@
 /**
- * Monita Flex v3.01 — 計測＋Sigfox 送信スケッチ（PlatformIO / XIAO nRF52840）
+ * Monita Flex v3.02 — 計測＋Sigfox 送信スケッチ（PlatformIO / XIAO nRF52840）
+ *
+ * 【対象ハード】
+ *   Monita Flex **v3.02 基板専用**（4052 の A/B は **TCA9534**、D0 はゼロ点／操作タクト用）。
+ *   **v3.01 基板に本ビルドを書き込んでも HX711 経路は成立しない**（I²C に TCA9534 が無い）。
  *
  * 【役割の概要】
  *   - HX711 最大 4ch（4052 MUX 経由）または I2C 上 MPU（TCA9546A でバス切替）から荷重／姿勢を取得
@@ -8,7 +12,8 @@
  *   - 送信後、3V3_SW を落とし、内蔵 RTC2 で指定分スリープして繰り返し
  *
  * 【ハードの正本】
- *   【7】Monita/開発/Flex基板/Monita_Flex_構成_v3.01.md
+ *   【7】Monita/開発/Flex基板/Monita_Flex_構成_v3.02.md
+ *   継承・ピン詳細の確定値は v3.01 正本 [Monita_Flex_構成_v3.01.md] も参照。
  *   回路図・実装と食い違う場合は回路図を正とする。
  *
  * 【スリープの方式】
@@ -17,15 +22,8 @@
  *   プリスケーラ 4095 → LFCLK を 32768Hz 名義としたとき 8 tick/秒。
  *
  * 【ステータス LED】
- *   framework の Seeed_XIAO_nRF52840_Sense は LED_RED/GREEN/BLUE（離散 GPIO・アクティブ LOW）。
+ *   framework の Seeed_XIAO_nRF52840_Sense は LED_RED/GREEN/BLUE（離散 GPIO）。
  *   WS2812 の場合は USE_WS2812_STATUS_LED を有効にしピン・NeoPixel ライブラリを合わせる。
- *
- * 【LED ステータス一覧】
- *   起動      : 青（強）
- *   待機・起床 : 青（弱）
- *   計測・送信 : 緑（点灯）
- *   エラー    : 赤
- *   スリープ  : 消灯
  */
 
 /*
@@ -38,12 +36,13 @@
  * | ERR_HX711_TIMEOUT      | HX711 が is_ready で 1000 ms 超待ち       | 赤・点灯 | Sigfox は送信しない→スリープ |
  * | ERR_MPU_I2C            | MPU 読みで requestFrom / バイト数不足      | 同上     | 同上                         |
  * | ERR_TCA_I2C            | TCA9546 の endTransmission が非ゼロ（MPU時）| 同上     | 同上                         |
+ * | ERR_TCA9534_I2C        | TCA9534（4052 A/B 用）の設定／出力レジスタ I²C 失敗 | 同上     | 同上                         |
  * | ERR_SIGFOX_AT          | AT$SF= の応答に OK が含まれない／タイムアウト | 赤・点灯 | 計測は済み→送信スキップ扱い後もそのサイクルは赤→スリープ |
  *
  * 共通ポリシー:
  *   - 本番・DEBUG_MODE とも LED ロジックは同一。
  *   - エラー発生後は **送信をスキップしてスリープ**（計測エラー時は sendSigfox を呼ばない）。
- *   - deepSleep 入場時は **LED 消灯**（スリープ中は省電力のため消灯）。
+ *   - deepSleep 入場時は **常に青・最低輝度**（睡眠中表示を優先し赤は消す）。
  *
  * （将来追加しやすい例: 電池下限閾値 ERR_BATT_LOW、Wire.begin 後の TCA 応答確認 等）
  * =============================================================================
@@ -76,6 +75,9 @@
 // 電源 ON 後の「強い青」の表示時間（ms）
 #define BOOT_BLUE_MS 500
 
+// D0 長押し判定閾値（ms）: これ以上 LOW が続いたら tare、未満で離したらソフトリセット
+#define BUTTON_LONG_PRESS_MS 5000UL
+
 // WS2812 を使う場合は 1 にし、NeoPixel のデータピン・個数と lib_deps を設定する。
 // Seeed XIAO nRF52840 Sense の Adafruit variant は離散 RGB（LED_RED/GREEN/BLUE）が標準。
 #define USE_WS2812_STATUS_LED 0
@@ -87,10 +89,10 @@
 #endif
 
 // 各スロット i（0〜3）が CH(i+1) に相当。1=HX711、2=TCA 経由で MPU6050 等（I2C 0x68）
-const uint8_t CH_ASSIGN[4] = {2, 2, 2, 2};
+const uint8_t CH_ASSIGN[4] = {1, 1, 1, 1};
 
 // HX711 1ch あたりの生サンプル数（中央値をとる前の個数）
-#define DATA_NUM 3
+#define DATA_NUM 5
 // 将来の「同一 ch 複数回平均」等用。現状コードでは未使用。
 #define REPEAT_NUM 3
 
@@ -99,7 +101,7 @@ const uint8_t CH_ASSIGN[4] = {2, 2, 2, 2};
 #endif
 
 // ============================================================
-// ピン番号（Arduino ピン番号 = XIAO の Dx。正本 Monita_Flex_構成_v3.01.md と対応）
+// ピン番号（Arduino ピン番号 = XIAO の Dx。正本 Monita_Flex_構成_v3.02.md）
 // ============================================================
 
 // HX711: PD_SCK=D6, DOUT=D7（U5 SN74LV4052 経由で各 JP の HX711 に接続）
@@ -110,9 +112,14 @@ const uint8_t CH_ASSIGN[4] = {2, 2, 2, 2};
 #define BATT_ANALOG_PIN A3
 #define TEMP_ANALOG_PIN A2
 
-// 4052 の選択線: D1=A, D0=B（正本の「D0=B / D1=A」表記と一致）
-#define MUX_A_PIN 1
-#define MUX_B_PIN 0
+// 4052 の A/B は **TCA9534 の GPIO**（主バス D4/D5 の Wire 上、U6 と並列）。回路図の A0〜A2 で 7bit アドレスを決める。
+#define TCA9534_ADDR 0x27
+// 4052 側の対応（リビジョン案）: TCA9534 **P0 → B**、**P1 → A**（`muxSelect` の 2bit 写像）。回路図で変更した場合は `muxSelect` を合わせる。
+
+// D0 = ゼロ点／リセット判読用タクト（GND ショート、内部プルアップ）。長押し・短押しのポリシーは正本 §6（本スケッチでは計測ループ前のスタブのみ）。
+#define USER_BUTTON_PIN 0
+// D1 = 予備 GPIO（未使用時は入力＋プルアップ）
+#define SPARE_GPIO_PIN 1
 
 // D10 = MOSFET_GATE → Q2 → Q1 で 3V3_SW の ON/OFF（HIGH で周辺レール給電）
 #define SW_POWER_PIN 10
@@ -135,9 +142,19 @@ enum : uint32_t {
   ERR_MPU_I2C = 1u << 1,
   ERR_TCA_I2C = 1u << 2,
   ERR_SIGFOX_AT = 1u << 3,
+  ERR_TCA9534_I2C = 1u << 4,
 };
 
 static uint32_t s_errors;
+
+// D0 ボタン: ISR からメインへ「押下エッジあり」を伝えるフラグ
+static volatile bool s_btnFlag = false;
+// deepSleep() がタイマー満了前にボタン長押しで抜けたとき、次の loop() で tare を実行する
+static bool s_pendingTare = false;
+
+static void btnISR() {
+  s_btnFlag = true;
+}
 
 // ============================================================
 // ステータス LED（離散 RGB／または NeoPixel）
@@ -169,32 +186,31 @@ static void rgbHwBegin() {
 #endif
 }
 
-// r,g,b は 0〜255。輝度は全体スケール。
-// XIAO nRF52840 の RGB LED はアクティブ LOW のため値を反転して渡す。
+// r,g,b は 0〜255。輝度は全体スケール（スリープ時の青は brightness 低めで指定）。
 static void rgbHwShow(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness8) {
 #ifdef LED_RED
   uint16_t rr = (uint16_t)r * brightness8 / 255;
   uint16_t gg = (uint16_t)g * brightness8 / 255;
   uint16_t bb = (uint16_t)b * brightness8 / 255;
-  analogWrite(LED_RED,   255 - (int)rr);
-  analogWrite(LED_GREEN, 255 - (int)gg);
-  analogWrite(LED_BLUE,  255 - (int)bb);
+  analogWrite(LED_RED, (int)rr);
+  analogWrite(LED_GREEN, (int)gg);
+  analogWrite(LED_BLUE, (int)bb);
 #endif
 }
 
 #endif
 
 #define RGB_BRIGHT_FULL 255
-#define RGB_BRIGHT_DIM   16
+#define RGB_BRIGHT_SLEEP_BLUE 16 // スリープ時の青（できるだけ低輝度）
 
 static void rgbOff() {
 #if USE_WS2812_STATUS_LED
   rgbHwShow(0, 0, 0, 1);
 #else
 #ifdef LED_RED
-  analogWrite(LED_RED,   255);
-  analogWrite(LED_GREEN, 255);
-  analogWrite(LED_BLUE,  255);
+  analogWrite(LED_RED, 0);
+  analogWrite(LED_GREEN, 0);
+  analogWrite(LED_BLUE, 0);
 #endif
 #endif
 }
@@ -204,7 +220,7 @@ static void statusBootBlueStrong() {
 }
 
 static void statusIdleBlueDim() {
-  rgbHwShow(0, 0, 255, RGB_BRIGHT_DIM);
+  rgbHwShow(0, 0, 255, RGB_BRIGHT_SLEEP_BLUE);
 }
 
 static void statusMeasureGreen() {
@@ -213,6 +229,32 @@ static void statusMeasureGreen() {
 
 static void statusErrorRed() {
   rgbHwShow(255, 0, 0, RGB_BRIGHT_FULL);
+}
+
+static void statusSleepBlueDim() {
+  rgbHwShow(0, 0, 255, RGB_BRIGHT_SLEEP_BLUE);
+}
+
+// Sigfox 送信中の緑点滅（ノンブロッキング）
+static unsigned long s_sigfoxBlinkLastMs;
+static bool s_sigfoxBlinkOn;
+
+static void statusSigfoxBlinkReset() {
+  s_sigfoxBlinkLastMs = millis();
+  s_sigfoxBlinkOn = true;
+  rgbHwShow(0, 255, 0, RGB_BRIGHT_FULL);
+}
+
+static void statusSigfoxBlinkTick() {
+  unsigned long now = millis();
+  if (now - s_sigfoxBlinkLastMs >= 200) {
+    s_sigfoxBlinkLastMs = now;
+    s_sigfoxBlinkOn = !s_sigfoxBlinkOn;
+    if (s_sigfoxBlinkOn)
+      rgbHwShow(0, 255, 0, RGB_BRIGHT_FULL);
+    else
+      rgbOff();
+  }
 }
 
 // ============================================================
@@ -248,12 +290,13 @@ extern "C" void RTC2_IRQHandler(void) {
 static void deepSleep(uint32_t minutes) {
 
 #if DEBUG_MODE
+  // USB 接続でログを見る時間を確保（この間もスリープ表示の青デューム）
   Serial.println("[Sleep before wait]");
-  delay(500);
+  delay(5000);
 #endif
 
-  // スリープ中は消灯（省電力）
-  rgbOff();
+  // スリープ中表示: 青・最低輝度（エラー赤より優先）
+  statusSleepBlueDim();
 
   // スリープ中は周辺 IC 用レールをオフ（消費電流削減。正本の 3V3_SW 節）
   digitalWrite(SW_POWER_PIN, LOW);
@@ -311,6 +354,40 @@ static void deepSleep(uint32_t minutes) {
   while (!s_rtc2Compare0Wake) {
     __DSB();
     __WFI();
+
+    if (s_btnFlag) {
+      s_btnFlag = false;
+      delay(20); // チャタリング除去
+      if (digitalRead(USER_BUTTON_PIN) == LOW) {
+        unsigned long pressStart = millis();
+        bool longPress = false;
+        while (digitalRead(USER_BUTTON_PIN) == LOW) {
+          if (millis() - pressStart >= BUTTON_LONG_PRESS_MS) {
+            longPress = true;
+            break;
+          }
+        }
+        if (longPress) {
+          // 長押し: tare フラグを立てて早期リターン（loop() で実行）
+          s_pendingTare = true;
+          NRF_RTC2->TASKS_STOP = 1;
+          NRF_RTC2->INTENCLR = 0xFFFFFFFFU;
+          NVIC_DisableIRQ(RTC2_IRQn);
+#if DEBUG_MODE
+          Serial.println("[BTN] long press -> tare pending");
+          Serial.flush();
+#endif
+          return;
+        } else {
+          // 短押し: ソフトウェアリセット
+#if DEBUG_MODE
+          Serial.println("[BTN] short press -> reset");
+          Serial.flush();
+#endif
+          NVIC_SystemReset();
+        }
+      }
+    }
   }
 
   NVIC_DisableIRQ(RTC2_IRQn);
@@ -319,16 +396,62 @@ static void deepSleep(uint32_t minutes) {
 }
 
 // ============================================================
-// SN74LV4052（U5）チャネル選択
+// TCA9534 — SN74LV4052（U5）の A/B を I²C から駆動
 //
-// ch は 1〜4（物理スロット）。idx 0〜3 で A/B の 2bit を駆動。
+// レジスタは TI TCA9534 互換の一般的マップ（Input0 / Output1 / Polarity2 / Config3）。
+// ch は 1〜4（物理スロット）。idx 0〜3 で v3.01 相当の A/B 2bit（A=LSB, B=bit1）を TCA の P1/P0 に写像。
 // ============================================================
+
+static bool tca9534WriteReg(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(TCA9534_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+
+static bool tca9534ReadReg(uint8_t reg, uint8_t *out) {
+  Wire.beginTransmission(TCA9534_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0)
+    return false;
+  if (Wire.requestFrom(TCA9534_ADDR, (uint8_t)1) != 1)
+    return false;
+  *out = Wire.read();
+  return true;
+}
+
+// `3V3_SW` 復帰後も呼べるよう冪等に。失敗時は ERR_TCA9534_I2C。
+static bool tca9534Configure() {
+  if (!tca9534WriteReg(0x02, 0x00))
+    return false;
+  // P0,P1 を出力、P2〜P7 を入力（未使用ピンは入力へ）
+  if (!tca9534WriteReg(0x03, 0xFC))
+    return false;
+  uint8_t out = 0;
+  if (!tca9534ReadReg(0x01, &out))
+    return false;
+  out = (uint8_t)((out & (uint8_t)~0x03U) | 0x00U); // A=0,B=0 で MUX を既知状態へ
+  return tca9534WriteReg(0x01, out);
+}
 
 static void muxSelect(uint8_t ch) {
   uint8_t idx = (ch - 1) & 0x03;
-  // 実機PCBでは 4052 Y1→JP3 / Y2→JP2 のため bit1→A, bit0→B で補正
-  digitalWrite(MUX_A_PIN, (idx >> 1) & 0x01);
-  digitalWrite(MUX_B_PIN,  idx        & 0x01);
+  const uint8_t a = idx & 0x01;
+  const uint8_t b = (idx >> 1) & 0x01;
+  // P0=B, P1=A → OUT レジスタの bit0=B, bit1=A
+  const uint8_t twoBits = (uint8_t)(b | (a << 1));
+
+  uint8_t out = 0;
+  if (!tca9534ReadReg(0x01, &out)) {
+    s_errors |= ERR_TCA9534_I2C;
+    statusErrorRed();
+    return;
+  }
+  out = (uint8_t)((out & (uint8_t)~0x03U) | (twoBits & 0x03U));
+  if (!tca9534WriteReg(0x01, out)) {
+    s_errors |= ERR_TCA9534_I2C;
+    statusErrorRed();
+  }
 }
 
 // ============================================================
@@ -355,6 +478,40 @@ static void tcaDisable() {
 // ============================================================
 
 HX711 hx;
+
+// HX711 全有効チャネルに tare を実行する（3V3_SW ON・Wire 初期化済みの状態で呼ぶこと）
+static void performTare() {
+  if ((s_errors & ERR_TCA9534_I2C) != 0U) {
+#if DEBUG_MODE
+    Serial.println("[TARE] skipped (TCA9534 error)");
+#endif
+    return;
+  }
+  for (uint8_t i = 0; i < 4; i++) {
+    if (CH_ASSIGN[i] != 1) continue;
+    muxSelect((uint8_t)(i + 1));
+    delay(10);
+    hx.begin(HX711_DOUT_PIN, HX711_SCK_PIN);
+    unsigned long t = millis();
+    while (!hx.is_ready()) {
+      if (millis() - t > 1000) break;
+    }
+    if (hx.is_ready()) {
+      hx.tare();
+#if DEBUG_MODE
+      Serial.print("[TARE] CH");
+      Serial.print(i + 1);
+      Serial.println(" done");
+#endif
+    } else {
+#if DEBUG_MODE
+      Serial.print("[TARE] CH");
+      Serial.print(i + 1);
+      Serial.println(" timeout");
+#endif
+    }
+  }
+}
 
 // 小さな配列のバブルソートで中央値（外れ値に強い簡易ロバスト化）
 static float median(float *a, int n) {
@@ -480,32 +637,24 @@ static void measureAll() {
 
 #if DEBUG_MODE
   Serial.println("----- MEASURE START -----");
-  Serial.flush();
 #endif
 
+  // 計測フェーズ: 緑点灯（電源 ON の強青 500 ms は setup で済ませ、その後〜計測開始は setup がディム青）
   statusMeasureGreen();
 
   for (int i = 0; i < 4; i++) {
 
     if (CH_ASSIGN[i] == 1) {
+      if ((s_errors & ERR_TCA9534_I2C) != 0U) {
+        ch[i] = 0;
+        continue;
+      }
       // 物理 CH は 1 origin（MUX と正本 JP の対応）
       hxBegin((uint8_t)(i + 1));
       hxRead(&ch[i]);
     } else if (CH_ASSIGN[i] == 2) {
       // MPU は TCA のチャネル i（0 origin）に合わせてバスを開く
-#if DEBUG_MODE
-      Serial.print("[TCA] select ch");
-      Serial.print(i);
-      Serial.println(" ...");
-      Serial.flush();
-#endif
-      uint8_t tcaErr = tcaSelect((uint8_t)i);
-#if DEBUG_MODE
-      Serial.print("[TCA] endTransmission=");
-      Serial.println(tcaErr);
-      Serial.flush();
-#endif
-      if (tcaErr != 0) {
+      if (tcaSelect((uint8_t)i) != 0) {
         s_errors |= ERR_TCA_I2C;
         statusErrorRed();
         ch[i] = 0;
@@ -520,7 +669,6 @@ static void measureAll() {
     Serial.print(i + 1);
     Serial.print("] ");
     Serial.println(ch[i]);
-    Serial.flush();
 #endif
   }
 
@@ -536,13 +684,12 @@ static void measureAll() {
 }
 
 // ============================================================
-// Sigfox ペイロード用: int を 4 桁十六進文字列（リトルエンディアン・符号付き 16bit）
+// Sigfox ペイロード用: int を 4 桁十六進文字列（符号付き 16bit 範囲を uint16 キャスト）
 // ============================================================
 
 String hx4(int v) {
-  uint16_t u = (uint16_t)(int16_t)v;
   char b[5];
-  snprintf(b, 5, "%02X%02X", u & 0xFF, (u >> 8) & 0xFF);
+  snprintf(b, 5, "%04X", (uint16_t)(int16_t)v);
   return String(b);
 }
 
@@ -551,8 +698,8 @@ String hx4(int v) {
 // ============================================================
 
 // 改行付きで AT を送り、waitMs ミリ秒の間に届いた応答をすべて読んで返す（ポーリング）。
-// logResponse=false にするとレスポンス行の自動出力を抑制できる（呼び元で独自ログを出す場合）。
-static String sendAT(String cmd, int waitMs = 2000, bool logResponse = true) {
+// Sigfox 送信中は緑点滅をこのループで更新する。
+static String sendAT(String cmd, int waitMs = 2000) {
 
 #if DEBUG_MODE
   Serial.print(">> ");
@@ -565,6 +712,7 @@ static String sendAT(String cmd, int waitMs = 2000, bool logResponse = true) {
   String response = "";
 
   while (millis() - start < (unsigned long)waitMs) {
+    statusSigfoxBlinkTick();
     while (Serial1.available()) {
       char c = (char)Serial1.read();
       response += c;
@@ -573,56 +721,10 @@ static String sendAT(String cmd, int waitMs = 2000, bool logResponse = true) {
   }
 
 #if DEBUG_MODE
-  if (logResponse) Serial.println(response);
+  Serial.println(response);
 #endif
 
   return response;
-}
-
-// モジュールが AT コマンドに応答するまでポーリング待機。
-// 応答が来た時点で即座に次へ進む（固定 delay より速い）。
-// 実測: 電源投入から約 1007 ms で安定応答（5サイクル計測）。
-// maxMs = 4000 ms（実測最大値の約4倍・安全マージン）。
-// 戻り値: true=準備完了、false=maxMs 超過（ERR_SIGFOX_AT をセット）
-static bool waitSigfoxReady(unsigned long maxMs = 4000) {
-  unsigned long start = millis();
-
-#if DEBUG_MODE
-  Serial.print("[SIGFOX] waiting for module");
-#endif
-
-  while (millis() - start < maxMs) {
-    // 受信バッファをクリアしてから AT を送る
-    while (Serial1.available()) Serial1.read();
-    Serial1.print("AT\r");
-
-    // 最大 1 秒応答を待つ
-    unsigned long t = millis();
-    String r = "";
-    while (millis() - t < 1000) {
-      while (Serial1.available()) r += (char)Serial1.read();
-      if (r.indexOf("OK") >= 0) {
-#if DEBUG_MODE
-        Serial.print(" OK (");
-        Serial.print(millis() - start);
-        Serial.println(" ms)");
-#endif
-        return true;
-      }
-      yield();
-    }
-
-#if DEBUG_MODE
-    Serial.print(".");
-#endif
-  }
-
-#if DEBUG_MODE
-  Serial.println(" timeout");
-#endif
-  s_errors |= ERR_SIGFOX_AT;
-  statusErrorRed();
-  return false;
 }
 
 // ch[0..3]・温度・電池を連結した 16 進ペイロードで AT$SF= を送信
@@ -634,12 +736,6 @@ static void sendSigfox() {
 #endif
     return;
   }
-
-  // 無線スタック初期化。応答は AT_ERROR（RC設定済み）が正常なので独自メッセージで表示。
-  sendAT("AT$RC", 200, false);
-#if DEBUG_MODE
-  Serial.println("[AT$RC] radio stack ready");
-#endif
 
   String payload = "";
   for (int i = 0; i < 4; i++) {
@@ -655,8 +751,10 @@ static void sendSigfox() {
   Serial.println(cmd);
 #endif
 
-  // 計測と同じ緑を維持したまま送信（送信中も緑点灯）
-  String result = sendAT(cmd, 25000);
+  // Sigfox データ送信中: 緑点滅（sendAT 内で tick）
+  statusSigfoxBlinkReset();
+
+  String result = sendAT(cmd, 10000);
 
   if (result.indexOf("OK") >= 0) {
 #if DEBUG_MODE
@@ -684,8 +782,9 @@ void setup() {
   pinMode(SW_POWER_PIN, OUTPUT);
   digitalWrite(SW_POWER_PIN, HIGH);
 
-  pinMode(MUX_A_PIN, OUTPUT);
-  pinMode(MUX_B_PIN, OUTPUT);
+  pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(SPARE_GPIO_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(USER_BUTTON_PIN), btnISR, FALLING);
 
   // 電源 ON: 青・強（500 ms）
   statusBootBlueStrong();
@@ -709,22 +808,27 @@ void setup() {
   Serial1.setPins(SIGFOX_RX_PIN, SIGFOX_TX_PIN);
   Serial1.begin(SIGFOX_BAUD);
 
+  // BRKLSM100 コールドスタート時の内部起動待ち（データシート・実測に応じて調整可）
+  delay(3000);
+
   // ハード I2C（D4/D5）— 正本の SDA/SCL
   Wire.begin();
   analogReadResolution(12);
 
-  // BRKLSM100 が AT コマンドに応答するまでポーリング（最大 5s）
-  if (!waitSigfoxReady()) {
-    deepSleep(SLEEP_MINUTES);
-    return;
-  }
-
-  delay(50);
+  // 3V3_SW 投入直後は各 ICの起動・デカップ充電に余裕を持たせる
+  delay(200);
 
   s_errors = ERR_NONE;
 
-  measureAll();
+  if (!tca9534Configure()) {
+    s_errors |= ERR_TCA9534_I2C;
+    statusErrorRed();
+#if DEBUG_MODE
+    Serial.println("[TCA9534] init failed (check ADDR / wiring / v3.02 board)");
+#endif
+  }
 
+  measureAll();
   sendSigfox();
 
   deepSleep(SLEEP_MINUTES);
@@ -738,8 +842,12 @@ void loop() {
   // スリープから戻ったあと、再度周辺レールを有効化
   digitalWrite(SW_POWER_PIN, HIGH);
 
+  // 電源オフ運用後は毎回モジュール起動に相当する待ちを入れる
+  delay(3000);
+
+  delay(200);
+
   // スリープ中は Serial1 を end しているため、ここで UART を再度有効化
-  // ポーリングより前に初期化が必要なのでここに置く
   Serial1.setPins(SIGFOX_RX_PIN, SIGFOX_TX_PIN);
   Serial1.begin(SIGFOX_BAUD);
 
@@ -750,15 +858,20 @@ void loop() {
   Serial.println("[WAKE]");
 #endif
 
-  // BRKLSM100 が AT コマンドに応答するまでポーリング（最大 5s）
-  if (!waitSigfoxReady()) {
-    deepSleep(SLEEP_MINUTES);
-    return;
+  s_errors = ERR_NONE;
+
+  if (!tca9534Configure()) {
+    s_errors |= ERR_TCA9534_I2C;
+    statusErrorRed();
+#if DEBUG_MODE
+    Serial.println("[TCA9534] re-init after wake failed");
+#endif
   }
 
-  delay(50);
-
-  s_errors = ERR_NONE;
+  if (s_pendingTare) {
+    s_pendingTare = false;
+    performTare();
+  }
 
   measureAll();
   sendSigfox();
