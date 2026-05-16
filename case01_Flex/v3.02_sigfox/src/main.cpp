@@ -65,34 +65,35 @@
 // アプリ設定（ここを主に編集する）
 // ============================================================
 
-// 1: USB Serial でデバッグログを出す。本番では 0 にするとログ待ち等がなくなる。
-#define DEBUG_MODE 1
+#define DEBUG_MODE           1        // 1: USB Serial デバッグログ有効。本番は 0
+#define SLEEP_MINUTES        1        // 1サイクル後のスリープ時間（分）
+#define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
+#define BUTTON_LONG_PRESS_MS 5000UL  // D0 長押し閾値（ms）: 以上で tare、未満でリセット
 
-// 計測＋Sigfox の 1 サイクル終了後、「スリープ状態」に入る時間（分）。
-// 実際の周期は この分 ＋ 起きている間の計測・送信時間。
-#define SLEEP_MINUTES 1
+// ── モジュール選択 ────────────────────────────────────────────
+// U1（Sigfox）と U7（LTE-M）は UART 共有のため同時実装禁止。実装モジュールに合わせること。
+#define MODULE_TYPE 0    // 0 = Sigfox (BRKLSM100 / U1)
+                         // 1 = LTE-M  (SIM7080G  / U7)
 
-// 電源 ON 後の「強い青」の表示時間（ms）
-#define BOOT_BLUE_MS 500
+// ── Sigfox 設定（MODULE_TYPE == 0 のとき使用）────────────────
+#define SIGFOX_TX_PIN 8    // D8: XIAO TX → BRKLSM100 RX
+#define SIGFOX_RX_PIN 9    // D9: XIAO RX ← BRKLSM100 TX
+#define SIGFOX_BAUD   9600
 
-// D0 長押し判定閾値（ms）: これ以上 LOW が続いたら tare、未満で離したらソフトリセット
-#define BUTTON_LONG_PRESS_MS 5000UL
+// ── LTE-M 設定（MODULE_TYPE == 1 のとき使用）─────────────────
+// SIM / ネットワーク
+#define LTE_APN   "iot.1nce.net"  // SIM カードの APN（1NCE の場合。他 SIM は要変更）
+#define LTE_BAUD  115200           // SIM7080G デフォルトボーレート（Sigfox の 9600 と異なる）
 
-// 無線モジュール選択: 0=Sigfox (BRKLSM100/U1)、1=LTE-M (SIM7080G/U7)
-// U1 と U7 は UART 共有のため、基板実装モジュールに合わせてどちらか一方のみ選択すること（同時実装禁止）
-#define MODULE_TYPE 0
+// HTTP POST 送信先（すべて要変更）
+// ※ LTE_TOKEN はコードへの平文記録を避ける運用を推奨（書き込み済みファームを除く）
+#define LTE_SERVER_HOST "your.server.com"
+#define LTE_POST_PATH   "/api/v2/write?org=YourOrg&bucket=YourBucket&precision=s"
+#define LTE_TOKEN       "REPLACE_WITH_YOUR_TOKEN"
+#define LTE_DEVICE_ID   "monita-flex-01"  // Line Protocol タグ用デバイス ID
 
-// SIM7080G 設定（MODULE_TYPE == 1 のときのみ使用。各値は要変更）
-// ※トークンはコードに平文で残さない運用を推奨（書き込み済みファームは除く）
-#define LTE_APN         "iot.1nce.net"       // SIM カードの APN（1NCE の場合。要確認）
-#define LTE_SERVER_HOST "your.server.com"    // HTTPS 送信先ホスト名（要変更）
-#define LTE_POST_PATH   "/api/v2/write?org=YourOrg&bucket=YourBucket&precision=s"  // POST パス（要変更）
-#define LTE_TOKEN       "REPLACE_WITH_YOUR_TOKEN"   // Bearer 認証トークン（要変更）
-#define LTE_DEVICE_ID   "monita-flex-01"     // Line Protocol タグ用デバイス ID（要変更）
-#define LTE_BAUD        115200               // SIM7080G デフォルトボーレート（Sigfox の 9600 と異なる）
-
+// ── ステータス LED ─────────────────────────────────────────────
 // WS2812 を使う場合は 1 にし、NeoPixel のデータピン・個数と lib_deps を設定する。
-// Seeed XIAO nRF52840 Sense の Adafruit variant は離散 RGB（LED_RED/GREEN/BLUE）が標準。
 #define USE_WS2812_STATUS_LED 0
 
 #if USE_WS2812_STATUS_LED
@@ -115,34 +116,28 @@ const uint8_t CH_ASSIGN[4] = {1, 1, 1, 1};
 
 // ============================================================
 // ピン番号（Arduino ピン番号 = XIAO の Dx。正本 Monita_Flex_構成_v3.02.md）
+// UART ピン・ボーレートは上部「アプリ設定」の各モジュール設定を参照。
 // ============================================================
 
-// HX711: PD_SCK=D6, DOUT=D7（U5 SN74LV4052 経由で各 JP の HX711 に接続）
-#define HX711_SCK_PIN 6
+// HX711: PD_SCK=D6, DOUT=D7（SN74LV4052 MUX 経由で各 JP に接続）
+#define HX711_SCK_PIN  6
 #define HX711_DOUT_PIN 7
 
-// アナログ: 電池分圧=D3→A3、温度センサ U4=D2→A2（解像度は setup で 12bit）
+// アナログ: 電池分圧=A3、温度センサ=A2（解像度は setup で 12bit 設定）
 #define BATT_ANALOG_PIN A3
 #define TEMP_ANALOG_PIN A2
 
-// 4052 の A/B は **TCA9534 の GPIO**（主バス D4/D5 の Wire 上、U6 と並列）。回路図の A0〜A2 で 7bit アドレスを決める。
-#define TCA9534_ADDR 0x20  // A0=A1=A2=GND（ネットリスト U6 確認済み）
-// 4052 側の対応（リビジョン案）: TCA9534 **P0 → B**、**P1 → A**（`muxSelect` の 2bit 写像）。回路図で変更した場合は `muxSelect` を合わせる。
+// TCA9534（U6）: SN74LV4052 の A/B を I²C で駆動。A0=A1=A2=GND → 0x20
+#define TCA9534_ADDR 0x20
 
-// D0 = ゼロ点／リセット判読用タクト（GND ショート、内部プルアップ）。長押し・短押しのポリシーは正本 §6（本スケッチでは計測ループ前のスタブのみ）。
+// D0 = タクトスイッチ（GND ショート、内部プルアップ）/ D1 = 予備 GPIO
 #define USER_BUTTON_PIN 0
-// D1 = 予備 GPIO（未使用時は入力＋プルアップ）
-#define SPARE_GPIO_PIN 1
+#define SPARE_GPIO_PIN  1
 
-// D10 = MOSFET_GATE → Q2 → Q1 で 3V3_SW の ON/OFF（HIGH で周辺レール給電）
+// D10 = MOSFET_GATE → 3V3_SW ON/OFF（HIGH で周辺レール給電）
 #define SW_POWER_PIN 10
 
-// Sigfox BRKLSM100（U2）: UART。D8=TX→モジュール RX、D9=RX←モジュール TX（正本どおり交差）
-#define SIGFOX_TX_PIN 8
-#define SIGFOX_RX_PIN 9
-#define SIGFOX_BAUD 9600
-
-// TCA9546A（U6）の I2C アドレス（A0〜A2 全て GND のとき 0x70 が一般的）
+// TCA9546A（U5）I²C アドレス（A0〜A2 全て GND → 0x70）
 #define TCA_ADDR 0x70
 
 // ============================================================
@@ -784,14 +779,17 @@ static void sendSigfox() {
 }
 
 // ============================================================
-// SIM7080G LTE-M 送信（MODULE_TYPE == 1 のときのみコンパイル）
+// SIM7080G LTE-M（MODULE_TYPE == 1 のときのみコンパイル）
 //
 // 実証済み構成（2026-05-02）:
 //   MCU: XIAO nRF52840 / モジュール: SIM7080G / SIM: 1NCE IoT SIM
 //   UART: 115200bps, \r\n 終端（Sigfox の \r とは異なる）
-//   通信: HTTPS POST → InfluxDB Line Protocol（AT+SH系コマンド）
+//   通信: HTTPS POST → InfluxDB Line Protocol（AT+SH 系コマンド）
 //
-// 設定値（上部 #define）を NEXCO 案件の送信先に合わせること。
+// 起動フロー:
+//   lteBegin()      → モード設定＋APN 設定でネット登録を開始して即リターン
+//   measureAll()    → ネット登録している間に計測を並行実施
+//   lteWaitAndPost()→ 登録完了を待って残り時間を吸収し、HTTPS POST
 // ============================================================
 
 #if (MODULE_TYPE == 1)
@@ -818,17 +816,45 @@ static String sendATLTE(const String &cmd, int waitMs = 5000) {
   return response;
 }
 
-// ネットワーク初期化（LTE-M モード設定→登録確認→PDP 有効化）
-static bool lteInitNetwork() {
-  sendATLTE("AT+CNMP=38", 2000);  // LTE-M のみに絞る（NB-IoT 等を除外）
-  delay(500);
-  sendATLTE("AT+CMNB=1", 2000);   // Cat-M1 選択
-  delay(500);
-  sendATLTE("AT+CGDCONT=1,\"IP\",\"" LTE_APN "\"", 2000);
-  delay(500);
+// AT 疎通確認 + LTE-M モード設定 + APN 設定 → 即リターン（ネット登録は非同期で開始）
+// false: AT 応答なし（モジュール異常）→ 計測もスキップしてスリープ
+static bool lteBegin() {
+  if (sendATLTE("AT", 3000).indexOf("OK") < 0) {
+    s_errors |= ERR_LTE_AT;
+    statusErrorRed();
+#if DEBUG_MODE
+    Serial.println("[LTE] AT failed - module not responding");
+#endif
+    return false;
+  }
+  sendATLTE("AT+CPIN?", 2000);
 
-  // ネットワーク登録待ち（最大 60 秒 / 5 秒間隔 × 12 回）
-  // +CREG: 0,1=接続 / 0,5=ローミング接続（日本では 5 が正常なことがある）
+  // LTE-M のみに絞り APN を設定 → モジュールがバックグラウンドでネット登録を開始
+  sendATLTE("AT+CNMP=38", 2000); delay(300);  // LTE-M only（NB-IoT 除外）
+  sendATLTE("AT+CMNB=1",  2000); delay(300);  // Cat-M1 選択
+  sendATLTE("AT+CGDCONT=1,\"IP\",\"" LTE_APN "\"", 2000);
+
+#if DEBUG_MODE
+  Serial.println("[LTE] module init done, network search started");
+#endif
+  return true;
+}
+
+// ネット登録完了を待って HTTPS POST まで実行する
+// measureAll() の後に呼ぶことで、登録待ち時間を計測時間で吸収できる。
+static void lteWaitAndPost() {
+
+  if (s_errors != 0U) {
+#if DEBUG_MODE
+    Serial.println("[LTE] skipped (errors)");
+#endif
+    return;
+  }
+
+  statusSigfoxBlinkReset();
+
+  // ── ネット登録待ち（最大 60 秒 / 5 秒間隔 × 12 回）──────────
+  // +CREG: 0,1=接続 / 0,5=ローミング（日本では 5 が正常なことがある）
   bool registered = false;
   for (int i = 0; i < 12; i++) {
     String r = sendATLTE("AT+CREG?", 3000);
@@ -839,47 +865,39 @@ static bool lteInitNetwork() {
     delay(5000);
   }
   if (!registered) {
+    s_errors |= ERR_LTE_AT;
+    statusErrorRed();
 #if DEBUG_MODE
     Serial.println("[LTE] network registration timeout");
-#endif
-    return false;
-  }
-
-  // データ接続（GPRS Attach）確認
-  if (sendATLTE("AT+CGATT?", 3000).indexOf("+CGATT: 1") < 0) {
-#if DEBUG_MODE
-    Serial.println("[LTE] CGATT failed");
-#endif
-    return false;
-  }
-  delay(3000);
-
-  // PDP コンテキスト有効化
-  // すでにアクティブな場合は ERROR が返るが正常。AT+CNACT? で IP 確認が確実。
-  sendATLTE("AT+CNACT=0,1", 15000);
-  delay(3000);
-
-  if (sendATLTE("AT+CNACT?", 3000).indexOf("0,1") < 0) {
-#if DEBUG_MODE
-    Serial.println("[LTE] IP address not obtained");
-#endif
-    return false;
-  }
-
-  return true;
-}
-
-// InfluxDB Line Protocol 形式で HTTPS POST 送信
-// body 例: "monita,device=monita-flex-01 ch1=1234,ch2=5678,..."
-static void sendSIM7080G() {
-
-  if (s_errors != 0U) {
-#if DEBUG_MODE
-    Serial.println("[LTE] skipped (errors)");
 #endif
     return;
   }
 
+  // GPRS Attach 確認
+  if (sendATLTE("AT+CGATT?", 3000).indexOf("+CGATT: 1") < 0) {
+    s_errors |= ERR_LTE_AT;
+    statusErrorRed();
+#if DEBUG_MODE
+    Serial.println("[LTE] CGATT failed");
+#endif
+    return;
+  }
+  delay(3000);
+
+  // PDP コンテキスト有効化（すでにアクティブなら ERROR が返るが正常）
+  sendATLTE("AT+CNACT=0,1", 15000);
+  delay(3000);
+
+  if (sendATLTE("AT+CNACT?", 3000).indexOf("0,1") < 0) {
+    s_errors |= ERR_LTE_AT;
+    statusErrorRed();
+#if DEBUG_MODE
+    Serial.println("[LTE] IP address not obtained");
+#endif
+    return;
+  }
+
+  // ── HTTPS POST ───────────────────────────────────────────────
   // Line Protocol ボディ組み立て
   String body = "monita,device=" LTE_DEVICE_ID " ";
   body += "ch1=" + String(ch[0]);
@@ -895,29 +913,8 @@ static void sendSIM7080G() {
   Serial.println(body);
 #endif
 
-  statusSigfoxBlinkReset();
-
-  // モジュール疎通確認
-  if (sendATLTE("AT", 2000).indexOf("OK") < 0) {
-    s_errors |= ERR_LTE_AT;
-    statusErrorRed();
-#if DEBUG_MODE
-    Serial.println("[LTE] AT failed");
-#endif
-    return;
-  }
-  sendATLTE("AT+CPIN?", 2000);
-
-  // ネットワーク初期化
-  if (!lteInitNetwork()) {
-    s_errors |= ERR_LTE_AT;
-    statusErrorRed();
-    return;
-  }
-
   // 前回セッション切断（残骸があっても続行）
-  sendATLTE("AT+SHDISC", 3000);
-  delay(500);
+  sendATLTE("AT+SHDISC", 3000); delay(500);
 
   // SSL 設定
   sendATLTE("AT+CSSLCFG=\"ignorertctime\",1,1", 2000); delay(300);
@@ -947,7 +944,7 @@ static void sendSIM7080G() {
   sendATLTE("AT+SHAHEAD=\"Authorization\",\"Token " LTE_TOKEN "\"", 2000); delay(300);
   sendATLTE("AT+SHAHEAD=\"Content-Type\",\"text/plain; charset=utf-8\"", 2000); delay(300);
 
-  // ボディ送信: AT+SHBOD 後は sendATLTE 経由ではなく Serial1 直書き（実証済み）
+  // ボディ送信: AT+SHBOD 後は Serial1 直書き（sendATLTE 経由では不可。実証済み）
   Serial1.print("AT+SHBOD=" + String(bodyLen) + ",5000\r\n");
   delay(2000);        // ">" プロンプト待ち
   Serial1.print(body);  // \r\n なしで raw 送信
@@ -975,18 +972,6 @@ static void sendSIM7080G() {
 #endif  // MODULE_TYPE == 1
 
 // ============================================================
-// sendData() — MODULE_TYPE に応じて Sigfox または LTE-M を呼び分ける
-// ============================================================
-
-static void sendData() {
-#if (MODULE_TYPE == 0)
-  sendSigfox();
-#elif (MODULE_TYPE == 1)
-  sendSIM7080G();
-#endif
-}
-
-// ============================================================
 // Arduino エントリ
 // ============================================================
 
@@ -995,84 +980,94 @@ void setup() {
   rgbHwBegin();
   rgbOff();
 
-  // 先に周辺電源を入れる（HX711・Sigfox・温度・TCA 等が 3V3_SW 側）
   pinMode(SW_POWER_PIN, OUTPUT);
-  digitalWrite(SW_POWER_PIN, HIGH);
+  digitalWrite(SW_POWER_PIN, HIGH);  // 3V3_SW ON
 
   pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
-  pinMode(SPARE_GPIO_PIN, INPUT_PULLUP);
+  pinMode(SPARE_GPIO_PIN,  INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(USER_BUTTON_PIN), btnISR, FALLING);
 
-  // 電源 ON: 青・強（500 ms）
   statusBootBlueStrong();
   delay((unsigned long)BOOT_BLUE_MS);
-
-  // Sigfox 起動待ちなど計測前のアイドルは青・最低輝度
   statusIdleBlueDim();
 
 #if DEBUG_MODE
   Serial.begin(115200);
-  // USB ホストが CDC を開くまで最大 5 秒待つ（開かなくてもその後は進む）
-  unsigned long start = millis();
-  while (!Serial && millis() - start < 5000) {
-    delay(10);
-  }
-
+  unsigned long dbgStart = millis();
+  while (!Serial && millis() - dbgStart < 5000) { delay(10); }
   Serial.println("=== DEBUG START ===");
 #endif
 
-  // nRF の UART ピン割当（コアの setPins: RX, TX の順に注意）
+  // nRF UART ピン割当（setPins の引数順: RX, TX）
   Serial1.setPins(SIGFOX_RX_PIN, SIGFOX_TX_PIN);
+
 #if (MODULE_TYPE == 0)
+  // ── Sigfox パス ────────────────────────────────────────────
   Serial1.begin(SIGFOX_BAUD);
   delay(3000);  // BRKLSM100 コールドスタート待ち
-#else
-  Serial1.begin(LTE_BAUD);
-  delay(5000);  // SIM7080G 電源投入後の起動待ち
-#endif
 
-  // ハード I2C（D4/D5）— 正本の SDA/SCL
   Wire.begin();
   analogReadResolution(12);
-
-  // 3V3_SW 投入直後は各 IC の起動・デカップ充電に余裕を持たせる
   delay(200);
 
   s_errors = ERR_NONE;
-
   if (!tca9534Configure()) {
     s_errors |= ERR_TCA9534_I2C;
     statusErrorRed();
 #if DEBUG_MODE
-    Serial.println("[TCA9534] init failed (check ADDR / wiring / v3.02 board)");
+    Serial.println("[TCA9534] init failed");
 #endif
   }
-
   measureAll();
-  sendData();
+  sendSigfox();
+
+#elif (MODULE_TYPE == 1)
+  // ── LTE-M パス ─────────────────────────────────────────────
+  // ① モジュール起動直後に lteBegin() でネット登録を開始させる
+  Serial1.begin(LTE_BAUD);
+  delay(3000);  // SIM7080G UART 起動待ち
+
+  if (!lteBegin()) {
+    // AT 失敗 → 計測もスキップしてスリープ
+    deepSleep(SLEEP_MINUTES);
+    return;
+  }
+
+  // ② ネット登録している間に I2C 初期化と計測を並行実施
+  Wire.begin();
+  analogReadResolution(12);
+  delay(200);
+
+  s_errors = ERR_NONE;
+  if (!tca9534Configure()) {
+    s_errors |= ERR_TCA9534_I2C;
+    statusErrorRed();
+#if DEBUG_MODE
+    Serial.println("[TCA9534] init failed");
+#endif
+  }
+  measureAll();
+
+  // ③ ネット登録完了まで残り時間を吸収し、HTTPS POST
+  lteWaitAndPost();
+#endif
 
   deepSleep(SLEEP_MINUTES);
 }
 
 void loop() {
 
-  // 起床直後〜計測前: アイドルはディム青
   statusIdleBlueDim();
+  digitalWrite(SW_POWER_PIN, HIGH);  // 3V3_SW 再投入
 
-  // スリープから戻ったあと、再度周辺レールを有効化
-  digitalWrite(SW_POWER_PIN, HIGH);
-
-  // スリープ中は Serial1 を end しているため、ここで UART を再度有効化
+  // スリープ中に Serial1.end() しているため再初期化
   Serial1.setPins(SIGFOX_RX_PIN, SIGFOX_TX_PIN);
+
 #if (MODULE_TYPE == 0)
+  // ── Sigfox パス ────────────────────────────────────────────
   Serial1.begin(SIGFOX_BAUD);
   delay(3000);  // BRKLSM100 再起動待ち
-#else
-  Serial1.begin(LTE_BAUD);
-  delay(5000);  // SIM7080G 再起動待ち
-#endif
 
-  // スリープ前に Wire を止めていないが、周辺電源復帰後は再初期化しておく方が安全
   Wire.begin();
 
 #if DEBUG_MODE
@@ -1080,22 +1075,56 @@ void loop() {
 #endif
 
   s_errors = ERR_NONE;
-
   if (!tca9534Configure()) {
     s_errors |= ERR_TCA9534_I2C;
     statusErrorRed();
 #if DEBUG_MODE
-    Serial.println("[TCA9534] re-init after wake failed");
+    Serial.println("[TCA9534] re-init failed");
 #endif
   }
-
   if (s_pendingTare) {
     s_pendingTare = false;
     performTare();
   }
-
   measureAll();
-  sendData();
+  sendSigfox();
+
+#elif (MODULE_TYPE == 1)
+  // ── LTE-M パス ─────────────────────────────────────────────
+  // ① モジュール再起動直後にネット登録を開始させる
+  Serial1.begin(LTE_BAUD);
+  delay(3000);  // SIM7080G UART 再起動待ち
+
+#if DEBUG_MODE
+  Serial.println("[WAKE]");
+#endif
+
+  if (!lteBegin()) {
+    // AT 失敗 → 計測もスキップしてスリープ
+    deepSleep(SLEEP_MINUTES);
+    return;
+  }
+
+  // ② ネット登録している間に I2C 初期化と計測を並行実施
+  Wire.begin();
+
+  s_errors = ERR_NONE;
+  if (!tca9534Configure()) {
+    s_errors |= ERR_TCA9534_I2C;
+    statusErrorRed();
+#if DEBUG_MODE
+    Serial.println("[TCA9534] re-init failed");
+#endif
+  }
+  if (s_pendingTare) {
+    s_pendingTare = false;
+    performTare();
+  }
+  measureAll();
+
+  // ③ ネット登録完了まで残り時間を吸収し、HTTPS POST
+  lteWaitAndPost();
+#endif
 
   deepSleep(SLEEP_MINUTES);
 }
