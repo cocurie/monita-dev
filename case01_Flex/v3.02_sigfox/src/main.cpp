@@ -82,11 +82,14 @@
 // U1 と U7 は UART 共有のため、基板実装モジュールに合わせてどちらか一方のみ選択すること（同時実装禁止）
 #define MODULE_TYPE 0
 
-// SIM7080G 設定（MODULE_TYPE == 1 のときのみ使用。APNなどは要変更）
-#define LTE_APN         "your-apn"           // 使用 SIM カードの APN（要変更）
-#define LTE_SERVER_HOST "your.server.com"    // 送信先サーバーホスト／IP（要変更）
-#define LTE_SERVER_PORT 9000                 // 送信先 UDP ポート（要変更）
-#define LTE_BAUD        9600                 // SIM7080G UART ボーレート
+// SIM7080G 設定（MODULE_TYPE == 1 のときのみ使用。各値は要変更）
+// ※トークンはコードに平文で残さない運用を推奨（書き込み済みファームは除く）
+#define LTE_APN         "iot.1nce.net"       // SIM カードの APN（1NCE の場合。要確認）
+#define LTE_SERVER_HOST "your.server.com"    // HTTPS 送信先ホスト名（要変更）
+#define LTE_POST_PATH   "/api/v2/write?org=YourOrg&bucket=YourBucket&precision=s"  // POST パス（要変更）
+#define LTE_TOKEN       "REPLACE_WITH_YOUR_TOKEN"   // Bearer 認証トークン（要変更）
+#define LTE_DEVICE_ID   "monita-flex-01"     // Line Protocol タグ用デバイス ID（要変更）
+#define LTE_BAUD        115200               // SIM7080G デフォルトボーレート（Sigfox の 9600 と異なる）
 
 // WS2812 を使う場合は 1 にし、NeoPixel のデータピン・個数と lib_deps を設定する。
 // Seeed XIAO nRF52840 Sense の Adafruit variant は離散 RGB（LED_RED/GREEN/BLUE）が標準。
@@ -783,12 +786,91 @@ static void sendSigfox() {
 // ============================================================
 // SIM7080G LTE-M 送信（MODULE_TYPE == 1 のときのみコンパイル）
 //
-// ペイロードは Sigfox と同じ 16 進文字列（12 バイト ASCII hex）。
-// UDP ソケット経由で LTE_SERVER_HOST:LTE_SERVER_PORT へ送信する。
-// APN・サーバー・ポートは上部の #define で変更すること。
+// 実証済み構成（2026-05-02）:
+//   MCU: XIAO nRF52840 / モジュール: SIM7080G / SIM: 1NCE IoT SIM
+//   UART: 115200bps, \r\n 終端（Sigfox の \r とは異なる）
+//   通信: HTTPS POST → InfluxDB Line Protocol（AT+SH系コマンド）
+//
+// 設定値（上部 #define）を NEXCO 案件の送信先に合わせること。
 // ============================================================
 
 #if (MODULE_TYPE == 1)
+
+// SIM7080G 専用 AT 送信（\r\n 終端。Sigfox の sendAT とは別関数）
+static String sendATLTE(const String &cmd, int waitMs = 5000) {
+#if DEBUG_MODE
+  Serial.print(">> ");
+  Serial.println(cmd);
+#endif
+  Serial1.print(cmd + "\r\n");
+  long start = millis();
+  String response = "";
+  while (millis() - start < waitMs) {
+    statusSigfoxBlinkTick();
+    while (Serial1.available()) {
+      char c = (char)Serial1.read();
+      response += c;
+    }
+  }
+#if DEBUG_MODE
+  Serial.println(response);
+#endif
+  return response;
+}
+
+// ネットワーク初期化（LTE-M モード設定→登録確認→PDP 有効化）
+static bool lteInitNetwork() {
+  sendATLTE("AT+CNMP=38", 2000);  // LTE-M のみに絞る（NB-IoT 等を除外）
+  delay(500);
+  sendATLTE("AT+CMNB=1", 2000);   // Cat-M1 選択
+  delay(500);
+  sendATLTE("AT+CGDCONT=1,\"IP\",\"" LTE_APN "\"", 2000);
+  delay(500);
+
+  // ネットワーク登録待ち（最大 60 秒 / 5 秒間隔 × 12 回）
+  // +CREG: 0,1=接続 / 0,5=ローミング接続（日本では 5 が正常なことがある）
+  bool registered = false;
+  for (int i = 0; i < 12; i++) {
+    String r = sendATLTE("AT+CREG?", 3000);
+    if (r.indexOf("0,1") >= 0 || r.indexOf("0,5") >= 0) {
+      registered = true;
+      break;
+    }
+    delay(5000);
+  }
+  if (!registered) {
+#if DEBUG_MODE
+    Serial.println("[LTE] network registration timeout");
+#endif
+    return false;
+  }
+
+  // データ接続（GPRS Attach）確認
+  if (sendATLTE("AT+CGATT?", 3000).indexOf("+CGATT: 1") < 0) {
+#if DEBUG_MODE
+    Serial.println("[LTE] CGATT failed");
+#endif
+    return false;
+  }
+  delay(3000);
+
+  // PDP コンテキスト有効化
+  // すでにアクティブな場合は ERROR が返るが正常。AT+CNACT? で IP 確認が確実。
+  sendATLTE("AT+CNACT=0,1", 15000);
+  delay(3000);
+
+  if (sendATLTE("AT+CNACT?", 3000).indexOf("0,1") < 0) {
+#if DEBUG_MODE
+    Serial.println("[LTE] IP address not obtained");
+#endif
+    return false;
+  }
+
+  return true;
+}
+
+// InfluxDB Line Protocol 形式で HTTPS POST 送信
+// body 例: "monita,device=monita-flex-01 ch1=1234,ch2=5678,..."
 static void sendSIM7080G() {
 
   if (s_errors != 0U) {
@@ -798,20 +880,25 @@ static void sendSIM7080G() {
     return;
   }
 
-  String payload = "";
-  for (int i = 0; i < 4; i++) payload += hx4(ch[i]);
-  payload += hx4(tempV);
-  payload += hx4(battV);
+  // Line Protocol ボディ組み立て
+  String body = "monita,device=" LTE_DEVICE_ID " ";
+  body += "ch1=" + String(ch[0]);
+  body += ",ch2=" + String(ch[1]);
+  body += ",ch3=" + String(ch[2]);
+  body += ",ch4=" + String(ch[3]);
+  body += ",temp=" + String(tempV);
+  body += ",batt=" + String(battV);
+  int bodyLen = (int)body.length();
 
 #if DEBUG_MODE
-  Serial.print("[LTE] payload: ");
-  Serial.println(payload);
+  Serial.print("[LTE] body: ");
+  Serial.println(body);
 #endif
 
   statusSigfoxBlinkReset();
 
   // モジュール疎通確認
-  if (sendAT("AT", 2000).indexOf("OK") < 0) {
+  if (sendATLTE("AT", 2000).indexOf("OK") < 0) {
     s_errors |= ERR_LTE_AT;
     statusErrorRed();
 #if DEBUG_MODE
@@ -819,61 +906,72 @@ static void sendSIM7080G() {
 #endif
     return;
   }
+  sendATLTE("AT+CPIN?", 2000);
 
-  // ネットワーク登録待ち（最大 60 秒）
-  bool registered = false;
-  unsigned long t0 = millis();
-  while (millis() - t0 < 60000UL) {
-    statusSigfoxBlinkTick();
-    String r = sendAT("AT+CEREG?", 2000);
-    // stat=1（登録済み）または stat=5（ローミング）
-    if (r.indexOf(",1") >= 0 || r.indexOf(",5") >= 0) {
-      registered = true;
-      break;
-    }
-    delay(2000);
-  }
-  if (!registered) {
+  // ネットワーク初期化
+  if (!lteInitNetwork()) {
     s_errors |= ERR_LTE_AT;
     statusErrorRed();
-#if DEBUG_MODE
-    Serial.println("[LTE] network registration timeout");
-#endif
     return;
   }
 
-  // APN 設定 ＆ PDP コンテキスト有効化
-  sendAT("AT+CGDCONT=1,\"IP\",\"" LTE_APN "\"", 2000);
-  sendAT("AT+CNACT=0,1", 10000);
-  delay(2000);
-
-  // UDP ソケットオープン
-  String openCmd = String("AT+CAOPEN=0,0,\"UDP\",\"") + LTE_SERVER_HOST + "\"," + String(LTE_SERVER_PORT);
-  String r = sendAT(openCmd, 8000);
-  if (r.indexOf("OK") < 0) {
-    s_errors |= ERR_LTE_AT;
-    statusErrorRed();
-#if DEBUG_MODE
-    Serial.println("[LTE] socket open failed");
-#endif
-    sendAT("AT+CNACT=0,0", 5000);
-    return;
-  }
-
-  // データ送信: AT+CASEND=<socket>,<len> → ">" プロンプト後に ASCII hex を送出
-  Serial1.print("AT+CASEND=0," + String(payload.length()) + "\r");
+  // 前回セッション切断（残骸があっても続行）
+  sendATLTE("AT+SHDISC", 3000);
   delay(500);
-  Serial1.print(payload);
+
+  // SSL 設定
+  sendATLTE("AT+CSSLCFG=\"ignorertctime\",1,1", 2000); delay(300);
+  sendATLTE("AT+CSSLCFG=\"sslversion\",1,3", 2000);    delay(300);
+  sendATLTE("AT+CSSLCFG=\"sni\",1,\"" LTE_SERVER_HOST "\"", 2000); delay(300);
+  sendATLTE("AT+SHSSL=1,\"\"", 2000); delay(300);
+
+  // HTTP パラメータ設定
+  sendATLTE("AT+SHCONF=\"BODYLEN\",1024", 2000);  delay(300);
+  sendATLTE("AT+SHCONF=\"HEADERLEN\",350", 2000); delay(300);
+  sendATLTE("AT+SHCONF=\"URL\",\"https://" LTE_SERVER_HOST "\"", 2000); delay(300);
+
+  // HTTPS 接続
+  String conn = sendATLTE("AT+SHCONN", 15000);
+  if (conn.indexOf("OK") < 0) {
+    s_errors |= ERR_LTE_AT;
+    statusErrorRed();
+#if DEBUG_MODE
+    Serial.println("[LTE] SHCONN failed");
+#endif
+    sendATLTE("AT+CNACT=0,0", 5000);
+    return;
+  }
+
+  // HTTP ヘッダ設定
+  sendATLTE("AT+SHCHEAD", 2000); delay(300);
+  sendATLTE("AT+SHAHEAD=\"Authorization\",\"Token " LTE_TOKEN "\"", 2000); delay(300);
+  sendATLTE("AT+SHAHEAD=\"Content-Type\",\"text/plain; charset=utf-8\"", 2000); delay(300);
+
+  // ボディ送信: AT+SHBOD 後は sendATLTE 経由ではなく Serial1 直書き（実証済み）
+  Serial1.print("AT+SHBOD=" + String(bodyLen) + ",5000\r\n");
+  delay(2000);        // ">" プロンプト待ち
+  Serial1.print(body);  // \r\n なしで raw 送信
   delay(1000);
 
-  // ソケット ＆ PDP クローズ
-  sendAT("AT+CACLOSE=0", 3000);
-  sendAT("AT+CNACT=0,0", 5000);
+  // POST 実行（3=POST）。204 No Content = InfluxDB 書き込み成功、200 OK も受け入れ
+  String result = sendATLTE("AT+SHREQ=\"" LTE_POST_PATH "\",3", 15000);
 
+  sendATLTE("AT+SHDISC", 3000);
+  sendATLTE("AT+CNACT=0,0", 5000);
+
+  if (result.indexOf(",204,") >= 0 || result.indexOf(",200,") >= 0) {
 #if DEBUG_MODE
-  Serial.println("[LTE] 送信完了");
+    Serial.println("[LTE] POST 成功");
 #endif
+  } else {
+    s_errors |= ERR_LTE_AT;
+    statusErrorRed();
+#if DEBUG_MODE
+    Serial.println("[LTE] POST 失敗: " + result);
+#endif
+  }
 }
+
 #endif  // MODULE_TYPE == 1
 
 // ============================================================
