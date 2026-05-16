@@ -78,6 +78,16 @@
 // D0 長押し判定閾値（ms）: これ以上 LOW が続いたら tare、未満で離したらソフトリセット
 #define BUTTON_LONG_PRESS_MS 5000UL
 
+// 無線モジュール選択: 0=Sigfox (BRKLSM100/U1)、1=LTE-M (SIM7080G/U7)
+// U1 と U7 は UART 共有のため、基板実装モジュールに合わせてどちらか一方のみ選択すること（同時実装禁止）
+#define MODULE_TYPE 0
+
+// SIM7080G 設定（MODULE_TYPE == 1 のときのみ使用。APNなどは要変更）
+#define LTE_APN         "your-apn"           // 使用 SIM カードの APN（要変更）
+#define LTE_SERVER_HOST "your.server.com"    // 送信先サーバーホスト／IP（要変更）
+#define LTE_SERVER_PORT 9000                 // 送信先 UDP ポート（要変更）
+#define LTE_BAUD        9600                 // SIM7080G UART ボーレート
+
 // WS2812 を使う場合は 1 にし、NeoPixel のデータピン・個数と lib_deps を設定する。
 // Seeed XIAO nRF52840 Sense の Adafruit variant は離散 RGB（LED_RED/GREEN/BLUE）が標準。
 #define USE_WS2812_STATUS_LED 0
@@ -143,6 +153,7 @@ enum : uint32_t {
   ERR_TCA_I2C = 1u << 2,
   ERR_SIGFOX_AT = 1u << 3,
   ERR_TCA9534_I2C = 1u << 4,
+  ERR_LTE_AT = 1u << 5,
 };
 
 static uint32_t s_errors;
@@ -770,6 +781,114 @@ static void sendSigfox() {
 }
 
 // ============================================================
+// SIM7080G LTE-M 送信（MODULE_TYPE == 1 のときのみコンパイル）
+//
+// ペイロードは Sigfox と同じ 16 進文字列（12 バイト ASCII hex）。
+// UDP ソケット経由で LTE_SERVER_HOST:LTE_SERVER_PORT へ送信する。
+// APN・サーバー・ポートは上部の #define で変更すること。
+// ============================================================
+
+#if (MODULE_TYPE == 1)
+static void sendSIM7080G() {
+
+  if (s_errors != 0U) {
+#if DEBUG_MODE
+    Serial.println("[LTE] skipped (errors)");
+#endif
+    return;
+  }
+
+  String payload = "";
+  for (int i = 0; i < 4; i++) payload += hx4(ch[i]);
+  payload += hx4(tempV);
+  payload += hx4(battV);
+
+#if DEBUG_MODE
+  Serial.print("[LTE] payload: ");
+  Serial.println(payload);
+#endif
+
+  statusSigfoxBlinkReset();
+
+  // モジュール疎通確認
+  if (sendAT("AT", 2000).indexOf("OK") < 0) {
+    s_errors |= ERR_LTE_AT;
+    statusErrorRed();
+#if DEBUG_MODE
+    Serial.println("[LTE] AT failed");
+#endif
+    return;
+  }
+
+  // ネットワーク登録待ち（最大 60 秒）
+  bool registered = false;
+  unsigned long t0 = millis();
+  while (millis() - t0 < 60000UL) {
+    statusSigfoxBlinkTick();
+    String r = sendAT("AT+CEREG?", 2000);
+    // stat=1（登録済み）または stat=5（ローミング）
+    if (r.indexOf(",1") >= 0 || r.indexOf(",5") >= 0) {
+      registered = true;
+      break;
+    }
+    delay(2000);
+  }
+  if (!registered) {
+    s_errors |= ERR_LTE_AT;
+    statusErrorRed();
+#if DEBUG_MODE
+    Serial.println("[LTE] network registration timeout");
+#endif
+    return;
+  }
+
+  // APN 設定 ＆ PDP コンテキスト有効化
+  sendAT("AT+CGDCONT=1,\"IP\",\"" LTE_APN "\"", 2000);
+  sendAT("AT+CNACT=0,1", 10000);
+  delay(2000);
+
+  // UDP ソケットオープン
+  String openCmd = String("AT+CAOPEN=0,0,\"UDP\",\"") + LTE_SERVER_HOST + "\"," + String(LTE_SERVER_PORT);
+  String r = sendAT(openCmd, 8000);
+  if (r.indexOf("OK") < 0) {
+    s_errors |= ERR_LTE_AT;
+    statusErrorRed();
+#if DEBUG_MODE
+    Serial.println("[LTE] socket open failed");
+#endif
+    sendAT("AT+CNACT=0,0", 5000);
+    return;
+  }
+
+  // データ送信: AT+CASEND=<socket>,<len> → ">" プロンプト後に ASCII hex を送出
+  Serial1.print("AT+CASEND=0," + String(payload.length()) + "\r");
+  delay(500);
+  Serial1.print(payload);
+  delay(1000);
+
+  // ソケット ＆ PDP クローズ
+  sendAT("AT+CACLOSE=0", 3000);
+  sendAT("AT+CNACT=0,0", 5000);
+
+#if DEBUG_MODE
+  Serial.println("[LTE] 送信完了");
+#endif
+}
+#endif  // MODULE_TYPE == 1
+
+// ============================================================
+// sendData() — MODULE_TYPE に応じて Sigfox または LTE-M を呼び分ける
+// ============================================================
+
+static void sendData() {
+#if (MODULE_TYPE == 0)
+  sendSigfox();
+#elif (MODULE_TYPE == 1)
+  sendSIM7080G();
+#endif
+}
+
+// ============================================================
 // Arduino エントリ
 // ============================================================
 
@@ -806,16 +925,19 @@ void setup() {
 
   // nRF の UART ピン割当（コアの setPins: RX, TX の順に注意）
   Serial1.setPins(SIGFOX_RX_PIN, SIGFOX_TX_PIN);
+#if (MODULE_TYPE == 0)
   Serial1.begin(SIGFOX_BAUD);
-
-  // BRKLSM100 コールドスタート時の内部起動待ち（データシート・実測に応じて調整可）
-  delay(3000);
+  delay(3000);  // BRKLSM100 コールドスタート待ち
+#else
+  Serial1.begin(LTE_BAUD);
+  delay(5000);  // SIM7080G 電源投入後の起動待ち
+#endif
 
   // ハード I2C（D4/D5）— 正本の SDA/SCL
   Wire.begin();
   analogReadResolution(12);
 
-  // 3V3_SW 投入直後は各 ICの起動・デカップ充電に余裕を持たせる
+  // 3V3_SW 投入直後は各 IC の起動・デカップ充電に余裕を持たせる
   delay(200);
 
   s_errors = ERR_NONE;
@@ -829,7 +951,7 @@ void setup() {
   }
 
   measureAll();
-  sendSigfox();
+  sendData();
 
   deepSleep(SLEEP_MINUTES);
 }
@@ -842,14 +964,15 @@ void loop() {
   // スリープから戻ったあと、再度周辺レールを有効化
   digitalWrite(SW_POWER_PIN, HIGH);
 
-  // 電源オフ運用後は毎回モジュール起動に相当する待ちを入れる
-  delay(3000);
-
-  delay(200);
-
   // スリープ中は Serial1 を end しているため、ここで UART を再度有効化
   Serial1.setPins(SIGFOX_RX_PIN, SIGFOX_TX_PIN);
+#if (MODULE_TYPE == 0)
   Serial1.begin(SIGFOX_BAUD);
+  delay(3000);  // BRKLSM100 再起動待ち
+#else
+  Serial1.begin(LTE_BAUD);
+  delay(5000);  // SIM7080G 再起動待ち
+#endif
 
   // スリープ前に Wire を止めていないが、周辺電源復帰後は再初期化しておく方が安全
   Wire.begin();
@@ -874,7 +997,7 @@ void loop() {
   }
 
   measureAll();
-  sendSigfox();
+  sendData();
 
   deepSleep(SLEEP_MINUTES);
 }
