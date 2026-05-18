@@ -1,122 +1,406 @@
 /**
- * BLE 公園人流測定 — 周辺デバイスのアドバタイジングをシリアルへログ
- * 基板: Seeed XIAO nRF52840 Sense / Adafruit Bluefruit52 Central スキャン
- *
- * 要件メモ: ble_people_count_requirements.md §3.2 Active Scan
- * SoftDevice v6: 各 ADV レポート後に Scanner.resume() が必須
+ * BLE 親機 — 人数推定（RSSIクラスタリング付き）
+ * 基板: Seeed XIAO nRF52840
  */
 
+#include <Adafruit_TinyUSB.h>
 #include <bluefruit.h>
+#include <string.h>
+#include <Adafruit_LittleFS.h>
+#include <InternalFileSystem.h>
+using namespace Adafruit_LittleFS_Namespace;
 
-/** 1 にするとローカル名等を AD から分解して追記（ログ量増） */
-#ifndef DEBUG_VERBOSE
-#define DEBUG_VERBOSE 0
-#endif
+// ── 出力 ─────────────────────────
+static bool const OUTPUT_RAW_LOG = false;
+static bool const OUTPUT_PEOPLE  = true;
 
-/** 連続スキャンの開始間隔（ミリ秒）。「10秒に一回」スキャン周期の基準 */
-#ifndef SCAN_CYCLE_MS
-#define SCAN_CYCLE_MS 10000u
-#endif
-/**
- * 1回のスキャン継続時間。Adafruit BLEScanner::start(timeout) の timeout は
- * Nordic SoftDevice の「スキャン持続時間」= 10ms 単位（0 のときは無制限）
- */
-#ifndef SCAN_DURATION_10MS
-#define SCAN_DURATION_10MS 200u /* 200 × 10ms = 2s。長くしたいときは例: 1000 = 10s */
-#endif
+// ── ログ設定 ──────────────────────
+static bool const ENABLE_LOGGING = false;    // false にするとフラッシュ書き込みなし
+static char const* LOG_FILE      = "/log.csv";
 
-static void scan_callback(ble_gap_evt_adv_report_t *report);
-static uint32_t last_scan_cycle_ms;
+// ── パラメータ ───────────────────
+static uint32_t const WINDOW_MS   = 60000;
+static int const MIN_HITS         = 5;
+static int const RSSI_THRESHOLD   = -50;
+static int const RSSI_MERGE_GAP   = 1;   // ★クラスタ幅
+static float const CALIBRATION    = 0.9;
 
-void setup() {
-  Serial.begin(115200);
-  while (!Serial) {
-    delay(10);
-  }
+// ── BLEスキャン ─────────────────
+static uint16_t const SCAN_INTERVAL_MS = 150;
+static uint16_t const SCAN_WINDOW_MS   = 50;
 
-  Serial.println();
-  Serial.println(F("=== BLE park scan — advertising log ==="));
-  Serial.println(F("fmt: ms MAC_RSSI [ADV|SR] payload(hex)"));
-#if DEBUG_VERBOSE
-  Serial.println(F("(DEBUG_VERBOSE: name/MSD lines follow each packet)"));
-#endif
-  Serial.println();
+// ── デバイス保持 ────────────────
+#define MAX_DEVICES 64
 
-  Bluefruit.begin(0, 1);
-  Bluefruit.setTxPower(4);
-  Bluefruit.setName("XiaoParkScan");
+struct Device {
+  uint8_t mac[6];
+  int count;
+  int rssi_sum;
+};
 
-  Bluefruit.Scanner.setRxCallback(scan_callback);
-  Bluefruit.Scanner.restartOnDisconnect(true);
-  Bluefruit.Scanner.setInterval(160, 80);
-  Bluefruit.Scanner.useActiveScan(true);
-  /* start(0) は使わず loop で周期起動（省電力・ログ間引き） */
-  last_scan_cycle_ms = 0;
+Device devices[MAX_DEVICES];
+int deviceCount = 0;
 
-  Serial.print(F("Scan cycle: every "));
-  Serial.print(SCAN_CYCLE_MS / 1000);
-  Serial.print(F(" s, burst "));
-  Serial.print((unsigned long)SCAN_DURATION_10MS * 10UL);
-  Serial.println(F(" ms (active), then idle"));
-  Serial.println();
+uint32_t windowStart = 0;
+
+// ── LittleFS ファイルハンドル ────
+File logFile(InternalFS);
+
+// ── キャリブレーション状態 ─────────
+static bool  calibMode       = false;
+static int   calibActual     = 0;
+static int   calibSamples    = 0;
+static float calibRatioSum   = 0.0f;
+static int   calibMinHitsSum = 0;
+#define CALIB_MIN_SAMPLES 5
+
+// ── Serial コマンドバッファ ─────────
+static char cmdBuf[16];
+static int  cmdLen = 0;
+
+// ───────────────────────────────
+// ユーティリティ
+// ───────────────────────────────
+
+/** 起動からの経過時間を "HH:MM:SS" 形式で返す */
+void printTimestamp() {
+  uint32_t s = millis() / 1000UL;
+  uint32_t h = s / 3600;
+  uint32_t m = (s % 3600) / 60;
+  uint32_t sec = s % 60;
+  char buf[10];
+  snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu", h, m, sec);
+  Serial.print(buf);
 }
 
-void scan_callback(ble_gap_evt_adv_report_t *report) {
-  Serial.print((unsigned long)millis());
-  Serial.print(' ');
-  Serial.printBufferReverse(report->peer_addr.addr, 6, ':');
-  Serial.print(' ');
-  Serial.print(report->rssi);
-  Serial.print(F("dBm "));
-  Serial.print(report->type.scan_response ? F("[SR] ") : F("[ADV] "));
-  Serial.printBuffer(report->data.p_data, report->data.len, '-');
-  Serial.println();
+/** 現在の経過時間を CSV 1行としてフラッシュに追記 */
+void logRecord(int people, int devCount) {
+  if (!ENABLE_LOGGING) return;
 
-#if DEBUG_VERBOSE
-  uint8_t buf[32];
-  memset(buf, 0, sizeof(buf));
-  if (Bluefruit.Scanner.parseReportByType(report, BLE_GAP_AD_TYPE_SHORT_LOCAL_NAME, buf,
-                                          sizeof(buf))) {
-    Serial.print(F("      name(short): "));
-    Serial.println((const char *)buf);
+  logFile.open(LOG_FILE, FILE_O_WRITE);
+  if (!logFile) return;
+  logFile.seek(logFile.size());  // 末尾に追記
+
+  char ts[10];
+  uint32_t s = millis() / 1000UL;
+  snprintf(ts, sizeof(ts), "%02lu:%02lu:%02lu",
+           s / 3600, (s % 3600) / 60, s % 60);
+
+  logFile.print(ts);
+  logFile.print(",");
+  logFile.print(people);
+  logFile.print(",");
+  logFile.println(devCount);
+  logFile.close();
+}
+
+/** フラッシュに保存された全レコードをシリアルに出力 */
+void dumpLog() {
+  if (!ENABLE_LOGGING) {
+    Serial.println("[LOG] Logging is disabled.");
+    return;
   }
-  memset(buf, 0, sizeof(buf));
-  if (Bluefruit.Scanner.parseReportByType(report, BLE_GAP_AD_TYPE_COMPLETE_LOCAL_NAME, buf,
-                                          sizeof(buf))) {
-    Serial.print(F("      name(complete): "));
-    Serial.println((const char *)buf);
+  logFile.open(LOG_FILE, FILE_O_READ);
+  if (!logFile) {
+    Serial.println("[LOG] No log file found.");
+    return;
   }
-  memset(buf, 0, sizeof(buf));
-  uint8_t len = Bluefruit.Scanner.parseReportByType(
-      report, BLE_GAP_AD_TYPE_MANUFACTURER_SPECIFIC_DATA, buf, sizeof(buf));
-  if (len) {
-    Serial.print(F("      MSD ("));
-    Serial.print(len);
-    Serial.print(F("): "));
-    Serial.printBuffer(buf, len, '-');
-    Serial.println();
+  Serial.println("=== LOG DUMP ===");
+  while (logFile.available()) {
+    Serial.write(logFile.read());
   }
-#endif
+  logFile.close();
+  Serial.println("=== END ===");
+}
+
+// ───────────────────────────────
+// キャリブレーション
+// ───────────────────────────────
+
+/**
+ * MIN_HITS を 1〜20 で総当たりし、
+ * 有効デバイス数が actual に最も近く
+ * かつ CALIBRATION が 1.0 に近くなる組み合わせを返す
+ */
+void findBestParams(int actual, int &outMinHits, float &outCalib) {
+  outMinHits = MIN_HITS;
+  outCalib   = CALIBRATION;
+  float bestScore = 1e9f;
+
+  for (int minH = 1; minH <= 20; minH++) {
+    int q = 0;
+    for (int i = 0; i < deviceCount; i++) {
+      if (devices[i].count >= minH) q++;
+    }
+    if (q == 0) break;
+    float calib = (float)actual / (float)q;
+    float score = fabsf(calib - 1.0f);  // 1.0 に近いほど良い
+    if (score < bestScore) {
+      bestScore  = score;
+      outMinHits = minH;
+      outCalib   = calib;
+    }
+  }
+}
+
+/** キャリブレーション結果を出力 */
+void printCalibResult() {
+  if (calibSamples == 0) {
+    Serial.println("[CALIB] No data. Send c<N> to start. e.g. c18");
+    return;
+  }
+  int   minHits = (calibMinHitsSum + calibSamples / 2) / calibSamples;
+  float calib   = calibRatioSum / (float)calibSamples;
+
+  Serial.println("=== CALIB RESULT ===");
+  Serial.print  ("  Samples : "); Serial.println(calibSamples);
+  Serial.println("  --- Paste into your code ---");
+  Serial.print  ("  static int   const MIN_HITS    = "); Serial.print(minHits);    Serial.println(";");
+  Serial.print  ("  static float const CALIBRATION = "); Serial.print(calib, 2);  Serial.println(";");
+  Serial.println("====================");
+}
+
+/** シリアルコマンドを解釈して実行 */
+void processCommand(const char* cmd) {
+  if (cmd[0] == '\0') return;
+
+  if (cmd[0] == 'd' || cmd[0] == 'D') {
+    dumpLog();
+
+  } else if (cmd[0] == 'c' || cmd[0] == 'C') {
+    const char* p = cmd + 1;
+    while (*p == ' ') p++;
+    int n = atoi(p);
+    if (n > 0) {
+      calibMode       = true;
+      calibActual     = n;
+      calibSamples    = 0;
+      calibRatioSum   = 0.0f;
+      calibMinHitsSum = 0;
+      Serial.print("[CALIB] Ground truth = ");
+      Serial.print(n);
+      Serial.print(" people. Collecting ");
+      Serial.print(CALIB_MIN_SAMPLES);
+      Serial.println(" samples...");
+    } else {
+      Serial.println("[CALIB] Usage: c<N>  e.g. c18");
+    }
+
+  } else if (cmd[0] == 'r' || cmd[0] == 'R') {
+    printCalibResult();
+
+  } else if (cmd[0] == 'x' || cmd[0] == 'X') {
+    calibMode = false;
+    Serial.println("[CALIB] Exited calibration mode.");
+
+  } else {
+    Serial.println("[CMD] d=dump  c<N>=calib  r=result  x=exit calib");
+  }
+}
+
+int findDevice(uint8_t* mac) {
+  for (int i = 0; i < deviceCount; i++) {
+    if (memcmp(devices[i].mac, mac, 6) == 0) return i;
+  }
+  return -1;
+}
+
+void updateDevice(uint8_t* mac, int rssi) {
+  if (rssi < RSSI_THRESHOLD) return;
+
+  int idx = findDevice(mac);
+
+  if (idx >= 0) {
+    devices[idx].count++;
+    devices[idx].rssi_sum += rssi;
+  } else if (deviceCount < MAX_DEVICES) {
+    memcpy(devices[deviceCount].mac, mac, 6);
+    devices[deviceCount].count = 1;
+    devices[deviceCount].rssi_sum = rssi;
+    deviceCount++;
+  }
+}
+
+// ───────────────────────────────
+// 人数推定（クラスタリング）
+// ───────────────────────────────
+
+int estimatePeople() {
+
+  // ① 有効デバイスのRSSI平均を配列へ
+  int rssiList[MAX_DEVICES];
+  int n = 0;
+
+  for (int i = 0; i < deviceCount; i++) {
+    if (devices[i].count >= MIN_HITS) {
+      int avg = devices[i].rssi_sum / devices[i].count;
+      rssiList[n++] = avg;
+    }
+  }
+
+  if (n == 0) return 0;
+
+  // ② RSSIでソート（強い順）
+  for (int i = 0; i < n - 1; i++) {
+    for (int j = i + 1; j < n; j++) {
+      if (rssiList[i] < rssiList[j]) {
+        int tmp = rssiList[i];
+        rssiList[i] = rssiList[j];
+        rssiList[j] = tmp;
+      }
+    }
+  }
+
+  // ③ クラスタリング
+  int people = 0;
+  bool used[MAX_DEVICES] = {false};
+
+  for (int i = 0; i < n; i++) {
+    if (used[i]) continue;
+
+    people++;               // 新しい人
+    used[i] = true;
+
+    for (int j = i + 1; j < n; j++) {
+      if (used[j]) continue;
+
+      if (abs(rssiList[i] - rssiList[j]) <= RSSI_MERGE_GAP) {
+        used[j] = true;     // 同一人物として潰す
+      }
+    }
+  }
+
+  // ④ 補正
+  return (int)(people * CALIBRATION);
+}
+
+// ───────────────────────────────
+// スキャンコールバック
+// ───────────────────────────────
+
+static void scanCallback(ble_gap_evt_adv_report_t *report) {
+
+  updateDevice(report->peer_addr.addr, report->rssi);
+
+  if (OUTPUT_RAW_LOG) {
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr),
+             "%02X:%02X:%02X:%02X:%02X:%02X",
+             report->peer_addr.addr[5], report->peer_addr.addr[4],
+             report->peer_addr.addr[3], report->peer_addr.addr[2],
+             report->peer_addr.addr[1], report->peer_addr.addr[0]);
+
+    Serial.print("[");
+    Serial.print(millis() / 1000UL);
+    Serial.print("s] ");
+    Serial.print(macStr);
+    Serial.print(" RSSI=");
+    Serial.println(report->rssi);
+  }
 
   Bluefruit.Scanner.resume();
 }
 
+// ───────────────────────────────
+// setup
+// ───────────────────────────────
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000) yield();
+
+  Serial.println("\n--- BLE People Counter (Clustering) ---");
+  Serial.println("  Commands: d=dump  c<N>=calib(e.g.c18)  r=result  x=exit calib");
+
+  // ── フラッシュ初期化 ─────────────
+  if (ENABLE_LOGGING) {
+    InternalFS.begin();
+    if (!InternalFS.exists(LOG_FILE)) {
+      logFile.open(LOG_FILE, FILE_O_WRITE);
+      logFile.println("timestamp,people,devices");
+      logFile.close();
+      Serial.println("[LOG] Created new log file.");
+    } else {
+      Serial.println("[LOG] Log file found. Appending.");
+    }
+    Serial.println("[LOG] Send 'd' to dump log.");
+  }
+
+  Bluefruit.begin(1, 0);
+  Bluefruit.setName("PeopleCounter");
+
+  Bluefruit.Scanner.setRxCallback(scanCallback);
+  Bluefruit.Scanner.useActiveScan(false);
+  Bluefruit.Scanner.setInterval(
+    (uint16_t)(SCAN_INTERVAL_MS * 1000 / 625),
+    (uint16_t)(SCAN_WINDOW_MS   * 1000 / 625)
+  );
+
+  Bluefruit.Scanner.start(0);
+
+  windowStart = millis();
+}
+
+// ───────────────────────────────
+// loop
+// ───────────────────────────────
+
 void loop() {
-  if (Bluefruit.Scanner.isRunning()) {
-    return;
+  uint32_t now = millis();
+
+  // ── Serial コマンド処理（行バッファ）──
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (cmdLen > 0) {
+        cmdBuf[cmdLen] = '\0';
+        processCommand(cmdBuf);
+        cmdLen = 0;
+      }
+    } else if (cmdLen < (int)sizeof(cmdBuf) - 1) {
+      cmdBuf[cmdLen++] = c;
+    }
   }
 
-  uint32_t const now = millis();
-  if (last_scan_cycle_ms != 0 && (now - last_scan_cycle_ms) < SCAN_CYCLE_MS) {
-    return;
-  }
+  if (now - windowStart >= WINDOW_MS) {
 
-  last_scan_cycle_ms = now;
-  Serial.print(F("[scan start] "));
-  Serial.println((unsigned long)now);
+    if (OUTPUT_PEOPLE) {
+      int people = estimatePeople();
 
-  if (!Bluefruit.Scanner.start(SCAN_DURATION_10MS)) {
-    Serial.println(F("[err] Scanner.start failed"));
-    delay(50);
+      Serial.println("==============================");
+      Serial.print("[");
+      printTimestamp();
+      Serial.print("] People=");
+      Serial.print(people);
+      Serial.print(" (devices=");
+      Serial.print(deviceCount);
+      Serial.println(")");
+
+      logRecord(people, deviceCount);  // フラッシュに記録
+    }
+
+    // ── キャリブレーション処理 ──────
+    if (calibMode) {
+      int   bestMinHits;
+      float bestCalib;
+      findBestParams(calibActual, bestMinHits, bestCalib);
+      calibMinHitsSum += bestMinHits;
+      calibRatioSum   += bestCalib;
+      calibSamples++;
+
+      Serial.print("[CALIB] #"); Serial.print(calibSamples);
+      Serial.print("  actual=");       Serial.print(calibActual);
+      Serial.print("  MIN_HITS→");    Serial.print(bestMinHits);
+      Serial.print("  CALIBRATION→"); Serial.println(bestCalib, 2);
+
+      if (calibSamples >= CALIB_MIN_SAMPLES) {
+        printCalibResult();
+        calibMode = false;
+      }
+    }
+
+    // リセット
+    deviceCount = 0;
+    windowStart = now;
   }
 }

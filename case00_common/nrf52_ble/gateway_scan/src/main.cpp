@@ -6,28 +6,21 @@
 #include <Adafruit_TinyUSB.h>
 #include <bluefruit.h>
 #include <string.h>
-#include <Adafruit_LittleFS.h>
-#include <InternalFileSystem.h>
-using namespace Adafruit_LittleFS_Namespace;
 
 // ── 出力 ─────────────────────────
 static bool const OUTPUT_RAW_LOG = false;
 static bool const OUTPUT_PEOPLE  = true;
 
-// ── ログ設定 ──────────────────────
-static bool const ENABLE_LOGGING = false;    // false にするとフラッシュ書き込みなし
-static char const* LOG_FILE      = "/log.csv";
-
 // ── パラメータ ───────────────────
 static uint32_t const WINDOW_MS   = 60000;
 static int const MIN_HITS         = 5;
-static int const RSSI_THRESHOLD   = -50;
-static int const RSSI_MERGE_GAP   = 1;   // ★クラスタ幅
-static float const CALIBRATION    = 0.9;
+static int const RSSI_THRESHOLD   = -65;
+static int const RSSI_MERGE_GAP   = 3;   // ★クラスタ幅
+static float const CALIBRATION    = 0.70;
 
 // ── BLEスキャン ─────────────────
-static uint16_t const SCAN_INTERVAL_MS = 150;
-static uint16_t const SCAN_WINDOW_MS   = 50;
+static uint16_t const SCAN_INTERVAL_MS = 300;
+static uint16_t const SCAN_WINDOW_MS   = 30;
 
 // ── デバイス保持 ────────────────
 #define MAX_DEVICES 64
@@ -43,160 +36,9 @@ int deviceCount = 0;
 
 uint32_t windowStart = 0;
 
-// ── LittleFS ファイルハンドル ────
-File logFile(InternalFS);
-
-// ── キャリブレーション状態 ─────────
-static bool  calibMode       = false;
-static int   calibActual     = 0;
-static int   calibSamples    = 0;
-static float calibRatioSum   = 0.0f;
-static int   calibMinHitsSum = 0;
-#define CALIB_MIN_SAMPLES 5
-
-// ── Serial コマンドバッファ ─────────
-static char cmdBuf[16];
-static int  cmdLen = 0;
-
 // ───────────────────────────────
 // ユーティリティ
 // ───────────────────────────────
-
-/** 起動からの経過時間を "HH:MM:SS" 形式で返す */
-void printTimestamp() {
-  uint32_t s = millis() / 1000UL;
-  uint32_t h = s / 3600;
-  uint32_t m = (s % 3600) / 60;
-  uint32_t sec = s % 60;
-  char buf[10];
-  snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu", h, m, sec);
-  Serial.print(buf);
-}
-
-/** 現在の経過時間を CSV 1行としてフラッシュに追記 */
-void logRecord(int people, int devCount) {
-  if (!ENABLE_LOGGING) return;
-
-  logFile.open(LOG_FILE, FILE_O_WRITE);
-  if (!logFile) return;
-  logFile.seek(logFile.size());  // 末尾に追記
-
-  char ts[10];
-  uint32_t s = millis() / 1000UL;
-  snprintf(ts, sizeof(ts), "%02lu:%02lu:%02lu",
-           s / 3600, (s % 3600) / 60, s % 60);
-
-  logFile.print(ts);
-  logFile.print(",");
-  logFile.print(people);
-  logFile.print(",");
-  logFile.println(devCount);
-  logFile.close();
-}
-
-/** フラッシュに保存された全レコードをシリアルに出力 */
-void dumpLog() {
-  if (!ENABLE_LOGGING) {
-    Serial.println("[LOG] Logging is disabled.");
-    return;
-  }
-  logFile.open(LOG_FILE, FILE_O_READ);
-  if (!logFile) {
-    Serial.println("[LOG] No log file found.");
-    return;
-  }
-  Serial.println("=== LOG DUMP ===");
-  while (logFile.available()) {
-    Serial.write(logFile.read());
-  }
-  logFile.close();
-  Serial.println("=== END ===");
-}
-
-// ───────────────────────────────
-// キャリブレーション
-// ───────────────────────────────
-
-/**
- * MIN_HITS を 1〜20 で総当たりし、
- * 有効デバイス数が actual に最も近く
- * かつ CALIBRATION が 1.0 に近くなる組み合わせを返す
- */
-void findBestParams(int actual, int &outMinHits, float &outCalib) {
-  outMinHits = MIN_HITS;
-  outCalib   = CALIBRATION;
-  float bestScore = 1e9f;
-
-  for (int minH = 1; minH <= 20; minH++) {
-    int q = 0;
-    for (int i = 0; i < deviceCount; i++) {
-      if (devices[i].count >= minH) q++;
-    }
-    if (q == 0) break;
-    float calib = (float)actual / (float)q;
-    float score = fabsf(calib - 1.0f);  // 1.0 に近いほど良い
-    if (score < bestScore) {
-      bestScore  = score;
-      outMinHits = minH;
-      outCalib   = calib;
-    }
-  }
-}
-
-/** キャリブレーション結果を出力 */
-void printCalibResult() {
-  if (calibSamples == 0) {
-    Serial.println("[CALIB] No data. Send c<N> to start. e.g. c18");
-    return;
-  }
-  int   minHits = (calibMinHitsSum + calibSamples / 2) / calibSamples;
-  float calib   = calibRatioSum / (float)calibSamples;
-
-  Serial.println("=== CALIB RESULT ===");
-  Serial.print  ("  Samples : "); Serial.println(calibSamples);
-  Serial.println("  --- Paste into your code ---");
-  Serial.print  ("  static int   const MIN_HITS    = "); Serial.print(minHits);    Serial.println(";");
-  Serial.print  ("  static float const CALIBRATION = "); Serial.print(calib, 2);  Serial.println(";");
-  Serial.println("====================");
-}
-
-/** シリアルコマンドを解釈して実行 */
-void processCommand(const char* cmd) {
-  if (cmd[0] == '\0') return;
-
-  if (cmd[0] == 'd' || cmd[0] == 'D') {
-    dumpLog();
-
-  } else if (cmd[0] == 'c' || cmd[0] == 'C') {
-    const char* p = cmd + 1;
-    while (*p == ' ') p++;
-    int n = atoi(p);
-    if (n > 0) {
-      calibMode       = true;
-      calibActual     = n;
-      calibSamples    = 0;
-      calibRatioSum   = 0.0f;
-      calibMinHitsSum = 0;
-      Serial.print("[CALIB] Ground truth = ");
-      Serial.print(n);
-      Serial.print(" people. Collecting ");
-      Serial.print(CALIB_MIN_SAMPLES);
-      Serial.println(" samples...");
-    } else {
-      Serial.println("[CALIB] Usage: c<N>  e.g. c18");
-    }
-
-  } else if (cmd[0] == 'r' || cmd[0] == 'R') {
-    printCalibResult();
-
-  } else if (cmd[0] == 'x' || cmd[0] == 'X') {
-    calibMode = false;
-    Serial.println("[CALIB] Exited calibration mode.");
-
-  } else {
-    Serial.println("[CMD] d=dump  c<N>=calib  r=result  x=exit calib");
-  }
-}
 
 int findDevice(uint8_t* mac) {
   for (int i = 0; i < deviceCount; i++) {
@@ -310,21 +152,6 @@ void setup() {
   while (!Serial && millis() < 3000) yield();
 
   Serial.println("\n--- BLE People Counter (Clustering) ---");
-  Serial.println("  Commands: d=dump  c<N>=calib(e.g.c18)  r=result  x=exit calib");
-
-  // ── フラッシュ初期化 ─────────────
-  if (ENABLE_LOGGING) {
-    InternalFS.begin();
-    if (!InternalFS.exists(LOG_FILE)) {
-      logFile.open(LOG_FILE, FILE_O_WRITE);
-      logFile.println("timestamp,people,devices");
-      logFile.close();
-      Serial.println("[LOG] Created new log file.");
-    } else {
-      Serial.println("[LOG] Log file found. Appending.");
-    }
-    Serial.println("[LOG] Send 'd' to dump log.");
-  }
 
   Bluefruit.begin(1, 0);
   Bluefruit.setName("PeopleCounter");
@@ -348,55 +175,17 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  // ── Serial コマンド処理（行バッファ）──
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c == '\n' || c == '\r') {
-      if (cmdLen > 0) {
-        cmdBuf[cmdLen] = '\0';
-        processCommand(cmdBuf);
-        cmdLen = 0;
-      }
-    } else if (cmdLen < (int)sizeof(cmdBuf) - 1) {
-      cmdBuf[cmdLen++] = c;
-    }
-  }
-
   if (now - windowStart >= WINDOW_MS) {
 
     if (OUTPUT_PEOPLE) {
       int people = estimatePeople();
 
       Serial.println("==============================");
-      Serial.print("[");
-      printTimestamp();
-      Serial.print("] People=");
+      Serial.print("[People] ");
       Serial.print(people);
       Serial.print(" (devices=");
       Serial.print(deviceCount);
       Serial.println(")");
-
-      logRecord(people, deviceCount);  // フラッシュに記録
-    }
-
-    // ── キャリブレーション処理 ──────
-    if (calibMode) {
-      int   bestMinHits;
-      float bestCalib;
-      findBestParams(calibActual, bestMinHits, bestCalib);
-      calibMinHitsSum += bestMinHits;
-      calibRatioSum   += bestCalib;
-      calibSamples++;
-
-      Serial.print("[CALIB] #"); Serial.print(calibSamples);
-      Serial.print("  actual=");       Serial.print(calibActual);
-      Serial.print("  MIN_HITS→");    Serial.print(bestMinHits);
-      Serial.print("  CALIBRATION→"); Serial.println(bestCalib, 2);
-
-      if (calibSamples >= CALIB_MIN_SAMPLES) {
-        printCalibResult();
-        calibMode = false;
-      }
     }
 
     // リセット
