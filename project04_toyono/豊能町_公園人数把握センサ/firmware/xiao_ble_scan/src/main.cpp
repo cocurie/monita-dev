@@ -63,10 +63,10 @@ static char const* LOG_FILE      = "/log.csv";
 
 // ── パラメータ ───────────────────
 static uint32_t const WINDOW_MS   = 60000;
-static int const MIN_HITS         = 5;
+static int const MIN_HITS         = 12;
 static int const RSSI_THRESHOLD   = -50;
 static int const RSSI_MERGE_GAP   = 1;   // ★クラスタ幅
-static float const CALIBRATION    = 0.9;
+static float const CALIBRATION    = 0.8;
 
 // ── BLEスキャン ─────────────────
 static uint16_t const SCAN_INTERVAL_MS = 150;
