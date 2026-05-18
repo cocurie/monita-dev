@@ -10,7 +10,7 @@
  *
  * c<N>     キャリブレーション開始。<N> に実際の人数を指定する。
  *          例: c18  → 18人いる状態でキャリブレーション開始
- *          ・WINDOW_MS（デフォルト60秒）ごとにサンプルを自動収集する
+ *          ・SCAN_DURATION_MS（デフォルト30秒）のスキャンごとにサンプルを自動収集する
  *          ・CALIB_MIN_SAMPLES（デフォルト5回）集まると推奨パラメータを出力
  *          ・人数が変わったら再度 c<N> を送信することでリセットして再開できる
  *          出力例:
@@ -39,7 +39,7 @@
  * ═══════════════════════════════════════════════════
  * フラッシュログ（ENABLE_LOGGING）
  * ═══════════════════════════════════════════════════
- * ENABLE_LOGGING = true にすると、WINDOW_MS ごとの計測結果を
+ * ENABLE_LOGGING = true にすると、スキャンサイクルごとの計測結果を
  * 内部フラッシュ（LittleFS）の /log.csv に追記する。
  * フォーマット: timestamp,people,devices
  * 電源を切ってもデータは保持され、次回起動時は追記される。
@@ -61,8 +61,11 @@ static bool const OUTPUT_PEOPLE  = true;
 static bool const ENABLE_LOGGING = false;    // false にするとフラッシュ書き込みなし
 static char const* LOG_FILE      = "/log.csv";
 
+// ── スキャン/スリープ設定 ──────────
+static uint32_t const SCAN_DURATION_MS  = 30000;  // スキャン時間 (ms)
+static uint32_t const SLEEP_DURATION_MS = 30000;  // スリープ時間 (ms)
+
 // ── パラメータ ───────────────────
-static uint32_t const WINDOW_MS   = 60000;
 static int const MIN_HITS         = 12;
 static int const RSSI_THRESHOLD   = -50;
 static int const RSSI_MERGE_GAP   = 1;   // ★クラスタ幅
@@ -83,8 +86,6 @@ struct Device {
 
 Device devices[MAX_DEVICES];
 int deviceCount = 0;
-
-uint32_t windowStart = 0;
 
 // ── LittleFS ファイルハンドル ────
 File logFile(InternalFS);
@@ -241,6 +242,22 @@ void processCommand(const char* cmd) {
   }
 }
 
+/** シリアル入力を読んでコマンドバッファに蓄積し、行完結時に実行 */
+void handleSerial() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (cmdLen > 0) {
+        cmdBuf[cmdLen] = '\0';
+        processCommand(cmdBuf);
+        cmdLen = 0;
+      }
+    } else if (cmdLen < (int)sizeof(cmdBuf) - 1) {
+      cmdBuf[cmdLen++] = c;
+    }
+  }
+}
+
 int findDevice(uint8_t* mac) {
   for (int i = 0; i < deviceCount; i++) {
     if (memcmp(devices[i].mac, mac, 6) == 0) return i;
@@ -379,71 +396,76 @@ void setup() {
     (uint16_t)(SCAN_WINDOW_MS   * 1000 / 625)
   );
 
-  Bluefruit.Scanner.start(0);
-
-  windowStart = millis();
 }
 
 // ───────────────────────────────
-// loop
+// loop  — スキャン → 出力 → スリープ のサイクル
 // ───────────────────────────────
 
 void loop() {
-  uint32_t now = millis();
 
-  // ── Serial コマンド処理（行バッファ）──
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c == '\n' || c == '\r') {
-      if (cmdLen > 0) {
-        cmdBuf[cmdLen] = '\0';
-        processCommand(cmdBuf);
-        cmdLen = 0;
-      }
-    } else if (cmdLen < (int)sizeof(cmdBuf) - 1) {
-      cmdBuf[cmdLen++] = c;
+  // ① デバイスリストをリセットしてスキャン開始
+  deviceCount = 0;
+  Bluefruit.Scanner.start(0);
+  Serial.print("[SCAN] ");
+  Serial.print(SCAN_DURATION_MS / 1000);
+  Serial.println("s start");
+
+  // ② SCAN_DURATION_MS の間スキャン（コマンドも受け付ける）
+  uint32_t scanEnd = millis() + SCAN_DURATION_MS;
+  while (millis() < scanEnd) {
+    handleSerial();
+    delay(10);
+  }
+
+  // ③ スキャン停止
+  Bluefruit.Scanner.stop();
+
+  // ④ 人数推定・出力
+  if (OUTPUT_PEOPLE) {
+    int people = estimatePeople();
+
+    Serial.println("==============================");
+    Serial.print("[");
+    printTimestamp();
+    Serial.print("] People=");
+    Serial.print(people);
+    Serial.print(" (devices=");
+    Serial.print(deviceCount);
+    Serial.println(")");
+
+    logRecord(people, deviceCount);
+  }
+
+  // ⑤ キャリブレーション処理
+  if (calibMode) {
+    int   bestMinHits;
+    float bestCalib;
+    findBestParams(calibActual, bestMinHits, bestCalib);
+    calibMinHitsSum += bestMinHits;
+    calibRatioSum   += bestCalib;
+    calibSamples++;
+
+    Serial.print("[CALIB] #"); Serial.print(calibSamples);
+    Serial.print("  actual=");       Serial.print(calibActual);
+    Serial.print("  MIN_HITS→");    Serial.print(bestMinHits);
+    Serial.print("  CALIBRATION→"); Serial.println(bestCalib, 2);
+
+    if (calibSamples >= CALIB_MIN_SAMPLES) {
+      printCalibResult();
+      calibMode = false;
     }
   }
 
-  if (now - windowStart >= WINDOW_MS) {
+  // ⑥ スリープ（delay は nRF52 では低消費電力スリープ）
+  Serial.print("[SLEEP] ");
+  Serial.print(SLEEP_DURATION_MS / 1000);
+  Serial.println("s");
+  Serial.flush();
 
-    if (OUTPUT_PEOPLE) {
-      int people = estimatePeople();
-
-      Serial.println("==============================");
-      Serial.print("[");
-      printTimestamp();
-      Serial.print("] People=");
-      Serial.print(people);
-      Serial.print(" (devices=");
-      Serial.print(deviceCount);
-      Serial.println(")");
-
-      logRecord(people, deviceCount);  // フラッシュに記録
-    }
-
-    // ── キャリブレーション処理 ──────
-    if (calibMode) {
-      int   bestMinHits;
-      float bestCalib;
-      findBestParams(calibActual, bestMinHits, bestCalib);
-      calibMinHitsSum += bestMinHits;
-      calibRatioSum   += bestCalib;
-      calibSamples++;
-
-      Serial.print("[CALIB] #"); Serial.print(calibSamples);
-      Serial.print("  actual=");       Serial.print(calibActual);
-      Serial.print("  MIN_HITS→");    Serial.print(bestMinHits);
-      Serial.print("  CALIBRATION→"); Serial.println(bestCalib, 2);
-
-      if (calibSamples >= CALIB_MIN_SAMPLES) {
-        printCalibResult();
-        calibMode = false;
-      }
-    }
-
-    // リセット
-    deviceCount = 0;
-    windowStart = now;
+  uint32_t sleepEnd = millis() + SLEEP_DURATION_MS;
+  while (millis() < sleepEnd) {
+    handleSerial();
+    delay(10);
   }
 }
