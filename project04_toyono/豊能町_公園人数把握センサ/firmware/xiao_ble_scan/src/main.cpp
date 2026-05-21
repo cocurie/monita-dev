@@ -68,6 +68,10 @@ static char const* LOG_FILE      = "/log.csv";
 static uint32_t const SCAN_DURATION_MS  = 30000;  // スキャン時間 (ms)
 static uint32_t const SLEEP_DURATION_MS = 30000;  // スリープ時間 (ms)
 
+// ── LED設定 ──────────────────────
+// XIAO nRF52840 の LED はアクティブ LOW（LOW=点灯, HIGH=消灯）
+static uint32_t const LED_BLINK_MS = 500;  // 点滅間隔 (ms)
+
 // ── パラメータ ───────────────────
 static int const MIN_HITS         = 12;
 static int const RSSI_THRESHOLD   = -50;
@@ -406,6 +410,10 @@ void setup() {
     Serial.println("[LOG] Send 'd' to dump log.");
   }
 
+  // ── LED 初期化 ───────────────────
+  pinMode(LED_BLUE, OUTPUT);
+  digitalWrite(LED_BLUE, HIGH);  // 消灯
+
   Bluefruit.begin(1, 0);
   Bluefruit.setName("PeopleCounter");
 
@@ -431,15 +439,27 @@ void loop() {
   Serial.print(SCAN_DURATION_MS / 1000);
   Serial.println("s start");
 
-  // ② SCAN_DURATION_MS の間スキャン（コマンドも受け付ける）
-  uint32_t scanEnd = millis() + SCAN_DURATION_MS;
+  // ② SCAN_DURATION_MS の間スキャン（青LED点滅・コマンドも受け付ける）
+  uint32_t scanEnd   = millis() + SCAN_DURATION_MS;
+  uint32_t lastBlink = millis();
+  bool     ledOn     = false;
+
   while (millis() < scanEnd) {
     handleSerial();
+
+    // 青LED点滅
+    if (millis() - lastBlink >= LED_BLINK_MS) {
+      ledOn = !ledOn;
+      digitalWrite(LED_BLUE, ledOn ? LOW : HIGH);
+      lastBlink = millis();
+    }
+
     delay(10);
   }
 
-  // ③ スキャン停止
+  // ③ スキャン停止・LED消灯
   Bluefruit.Scanner.stop();
+  digitalWrite(LED_BLUE, HIGH);  // 消灯（スリープ中は消す）
 
   // ④ 人数推定・出力
   if (OUTPUT_PEOPLE) {
