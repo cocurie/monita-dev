@@ -8,6 +8,9 @@
  *
  * d        フラッシュログを全件シリアル出力する（ENABLE_LOGGING=true 時のみ有効）
  *
+ * e        フラッシュログを削除する（ENABLE_LOGGING=true 時のみ有効）
+ *          削除後は次回書き込み時にヘッダ行付きで新規作成される
+ *
  * c<N>     キャリブレーション開始。<N> に実際の人数を指定する。
  *          例: c18  → 18人いる状態でキャリブレーション開始
  *          ・SCAN_DURATION_MS（デフォルト30秒）のスキャンごとにサンプルを自動収集する
@@ -58,7 +61,7 @@ static bool const OUTPUT_RAW_LOG = false;
 static bool const OUTPUT_PEOPLE  = true;
 
 // ── ログ設定 ──────────────────────
-static bool const ENABLE_LOGGING = false;    // false にするとフラッシュ書き込みなし
+static bool const ENABLE_LOGGING = true;    // false にするとフラッシュ書き込みなし
 static char const* LOG_FILE      = "/log.csv";
 
 // ── スキャン/スリープ設定 ──────────
@@ -138,6 +141,20 @@ void logRecord(int people, int devCount) {
   logFile.close();
 }
 
+/** フラッシュログファイルを削除する */
+void eraseLog() {
+  if (!ENABLE_LOGGING) {
+    Serial.println("[LOG] Logging is disabled.");
+    return;
+  }
+  if (InternalFS.exists(LOG_FILE)) {
+    InternalFS.remove(LOG_FILE);
+    Serial.println("[LOG] Log file erased.");
+  } else {
+    Serial.println("[LOG] No log file to erase.");
+  }
+}
+
 /** フラッシュに保存された全レコードをシリアルに出力 */
 void dumpLog() {
   if (!ENABLE_LOGGING) {
@@ -211,6 +228,9 @@ void processCommand(const char* cmd) {
   if (cmd[0] == 'd' || cmd[0] == 'D') {
     dumpLog();
 
+  } else if (cmd[0] == 'e' || cmd[0] == 'E') {
+    eraseLog();
+
   } else if (cmd[0] == 'c' || cmd[0] == 'C') {
     const char* p = cmd + 1;
     while (*p == ' ') p++;
@@ -238,7 +258,7 @@ void processCommand(const char* cmd) {
     Serial.println("[CALIB] Exited calibration mode.");
 
   } else {
-    Serial.println("[CMD] d=dump  c<N>=calib  r=result  x=exit calib");
+    Serial.println("[CMD] d=dump  e=erase  c<N>=calib  r=result  x=exit calib");
   }
 }
 
@@ -370,7 +390,7 @@ void setup() {
   while (!Serial && millis() < 3000) yield();
 
   Serial.println("\n--- BLE People Counter (Clustering) ---");
-  Serial.println("  Commands: d=dump  c<N>=calib(e.g.c18)  r=result  x=exit calib");
+  Serial.println("  Commands: d=dump  e=erase  c<N>=calib(e.g.c18)  r=result  x=exit calib");
 
   // ── フラッシュ初期化 ─────────────
   if (ENABLE_LOGGING) {
