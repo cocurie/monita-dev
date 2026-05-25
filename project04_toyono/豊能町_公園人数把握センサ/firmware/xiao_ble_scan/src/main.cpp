@@ -47,6 +47,23 @@
  * フォーマット: timestamp,people,devices
  * 電源を切ってもデータは保持され、次回起動時は追記される。
  * 容量目安: 約9日分（1分1件ペース）
+ *
+ * ═══════════════════════════════════════════════════
+ * ログをCSVファイルとしてMacに保存する方法
+ * ═══════════════════════════════════════════════════
+ * firmware/ フォルダにある dump_log.py を使う。
+ *
+ * 手順:
+ *   1. VS Code のシリアルモニタを閉じる（ポートの競合を避けるため）
+ *   2. ターミナルで以下を実行:
+ *        cd .../firmware
+ *        python3 dump_log.py
+ *      ポートを手動指定する場合:
+ *        python3 dump_log.py /dev/cu.usbmodem101
+ *   3. ~/Desktop/ble_log_YYYYMMDD_HHMMSS.csv に保存される
+ *
+ * 注意: pyserial が必要。未インストールの場合は以下でインストール:
+ *        pip3 install pyserial
  */
 
 #include <Adafruit_TinyUSB.h>
@@ -66,21 +83,21 @@ static char const* LOG_FILE      = "/log.csv";
 
 // ── スキャン/スリープ設定 ──────────
 static uint32_t const SCAN_DURATION_MS  = 30000;  // スキャン時間 (ms)
-static uint32_t const SLEEP_DURATION_MS = 30000;  // スリープ時間 (ms)
+static uint32_t const SLEEP_DURATION_MS = 90000;  // スリープ時間 (ms)
 
 // ── LED設定 ──────────────────────
 // XIAO nRF52840 の LED はアクティブ LOW（LOW=点灯, HIGH=消灯）
-static uint32_t const LED_BLINK_MS = 500;  // 点滅間隔 (ms)
+static uint32_t const LED_BLINK_MS = 1000;  // 点滅間隔 (ms)
 
 // ── パラメータ ───────────────────
 static int const MIN_HITS         = 12;
-static int const RSSI_THRESHOLD   = -50;
-static int const RSSI_MERGE_GAP   = 1;   // ★クラスタ幅
-static float const CALIBRATION    = 0.8;
+static int const RSSI_THRESHOLD   = -65;
+static int const RSSI_MERGE_GAP   = 3;   // ★クラスタ幅
+static float const CALIBRATION    = 1.0;
 
 // ── BLEスキャン ─────────────────
 static uint16_t const SCAN_INTERVAL_MS = 150;
-static uint16_t const SCAN_WINDOW_MS   = 50;
+static uint16_t const SCAN_WINDOW_MS   = 100;
 
 // ── デバイス保持 ────────────────
 #define MAX_DEVICES 64
