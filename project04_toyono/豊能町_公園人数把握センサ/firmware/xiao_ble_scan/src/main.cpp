@@ -56,7 +56,7 @@
  * 手順:
  *   1. VS Code のシリアルモニタを閉じる（ポートの競合を避けるため）
  *   2. ターミナルで以下を実行:
- *        cd .../firmware
+ *        cd .../xiao_ble_scan
  *        python3 dump_log.py
  *      ポートを手動指定する場合:
  *        python3 dump_log.py /dev/cu.usbmodem101
