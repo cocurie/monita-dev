@@ -25,8 +25,10 @@
 // フィルタ対象の Company ID（子機と合わせること）
 static uint16_t const TARGET_COMPANY_ID = 0xFFFF;
 
-// フィルタ対象のデバイス名（空文字にすると全デバイスを対象にする）
-static char const *const TARGET_NAME = "nRfBLE1";
+// フィルタ対象のデバイス名
+// ※ ADVパケットと Scan Response は別コールバックのため名前フィルタは使わない
+// ※ CompanyID だけで判定する（空文字 = フィルタなし）
+static char const *const TARGET_NAME = "";
 
 // 子機の送信チャンネル数
 static uint8_t const NUM_CHANNELS = 4;
