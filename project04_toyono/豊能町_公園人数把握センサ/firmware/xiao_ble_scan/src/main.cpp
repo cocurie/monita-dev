@@ -8,9 +8,12 @@
  *
  * d        フラッシュログを全件シリアル出力する（ENABLE_LOGGING=true 時のみ有効）
  *
+ * e        フラッシュログを削除する（ENABLE_LOGGING=true 時のみ有効）
+ *          削除後は次回書き込み時にヘッダ行付きで新規作成される
+ *
  * c<N>     キャリブレーション開始。<N> に実際の人数を指定する。
  *          例: c18  → 18人いる状態でキャリブレーション開始
- *          ・WINDOW_MS（デフォルト60秒）ごとにサンプルを自動収集する
+ *          ・SCAN_DURATION_MS（デフォルト30秒）のスキャンごとにサンプルを自動収集する
  *          ・CALIB_MIN_SAMPLES（デフォルト5回）集まると推奨パラメータを出力
  *          ・人数が変わったら再度 c<N> を送信することでリセットして再開できる
  *          出力例:
@@ -39,11 +42,28 @@
  * ═══════════════════════════════════════════════════
  * フラッシュログ（ENABLE_LOGGING）
  * ═══════════════════════════════════════════════════
- * ENABLE_LOGGING = true にすると、WINDOW_MS ごとの計測結果を
+ * ENABLE_LOGGING = true にすると、スキャンサイクルごとの計測結果を
  * 内部フラッシュ（LittleFS）の /log.csv に追記する。
  * フォーマット: timestamp,people,devices
  * 電源を切ってもデータは保持され、次回起動時は追記される。
  * 容量目安: 約9日分（1分1件ペース）
+ *
+ * ═══════════════════════════════════════════════════
+ * ログをCSVファイルとしてMacに保存する方法
+ * ═══════════════════════════════════════════════════
+ * firmware/ フォルダにある dump_log.py を使う。
+ *
+ * 手順:
+ *   1. VS Code のシリアルモニタを閉じる（ポートの競合を避けるため）
+ *   2. ターミナルで以下を実行:
+ *        cd .../xiao_ble_scan
+ *        python3 dump_log.py
+ *      ポートを手動指定する場合:
+ *        python3 dump_log.py /dev/cu.usbmodem101
+ *   3. ~/Desktop/ble_log_YYYYMMDD_HHMMSS.csv に保存される
+ *
+ * 注意: pyserial が必要。未インストールの場合は以下でインストール:
+ *        pip3 install pyserial
  */
 
 #include <Adafruit_TinyUSB.h>
@@ -58,19 +78,26 @@ static bool const OUTPUT_RAW_LOG = false;
 static bool const OUTPUT_PEOPLE  = true;
 
 // ── ログ設定 ──────────────────────
-static bool const ENABLE_LOGGING = false;    // false にするとフラッシュ書き込みなし
+static bool const ENABLE_LOGGING = true;    // false にするとフラッシュ書き込みなし
 static char const* LOG_FILE      = "/log.csv";
 
+// ── スキャン/スリープ設定 ──────────
+static uint32_t const SCAN_DURATION_MS  = 30000;  // スキャン時間 (ms)
+static uint32_t const SLEEP_DURATION_MS = 90000;  // スリープ時間 (ms)
+
+// ── LED設定 ──────────────────────
+// XIAO nRF52840 の LED はアクティブ LOW（LOW=点灯, HIGH=消灯）
+static uint32_t const LED_BLINK_MS = 1000;  // 点滅間隔 (ms)
+
 // ── パラメータ ───────────────────
-static uint32_t const WINDOW_MS   = 60000;
 static int const MIN_HITS         = 12;
-static int const RSSI_THRESHOLD   = -50;
-static int const RSSI_MERGE_GAP   = 1;   // ★クラスタ幅
-static float const CALIBRATION    = 0.8;
+static int const RSSI_THRESHOLD   = -65;
+static int const RSSI_MERGE_GAP   = 3;   // ★クラスタ幅
+static float const CALIBRATION    = 1.0;
 
 // ── BLEスキャン ─────────────────
 static uint16_t const SCAN_INTERVAL_MS = 150;
-static uint16_t const SCAN_WINDOW_MS   = 50;
+static uint16_t const SCAN_WINDOW_MS   = 100;
 
 // ── デバイス保持 ────────────────
 #define MAX_DEVICES 64
@@ -83,8 +110,6 @@ struct Device {
 
 Device devices[MAX_DEVICES];
 int deviceCount = 0;
-
-uint32_t windowStart = 0;
 
 // ── LittleFS ファイルハンドル ────
 File logFile(InternalFS);
@@ -135,6 +160,20 @@ void logRecord(int people, int devCount) {
   logFile.print(",");
   logFile.println(devCount);
   logFile.close();
+}
+
+/** フラッシュログファイルを削除する */
+void eraseLog() {
+  if (!ENABLE_LOGGING) {
+    Serial.println("[LOG] Logging is disabled.");
+    return;
+  }
+  if (InternalFS.exists(LOG_FILE)) {
+    InternalFS.remove(LOG_FILE);
+    Serial.println("[LOG] Log file erased.");
+  } else {
+    Serial.println("[LOG] No log file to erase.");
+  }
 }
 
 /** フラッシュに保存された全レコードをシリアルに出力 */
@@ -210,6 +249,9 @@ void processCommand(const char* cmd) {
   if (cmd[0] == 'd' || cmd[0] == 'D') {
     dumpLog();
 
+  } else if (cmd[0] == 'e' || cmd[0] == 'E') {
+    eraseLog();
+
   } else if (cmd[0] == 'c' || cmd[0] == 'C') {
     const char* p = cmd + 1;
     while (*p == ' ') p++;
@@ -237,7 +279,23 @@ void processCommand(const char* cmd) {
     Serial.println("[CALIB] Exited calibration mode.");
 
   } else {
-    Serial.println("[CMD] d=dump  c<N>=calib  r=result  x=exit calib");
+    Serial.println("[CMD] d=dump  e=erase  c<N>=calib  r=result  x=exit calib");
+  }
+}
+
+/** シリアル入力を読んでコマンドバッファに蓄積し、行完結時に実行 */
+void handleSerial() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (cmdLen > 0) {
+        cmdBuf[cmdLen] = '\0';
+        processCommand(cmdBuf);
+        cmdLen = 0;
+      }
+    } else if (cmdLen < (int)sizeof(cmdBuf) - 1) {
+      cmdBuf[cmdLen++] = c;
+    }
   }
 }
 
@@ -353,7 +411,7 @@ void setup() {
   while (!Serial && millis() < 3000) yield();
 
   Serial.println("\n--- BLE People Counter (Clustering) ---");
-  Serial.println("  Commands: d=dump  c<N>=calib(e.g.c18)  r=result  x=exit calib");
+  Serial.println("  Commands: d=dump  e=erase  c<N>=calib(e.g.c18)  r=result  x=exit calib");
 
   // ── フラッシュ初期化 ─────────────
   if (ENABLE_LOGGING) {
@@ -369,6 +427,10 @@ void setup() {
     Serial.println("[LOG] Send 'd' to dump log.");
   }
 
+  // ── LED 初期化 ───────────────────
+  pinMode(LED_BLUE, OUTPUT);
+  digitalWrite(LED_BLUE, HIGH);  // 消灯
+
   Bluefruit.begin(1, 0);
   Bluefruit.setName("PeopleCounter");
 
@@ -379,71 +441,88 @@ void setup() {
     (uint16_t)(SCAN_WINDOW_MS   * 1000 / 625)
   );
 
-  Bluefruit.Scanner.start(0);
-
-  windowStart = millis();
 }
 
 // ───────────────────────────────
-// loop
+// loop  — スキャン → 出力 → スリープ のサイクル
 // ───────────────────────────────
 
 void loop() {
-  uint32_t now = millis();
 
-  // ── Serial コマンド処理（行バッファ）──
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c == '\n' || c == '\r') {
-      if (cmdLen > 0) {
-        cmdBuf[cmdLen] = '\0';
-        processCommand(cmdBuf);
-        cmdLen = 0;
-      }
-    } else if (cmdLen < (int)sizeof(cmdBuf) - 1) {
-      cmdBuf[cmdLen++] = c;
+  // ① デバイスリストをリセットしてスキャン開始
+  deviceCount = 0;
+  Bluefruit.Scanner.start(0);
+  Serial.print("[SCAN] ");
+  Serial.print(SCAN_DURATION_MS / 1000);
+  Serial.println("s start");
+
+  // ② SCAN_DURATION_MS の間スキャン（青LED点滅・コマンドも受け付ける）
+  uint32_t scanEnd   = millis() + SCAN_DURATION_MS;
+  uint32_t lastBlink = millis();
+  bool     ledOn     = false;
+
+  while (millis() < scanEnd) {
+    handleSerial();
+
+    // 青LED点滅
+    if (millis() - lastBlink >= LED_BLINK_MS) {
+      ledOn = !ledOn;
+      digitalWrite(LED_BLUE, ledOn ? LOW : HIGH);
+      lastBlink = millis();
+    }
+
+    delay(10);
+  }
+
+  // ③ スキャン停止・LED消灯
+  Bluefruit.Scanner.stop();
+  digitalWrite(LED_BLUE, HIGH);  // 消灯（スリープ中は消す）
+
+  // ④ 人数推定・出力
+  if (OUTPUT_PEOPLE) {
+    int people = estimatePeople();
+
+    Serial.println("==============================");
+    Serial.print("[");
+    printTimestamp();
+    Serial.print("] People=");
+    Serial.print(people);
+    Serial.print(" (devices=");
+    Serial.print(deviceCount);
+    Serial.println(")");
+
+    logRecord(people, deviceCount);
+  }
+
+  // ⑤ キャリブレーション処理
+  if (calibMode) {
+    int   bestMinHits;
+    float bestCalib;
+    findBestParams(calibActual, bestMinHits, bestCalib);
+    calibMinHitsSum += bestMinHits;
+    calibRatioSum   += bestCalib;
+    calibSamples++;
+
+    Serial.print("[CALIB] #"); Serial.print(calibSamples);
+    Serial.print("  actual=");       Serial.print(calibActual);
+    Serial.print("  MIN_HITS→");    Serial.print(bestMinHits);
+    Serial.print("  CALIBRATION→"); Serial.println(bestCalib, 2);
+
+    if (calibSamples >= CALIB_MIN_SAMPLES) {
+      printCalibResult();
+      calibMode = false;
     }
   }
 
-  if (now - windowStart >= WINDOW_MS) {
+  // ⑥ スリープ（delay は nRF52 では低消費電力スリープ）
+  Serial.print("[SLEEP] ");
+  Serial.print(SLEEP_DURATION_MS / 1000);
+  Serial.println("s");
+  Serial.flush();
 
-    if (OUTPUT_PEOPLE) {
-      int people = estimatePeople();
-
-      Serial.println("==============================");
-      Serial.print("[");
-      printTimestamp();
-      Serial.print("] People=");
-      Serial.print(people);
-      Serial.print(" (devices=");
-      Serial.print(deviceCount);
-      Serial.println(")");
-
-      logRecord(people, deviceCount);  // フラッシュに記録
-    }
-
-    // ── キャリブレーション処理 ──────
-    if (calibMode) {
-      int   bestMinHits;
-      float bestCalib;
-      findBestParams(calibActual, bestMinHits, bestCalib);
-      calibMinHitsSum += bestMinHits;
-      calibRatioSum   += bestCalib;
-      calibSamples++;
-
-      Serial.print("[CALIB] #"); Serial.print(calibSamples);
-      Serial.print("  actual=");       Serial.print(calibActual);
-      Serial.print("  MIN_HITS→");    Serial.print(bestMinHits);
-      Serial.print("  CALIBRATION→"); Serial.println(bestCalib, 2);
-
-      if (calibSamples >= CALIB_MIN_SAMPLES) {
-        printCalibResult();
-        calibMode = false;
-      }
-    }
-
-    // リセット
-    deviceCount = 0;
-    windowStart = now;
+  uint32_t sleepEnd = millis() + SLEEP_DURATION_MS;
+  while (millis() < sleepEnd) {
+    handleSerial();
+    delay(10);
   }
 }
