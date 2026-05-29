@@ -248,8 +248,20 @@ bool postToSheet(SignalInfo &info) {
   }
 
   // ── Step2: 302 → Location ヘッダを取得 ──────
+  // +SHREQ: "GET",302,<datalen> の datalen を取得し、
+  // HEADERLEN(350)以下で読み取る
   Serial.println(F("302リダイレクト → Locationを取得中..."));
-  String headers = sendAT("AT+SHREADHD=0,800", 5000);
+  int readLen = 350;  // HEADERLEN上限
+  if (shreqIdx >= 0) {
+    String s2 = result.substring(shreqIdx + 8);
+    int c1b = s2.indexOf(",");
+    int c2b = s2.indexOf(",", c1b + 1);
+    if (c1b >= 0 && c2b > c1b) {
+      int dataLen = s2.substring(c2b + 1).toInt();
+      if (dataLen > 0 && dataLen < readLen) readLen = dataLen;
+    }
+  }
+  String headers = sendAT("AT+SHREADHD=0," + String(readLen), 5000);
   String location = parseLocation(headers);
   Serial.print(F("Location: ")); Serial.println(location);
 
