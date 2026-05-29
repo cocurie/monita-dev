@@ -195,7 +195,7 @@ bool postToSheet(SignalInfo &info) {
 
   String scriptPath = "/macros/s/";
   scriptPath += GAS_SCRIPT_ID;
-  scriptPath += "/exec?";
+  scriptPath += "?";  // GAS_SCRIPT_ID末尾に/execが含まれるため?のみ追加
   scriptPath += params;
 
   // ── Step1: script.google.com に GET ──────────
