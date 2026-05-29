@@ -48,15 +48,15 @@ const char* GAS_SCRIPT_ID = "AKfycbywRcyl3059evcw-kFo9ypeejbhZWRyY9rILX9TUjlEWJ-
 
 // SIM切り替え（使う方だけ有効にする）
 // ── 1NCE SIM（KDDI回線）──
-const char* APN      = "iot.1nce.net";
-const char* SIM_NAME = "1NCE";
-const char* APN_USER = "";
-const char* APN_PASS = "";
+//const char* APN      = "iot.1nce.net";
+//const char* SIM_NAME = "1NCE";
+//const char* APN_USER = "";
+//const char* APN_PASS = "";
 // ── SORACOM SIM（ドコモ回線）（使う場合は上4行をコメントアウト）──
-// const char* APN      = "soracom.io";
-// const char* SIM_NAME = "SORACOM";
-// const char* APN_USER = "sora";
-// const char* APN_PASS = "sora";
+ const char* APN      = "soracom.io";
+ const char* SIM_NAME = "SORACOM";
+ const char* APN_USER = "sora";
+ const char* APN_PASS = "sora";
 
 // ══════════════════════════════════════════════
 // 測定間隔（現場で動かし続けるとき）
@@ -302,18 +302,25 @@ bool initNetwork() {
     sendAT("AT+CGAUTH=1,1,\"" + String(APN_PASS) + "\",\"" + String(APN_USER) + "\""); delay(500);
   }
 
+  // CREG確認（SORACOM等MVNOはCREG=0,3を返すことがあるため非致命的タイムアウト）
+  bool cregOk = false;
   for (int i = 0; i < 12; i++) {
     String reg = sendAT("AT+CREG?", 3000);
     if (reg.indexOf("0,1") >= 0 || reg.indexOf("0,5") >= 0) {
-      Serial.println(F("✓ ネットワーク登録成功")); break;
+      Serial.println(F("✓ ネットワーク登録成功"));
+      cregOk = true; break;
     }
-    if (i == 11) { Serial.println(F("✗ タイムアウト")); return false; }
-    delay(5000);
+    if (i == 11) { Serial.println(F("△ CREG未確認 → CGATTで確認")); }
+    else delay(5000);
   }
 
+  // CGATT確認（CREGが取れなくてもAttach済みなら続行）
   String att = sendAT("AT+CGATT?", 3000);
   if (att.indexOf("+CGATT: 1") < 0) {
     Serial.println(F("✗ Attach失敗")); return false;
+  }
+  if (!cregOk) {
+    Serial.println(F("△ CREG未確認だがAttach済 → 続行（SORACOM等）"));
   }
   Serial.println(F("✓ Attach完了"));
   delay(3000);
