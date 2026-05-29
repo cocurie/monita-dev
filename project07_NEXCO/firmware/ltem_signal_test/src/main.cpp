@@ -44,7 +44,7 @@
 // ══════════════════════════════════════════════
 
 // GAS スクリプトID（デプロイURLの "AKfycb..." 部分）
-const char* GAS_SCRIPT_ID = "ここにスクリプトIDを貼り付ける";
+const char* GAS_SCRIPT_ID = "AKfycbywRcyl3059evcw-kFo9ypeejbhZWRyY9rILX9TUjlEWJ-4K2nGkZqIrZymA9cYGZ8maQ/exec";
 
 // SIM切り替え（使う方だけ有効にする）
 // ── 1NCE SIM ──
@@ -207,7 +207,7 @@ bool postToSheet(SignalInfo &info) {
   sendAT("AT+CSSLCFG=\"sni\",1,\"script.google.com\""); delay(200);
   sendAT("AT+SHSSL=1,\"\""); delay(200);
   sendAT("AT+SHCONF=\"BODYLEN\",1024");  delay(200);
-  sendAT("AT+SHCONF=\"HEADERLEN\",1024"); delay(200);
+  sendAT("AT+SHCONF=\"HEADERLEN\",350"); delay(200);
   sendAT("AT+SHCONF=\"URL\",\"https://script.google.com\""); delay(200);
 
   Serial.println(F("script.google.com に接続中..."));
