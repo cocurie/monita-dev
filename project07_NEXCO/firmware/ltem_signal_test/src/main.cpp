@@ -47,17 +47,21 @@
 const char* GAS_SCRIPT_ID = "AKfycbywRcyl3059evcw-kFo9ypeejbhZWRyY9rILX9TUjlEWJ-4K2nGkZqIrZymA9cYGZ8maQ/exec";
 
 // SIM切り替え（使う方だけ有効にする）
-// ── 1NCE SIM ──
+// ── 1NCE SIM（KDDI回線）──
 const char* APN      = "iot.1nce.net";
 const char* SIM_NAME = "1NCE";
-// ── DOCOMO SIM（使う場合は上2行をコメントアウト）──
-// const char* APN      = "spmode.ne.jp";
-// const char* SIM_NAME = "DOCOMO";
+const char* APN_USER = "";
+const char* APN_PASS = "";
+// ── SORACOM SIM（ドコモ回線）（使う場合は上4行をコメントアウト）──
+// const char* APN      = "soracom.io";
+// const char* SIM_NAME = "SORACOM";
+// const char* APN_USER = "sora";
+// const char* APN_PASS = "sora";
 
 // ══════════════════════════════════════════════
 // 測定間隔（現場で動かし続けるとき）
 // ══════════════════════════════════════════════
-static uint32_t const MEASURE_INTERVAL_MS = 60000;  // 60秒ごと
+static uint32_t const MEASURE_INTERVAL_MS = 20000;  // 20秒ごと
 
 // ══════════════════════════════════════════════
 // ATコマンド送受信
@@ -293,6 +297,10 @@ bool initNetwork() {
   sendAT("AT+CNMP=38"); delay(500);
   sendAT("AT+CMNB=1");  delay(500);
   sendAT("AT+CGDCONT=1,\"IP\",\"" + String(APN) + "\""); delay(500);
+  // 認証が必要なSIM（SORACOMなど）のみ有効になる
+  if (strlen(APN_USER) > 0) {
+    sendAT("AT+CGAUTH=1,1,\"" + String(APN_PASS) + "\",\"" + String(APN_USER) + "\""); delay(500);
+  }
 
   for (int i = 0; i < 12; i++) {
     String reg = sendAT("AT+CREG?", 3000);
