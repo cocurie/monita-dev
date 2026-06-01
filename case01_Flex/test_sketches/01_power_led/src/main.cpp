@@ -23,11 +23,11 @@
 // D10 = MOSFET_GATE → 3V3_SW ON/OFF
 static const uint8_t SW_POWER_PIN = 10;
 
-// LEDは内部でアクティブLow → analogWrite(255)=最大輝度, 0=消灯
-static void ledRed()   { analogWrite(LED_RED, 255); analogWrite(LED_GREEN, 0);   analogWrite(LED_BLUE, 0);   }
-static void ledGreen() { analogWrite(LED_RED, 0);   analogWrite(LED_GREEN, 255); analogWrite(LED_BLUE, 0);   }
-static void ledBlue()  { analogWrite(LED_RED, 0);   analogWrite(LED_GREEN, 0);   analogWrite(LED_BLUE, 255); }
-static void ledOff()   { analogWrite(LED_RED, 0);   analogWrite(LED_GREEN, 0);   analogWrite(LED_BLUE, 0);   }
+// アクティブLow: LOW=点灯, HIGH=消灯
+static void ledRed()   { digitalWrite(LED_RED, LOW);  digitalWrite(LED_GREEN, HIGH); digitalWrite(LED_BLUE, HIGH); }
+static void ledGreen() { digitalWrite(LED_RED, HIGH); digitalWrite(LED_GREEN, LOW);  digitalWrite(LED_BLUE, HIGH); }
+static void ledBlue()  { digitalWrite(LED_RED, HIGH); digitalWrite(LED_GREEN, HIGH); digitalWrite(LED_BLUE, LOW);  }
+static void ledOff()   { digitalWrite(LED_RED, HIGH); digitalWrite(LED_GREEN, HIGH); digitalWrite(LED_BLUE, HIGH); }
 
 void setup() {
   Serial.begin(115200);
