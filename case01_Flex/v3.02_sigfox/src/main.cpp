@@ -65,7 +65,7 @@
 // アプリ設定（ここを主に編集する）
 // ============================================================
 
-#define DEBUG_MODE           1        // 1: USB Serial デバッグログ有効。本番は 0
+#define DEBUG_MODE           0        // 1: USB Serial デバッグログ有効。本番は 0
 #define SLEEP_MINUTES        1        // 1サイクル後のスリープ時間（分）
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 #define BUTTON_LONG_PRESS_MS 5000UL  // D0 長押し閾値（ms）: 以上で tare、未満でリセット
@@ -701,8 +701,10 @@ static void measureAll() {
 // ============================================================
 
 String hx4(int v) {
+  uint16_t u = (uint16_t)(int16_t)v;
   char b[5];
-  snprintf(b, 5, "%04X", (uint16_t)(int16_t)v);
+  // リトルエンディアン（LSB first）でバックエンドパーサーに合わせる
+  snprintf(b, 5, "%02X%02X", (uint8_t)(u & 0xFF), (uint8_t)(u >> 8));
   return String(b);
 }
 
