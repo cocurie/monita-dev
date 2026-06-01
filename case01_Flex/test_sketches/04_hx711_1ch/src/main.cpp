@@ -71,15 +71,21 @@ void setup() {
   Serial.println(F("[TCA9534] MUX → CH1 固定 OK"));
 
   delay(100);
+
+  // HX711 power-down復帰: SCKをLOWに確定させてから初期化
+  pinMode(HX711_SCK_PIN, OUTPUT);
+  digitalWrite(HX711_SCK_PIN, LOW);
+  delay(100);
+
   hx.begin(HX711_DOUT_PIN, HX711_SCK_PIN);
 
-  // HX711の起動待ち
+  // HX711の起動待ち（最大5秒）
   Serial.print(F("[HX711] 起動待ち..."));
   unsigned long t = millis();
   while (!hx.is_ready()) {
-    if (millis() - t > 3000) {
+    if (millis() - t > 5000) {
       Serial.println(F(" TIMEOUT"));
-      Serial.println(F("→ D6/D7配線、HX711電源、JP1接続を確認"));
+      Serial.println(F("→ JP1配線(E+/E-/A+/A-)、HX711電源(3V3_SW)を確認"));
       while (true) delay(1000);
     }
     delay(100);
