@@ -548,6 +548,10 @@ static void hxBegin(uint8_t ch) {
   muxSelect(ch);
   // MUX 切替直後の信号安定待ち（正本でも数十 ms 待機の例あり）
   delay(10);
+  // SCK を LOW に確定してから begin（起動時に SCK が浮くと power-down になる）
+  pinMode(HX711_SCK_PIN, OUTPUT);
+  digitalWrite(HX711_SCK_PIN, LOW);
+  delay(10);
   hx.begin(HX711_DOUT_PIN, HX711_SCK_PIN);
 }
 
