@@ -48,15 +48,15 @@ const char* GAS_SCRIPT_ID = "AKfycbywRcyl3059evcw-kFo9ypeejbhZWRyY9rILX9TUjlEWJ-
 
 // SIM切り替え（使う方だけ有効にする）
 // ── 1NCE SIM（KDDI回線）──
-//const char* APN      = "iot.1nce.net";
-//const char* SIM_NAME = "1NCE";
-//const char* APN_USER = "";
-//const char* APN_PASS = "";
+const char* APN      = "iot.1nce.net";
+const char* SIM_NAME = "1NCE";
+const char* APN_USER = "";
+const char* APN_PASS = "";
 // ── SORACOM SIM（ドコモ回線）（使う場合は上4行をコメントアウト）──
- const char* APN      = "soracom.io";
- const char* SIM_NAME = "SORACOM";
- const char* APN_USER = "sora";
- const char* APN_PASS = "sora";
+ //const char* APN      = "soracom.io";
+ //const char* SIM_NAME = "SORACOM";
+ //const char* APN_USER = "sora";
+ //const char* APN_PASS = "sora";
 
 // ══════════════════════════════════════════════
 // 測定間隔（現場で動かし続けるとき）

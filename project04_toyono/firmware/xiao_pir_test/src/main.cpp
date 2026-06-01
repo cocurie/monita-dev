@@ -15,6 +15,7 @@
  *   [12s] PIR: HIGH  検出数: 2
  */
 
+#include <Arduino.h>
 #include <Adafruit_TinyUSB.h>
 
 // ── 設定 ─────────────────────────────────────────
