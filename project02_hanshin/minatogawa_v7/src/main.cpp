@@ -8,6 +8,7 @@
  *    - ATコマンド: SARA系 → SIM7080G系 (CAOPEN/CASEND/CACLOSE)
  *    - AT応答チェックを追加（送達確認あり）
  *    - QuickStats 依存を廃止（median を内部実装）
+ *    - SHT40 (I2C) / DS18B20 (OneWire D22) 温度センサ追加
  *
  *  HX711 ピン配置は v6 から変更なし。
  *  SoftwareSerial (D10/D11) を継続使用 ― ハードウェアUART (Serial1-3) は
@@ -33,7 +34,7 @@
  *    CH14                  D14        D15   ※ Serial3(TX3/RX3) と共用ピン
  *    CH15                  D16        D17   ※ Serial2(TX2/RX2) と共用ピン
  *    CH16                  D18        D19   ※ Serial1(TX1/RX1) と共用ピン
- *    CH17                  D22        D23
+ *    CH17                  D22        D23   ※ USE_DS18B20=true の場合は要無効化
  *    CH18                  D24        D25
  *    CH19                  D26        D27
  *    CH20                  D28        D29
@@ -45,16 +46,21 @@
  *    VCC                        5V
  *    GND                        GND
  *
- *  [USB シリアル / デバッグ]
- *    Serial RX                   D0   (使用しない)
- *    Serial TX                   D1   (シリアルモニタ出力)
+ *  [温度センサ]
+ *    SHT40  SDA                D20   (USE_SHT40=true 時)
+ *    SHT40  SCL                D21   (USE_SHT40=true 時)
+ *    DS18B20 DQ                D22   (USE_DS18B20=true 時 / CH17と競合)
  *
- *  [未使用・予約]
- *    D20 (SDA), D21 (SCL)       I2C バス (将来拡張用)
- *    D30–D35, D37–D53           空きピン
+ *  [USB シリアル / デバッグ]
+ *    Serial TX                  D1   (シリアルモニタ出力)
+ *
+ *  [空きピン]
+ *    D30–D35, D37–D53
  * ----------------------------------------------------------
  *  ※ HX711 は GPIO としてのみ使用。Serial1-3 のUART機能は
  *    CH14-16 のピンと物理的に競合するため使用不可。
+ *  ※ DS18B20 を D22 で使う場合、CH17 (index 16) と同一ピンのため
+ *    channelEnabled[16] を false にすること。
  ************************************************************/
 
 /* ======================== 通信設定 ======================== */
@@ -81,10 +87,10 @@ SoftwareSerial simSerial(SW_RX, SW_TX);
 /* ----------- ★ ユーザー設定項目 ----------- */
 
 bool channelEnabled[CHANNEL_NUM] = {
-  true, true, true, true, false,
-  false, false, false, false, true,
-  false, false, false, false, false,
-  false, false, false, false, false,
+  true, true, true, true, true,
+  true, true, true, true, true,
+  true, true, true, true, true,
+  true, true, true, true, true,
 };
 
 float gaugeFactor[CHANNEL_NUM] = {
@@ -101,7 +107,36 @@ float gaugeFactor[CHANNEL_NUM] = {
 /* ----------- ★ ゼロ点補正モードフラグ ----------- */
 bool zeroModification = false;  // true: EEPROMゼロ点更新, false: 通常測定
 
+/* ----------- ★ 温度センサ ON/OFF ----------- */
+// SHT40: I2C (D20=SDA, D21=SCL)
+#define USE_SHT40   true
+
+// DS18B20: OneWire (D22)
+// !! D22 は CH17 (index 16) HX711 と同一ピン !!
+// USE_DS18B20=true にする場合は channelEnabled[16] を false にすること
+#define USE_DS18B20 true
+#define DS18B20_PIN 22
+
 /* ----------- ★ ここまでがユーザー設定項目 ----------- */
+
+/* ======================== 温度センサ ライブラリ ======================== */
+#if USE_SHT40
+  #include <Wire.h>
+  #include <Adafruit_SHT4x.h>
+  Adafruit_SHT4x sht4;
+  float sht_temp = 0.0;
+  float sht_humi = 0.0;
+  bool  sht40_ok = false;
+#endif
+
+#if USE_DS18B20
+  #include <OneWire.h>
+  #include <DallasTemperature.h>
+  OneWire           oneWire(DS18B20_PIN);
+  DallasTemperature ds18b20(&oneWire);
+  float ds_temp    = 0.0;
+  bool  ds18b20_ok = false;
+#endif
 
 /* ======================== HX711 ピン設定 (v6 から変更なし) ======================== */
 
@@ -121,7 +156,8 @@ float max_strain[CHANNEL_NUM];
 float min_strain[CHANNEL_NUM];
 float mean_val[CHANNEL_NUM];
 float range_val[CHANNEL_NUM];
-float val_buf[MEDIAN_SAMPLE_NUM];   // 1ch分のみ確保 (v6比 -380byte SRAM)
+float val_buf[MEDIAN_SAMPLE_NUM];
+char  payload[1200];   // グローバルに置きスタック節約
 
 /* ======================== 中央値計算 ======================== */
 float calcMedian(float* arr, int n) {
@@ -159,7 +195,6 @@ String sendAT(const String& cmd, int timeoutMs = 5000) {
 bool initLTE() {
   Serial.println(F("--- LTE初期化 ---"));
 
-  // AT疎通確認 (最大10秒)
   bool atOk = false;
   for (int i = 0; i < 10; i++) {
     if (sendAT("AT", 1000).indexOf("OK") >= 0) { atOk = true; break; }
@@ -167,12 +202,11 @@ bool initLTE() {
   }
   if (!atOk) { Serial.println(F("✗ ATコマンド応答なし")); return false; }
 
-  sendAT("AT+CNMP=38", 2000);                          // LTE only
-  sendAT("AT+CMNB=3", 2000);                           // CAT-M1
-  sendAT("AT+CGDCONT=1,\"IP\",\"soracom.io\"", 2000);  // SORACOM APN
+  sendAT("AT+CNMP=38", 2000);
+  sendAT("AT+CMNB=3", 2000);
+  sendAT("AT+CGDCONT=1,\"IP\",\"soracom.io\"", 2000);
 
-  // LTE ネットワーク登録待ち (最大60秒)
-  // AT+CREG は 2G/3G 用。LTE-M/NB-IoT は AT+CEREG を使う
+  // LTE登録待ち (AT+CREG は 2G/3G用, LTE-Mは AT+CEREG を使う)
   Serial.println(F("ネットワーク登録待ち..."));
   bool registered = false;
   for (int i = 0; i < 12; i++) {
@@ -184,7 +218,6 @@ bool initLTE() {
   }
   if (!registered) { Serial.println(F("✗ 登録タイムアウト")); return false; }
 
-  // PDPコンテキスト有効化 (既にアクティブな場合ERRORは正常)
   sendAT("AT+CNACT=0,1", 15000);
   delay(2000);
   String cnact = sendAT("AT+CNACT?", 3000);
@@ -200,11 +233,9 @@ bool initLTE() {
 bool sendPayload(const char* payload) {
   Serial.println(F("--- TCP送信 ---"));
 
-  // 前回セッション切断
   sendAT("AT+CACLOSE=0", 3000);
   delay(300);
 
-  // TCP接続
   String openCmd = String(F("AT+CAOPEN=0,0,\"TCP\",\"")) + ENDPOINT + "\"," + ENDPOINT_PORT;
   String res = sendAT(openCmd, 15000);
   if (res.indexOf("+CAOPEN: 0,0") < 0) {
@@ -214,15 +245,13 @@ bool sendPayload(const char* payload) {
   Serial.println(F("✓ TCP接続成功"));
   delay(300);
 
-  // データ送信
   int len = strlen(payload);
   simSerial.print("AT+CASEND=0,");
   simSerial.print(len);
   simSerial.print("\r\n");
-  delay(1000);  // '>' プロンプト待ち
+  delay(1000);
   simSerial.print(payload);
 
-  // 応答収集 (3秒)
   long t = millis();
   String sendResp = "";
   while (millis() - t < 3000) {
@@ -230,7 +259,6 @@ bool sendPayload(const char* payload) {
   }
   Serial.print(sendResp);
 
-  // クローズ
   sendAT("AT+CACLOSE=0", 3000);
 
   if (sendResp.indexOf("OK") >= 0) {
@@ -249,7 +277,7 @@ void setup() {
 
   Serial.println(F("===== System Boot (v7) ====="));
 
-  // SIM7080G 起動 (PWRKEY Low 1s → High)
+  // SIM7080G 起動
   Serial.println(F("[1/5] SIM7080G power on..."));
   pinMode(SIM_PWRKEY_PIN, OUTPUT);
   digitalWrite(SIM_PWRKEY_PIN, HIGH);
@@ -257,13 +285,38 @@ void setup() {
   digitalWrite(SIM_PWRKEY_PIN, LOW);
   delay(1000);
   digitalWrite(SIM_PWRKEY_PIN, HIGH);
-  delay(5000);  // 起動完了待ち
+  delay(5000);
 
   // HX711 初期化
-  Serial.println(F("[2/5] HX711 initialization..."));
+  Serial.println(F("[2/5] HX711 + sensor initialization..."));
   for (int i = 0; i < CHANNEL_NUM; i++) {
     channels[i].begin(hxPins[i][0], hxPins[i][1]);
   }
+
+  // SHT40 初期化
+#if USE_SHT40
+  Wire.begin();
+  if (sht4.begin()) {
+    sht4.setPrecision(SHT4X_HIGH_PRECISION);
+    sht40_ok = true;
+    Serial.println(F("  SHT40: OK"));
+  } else {
+    Serial.println(F("  SHT40: not found"));
+  }
+#endif
+
+  // DS18B20 初期化
+#if USE_DS18B20
+  ds18b20.begin();
+  if (ds18b20.getDeviceCount() > 0) {
+    ds18b20_ok = true;
+    Serial.print(F("  DS18B20: OK ("));
+    Serial.print(ds18b20.getDeviceCount());
+    Serial.println(F(" device(s))"));
+  } else {
+    Serial.println(F("  DS18B20: not found"));
+  }
+#endif
 
   // EEPROM からゼロ点読み込み
   Serial.println(F("[3/5] Loading calibration from EEPROM..."));
@@ -284,7 +337,6 @@ void setup() {
 /* ======================== メインループ ======================== */
 void loop() {
 
-  // ゼロ点補正モード: EEPROM 表示
   if (zeroModification) {
     Serial.println(F("===== EEPROM Zero Values ====="));
     for (int ch = 0; ch < CHANNEL_NUM; ch++) {
@@ -317,7 +369,7 @@ void loop() {
     min_strain[ch] =  999999.0;
   }
 
-  // 3/5 センサ読み取り
+  // 3/5 HX711 センサ読み取り
   Serial.println(F("[3/5] Reading HX711 sensors..."));
   for (int ch = 0; ch < CHANNEL_NUM; ch++) {
     if (!channelEnabled[ch]) {
@@ -347,12 +399,33 @@ void loop() {
     delay(HX711_READ_DELAY_MS);
   }
 
+  // 3.5/5 温度センサ読み取り
+#if USE_SHT40
+  if (sht40_ok) {
+    sensors_event_t hum_ev, tmp_ev;
+    sht4.getEvent(&hum_ev, &tmp_ev);
+    sht_temp = tmp_ev.temperature;
+    sht_humi = hum_ev.relative_humidity;
+    Serial.print(F("  SHT40: temp=")); Serial.print(sht_temp, 1);
+    Serial.print(F(" humi="));         Serial.println(sht_humi, 1);
+  }
+#endif
+
+#if USE_DS18B20
+  if (ds18b20_ok) {
+    ds18b20.requestTemperatures();
+    ds_temp = ds18b20.getTempCByIndex(0);
+    Serial.print(F("  DS18B20: temp=")); Serial.println(ds_temp, 1);
+  }
+#endif
+
   // 4/5 JSONペイロード生成
   Serial.println(F("[4/5] Creating payload..."));
-  char payload[1024];
   int pos = 0;
   bool firstItem = true;
   pos += sprintf(payload + pos, "{");
+
+  // HX711 データ
   for (int ch = 0; ch < CHANNEL_NUM; ch++) {
     if (!channelEnabled[ch]) continue;
     if (!firstItem) pos += sprintf(payload + pos, ",");
@@ -362,6 +435,30 @@ void loop() {
       ch + 1, (int)mean_val[ch],
       ch + 1, (int)range_val[ch]);
   }
+
+  // SHT40 データ
+#if USE_SHT40
+  if (sht40_ok) {
+    char st[8], sh[8];
+    dtostrf(sht_temp, 4, 1, st);
+    dtostrf(sht_humi, 4, 1, sh);
+    if (!firstItem) pos += sprintf(payload + pos, ",");
+    firstItem = false;
+    pos += sprintf(payload + pos, "\"temp_sht\":%s,\"humi\":%s", st, sh);
+  }
+#endif
+
+  // DS18B20 データ
+#if USE_DS18B20
+  if (ds18b20_ok) {
+    char sd[8];
+    dtostrf(ds_temp, 4, 1, sd);
+    if (!firstItem) pos += sprintf(payload + pos, ",");
+    firstItem = false;
+    pos += sprintf(payload + pos, "\"temp_ds\":%s", sd);
+  }
+#endif
+
   pos += sprintf(payload + pos, "}");
   Serial.print(F("Payload: ")); Serial.println(payload);
   Serial.print(F("Length: ")); Serial.println(pos);
