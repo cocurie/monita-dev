@@ -34,7 +34,7 @@
  *    CH14                  D14        D15   ※ Serial3(TX3/RX3) と共用ピン
  *    CH15                  D16        D17   ※ Serial2(TX2/RX2) と共用ピン
  *    CH16                  D18        D19   ※ Serial1(TX1/RX1) と共用ピン
- *    CH17                  D22        D23   ※ USE_DS18B20=true の場合は要無効化
+ *    CH17                  D22        D23
  *    CH18                  D24        D25
  *    CH19                  D26        D27
  *    CH20                  D28        D29
@@ -49,18 +49,17 @@
  *  [温度センサ]
  *    SHT40  SDA                D20   (USE_SHT40=true 時)
  *    SHT40  SCL                D21   (USE_SHT40=true 時)
- *    DS18B20 DQ                D22   (USE_DS18B20=true 時 / CH17と競合)
+ *    DS18B20 DQ                D30   (USE_DS18B20=true 時)
  *
  *  [USB シリアル / デバッグ]
  *    Serial TX                  D1   (シリアルモニタ出力)
  *
  *  [空きピン]
- *    D30–D35, D37–D53
+ *    D31–D35, D37–D53
  * ----------------------------------------------------------
  *  ※ HX711 は GPIO としてのみ使用。Serial1-3 のUART機能は
  *    CH14-16 のピンと物理的に競合するため使用不可。
- *  ※ DS18B20 を D22 で使う場合、CH17 (index 16) と同一ピンのため
- *    channelEnabled[16] を false にすること。
+ *  ※ DS18B20 は D30 (空きピン) を使用。HX711 との競合なし。
  ************************************************************/
 
 /* ======================== 通信設定 ======================== */
@@ -111,11 +110,9 @@ bool zeroModification = false;  // true: EEPROMゼロ点更新, false: 通常測
 // SHT40: I2C (D20=SDA, D21=SCL)
 #define USE_SHT40   true
 
-// DS18B20: OneWire (D22)
-// !! D22 は CH17 (index 16) HX711 と同一ピン !!
-// USE_DS18B20=true にする場合は channelEnabled[16] を false にすること
+// DS18B20: OneWire (D30) ← 空きピン、HX711 と競合なし
 #define USE_DS18B20 true
-#define DS18B20_PIN 22
+#define DS18B20_PIN 30
 
 /* ----------- ★ ここまでがユーザー設定項目 ----------- */
 
