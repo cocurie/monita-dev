@@ -8,7 +8,8 @@
  *    - ATコマンド: SARA系 → SIM7080G系 (CAOPEN/CASEND/CACLOSE)
  *    - AT応答チェックを追加（送達確認あり）
  *    - QuickStats 依存を廃止（median を内部実装）
- *    - SHT40 (I2C) / DS18B20 (OneWire D22) 温度センサ追加
+ *    - SHT40 (I2C) / DS18B20 (OneWire D30) 温度センサ追加
+ *    - リセットボタン (RESET-GND 直結) / ゼロ点補正ボタン (D31, 4秒長押し)
  *
  *  HX711 ピン配置は v6 から変更なし。
  *  SoftwareSerial (D10/D11) を継続使用 ― ハードウェアUART (Serial1-3) は
@@ -43,30 +44,32 @@
  *    SW-RX  (← SIM7080G TXD)   D10
  *    SW-TX  (→ SIM7080G RXD)   D11
  *    PWR KEY                    D36
- *    VCC                        5V
- *    GND                        GND
+ *    VCC                        5V / GND
  *
  *  [温度センサ]
  *    SHT40  SDA                D20   (USE_SHT40=true 時)
  *    SHT40  SCL                D21   (USE_SHT40=true 時)
  *    DS18B20 DQ                D30   (USE_DS18B20=true 時)
  *
+ *  [ボタン]
+ *    リセット                   RESET ─ GND (ハードウェア直結、GPIO不要)
+ *    ゼロ点補正 (4秒長押し)      D31  ─ GND (内部プルアップ使用)
+ *
  *  [USB シリアル / デバッグ]
  *    Serial TX                  D1   (シリアルモニタ出力)
  *
  *  [空きピン]
- *    D31–D35, D37–D53
+ *    D32–D35, D37–D53
  * ----------------------------------------------------------
  *  ※ HX711 は GPIO としてのみ使用。Serial1-3 のUART機能は
  *    CH14-16 のピンと物理的に競合するため使用不可。
- *  ※ DS18B20 は D30 (空きピン) を使用。HX711 との競合なし。
  ************************************************************/
 
 /* ======================== 通信設定 ======================== */
 #define INTERVAL_MS     (600000UL * 10)   // 100分
 #define ENDPOINT        "uni.soracom.io"
 #define ENDPOINT_PORT   23080
-#define LTE_BAUD        9600              // SoftwareSerial の安定限界に合わせる
+#define LTE_BAUD        9600
 #define SIM_PWRKEY_PIN  36
 #define SW_RX           10
 #define SW_TX           11
@@ -103,15 +106,18 @@ float gaugeFactor[CHANNEL_NUM] = {
 #define REPEAT_MEASURE_NUM  5
 #define HX711_READ_DELAY_MS 1000
 
-/* ----------- ★ ゼロ点補正モードフラグ ----------- */
-bool zeroModification = false;  // true: EEPROMゼロ点更新, false: 通常測定
+/* ----------- ★ ゼロ点補正ボタン設定 ----------- */
+// D31 と GND の間にボタンを接続（内部プルアップ使用）
+#define CALIB_BTN_PIN  31
+#define CALIB_HOLD_MS  4000UL   // 長押し判定時間 (ms)
+
+/* ----------- ★ ゼロ点補正フラグ (コンパイル時強制実行用) ----------- */
+// ボタンが使えない場合の代替手段。通常は false のまま
+bool zeroModification = false;
 
 /* ----------- ★ 温度センサ ON/OFF ----------- */
-// SHT40: I2C (D20=SDA, D21=SCL)
-#define USE_SHT40   true
-
-// DS18B20: OneWire (D30) ← 空きピン、HX711 と競合なし
-#define USE_DS18B20 true
+#define USE_SHT40   true    // SHT40: I2C (D20=SDA, D21=SCL)
+#define USE_DS18B20 true    // DS18B20: OneWire (D30)
 #define DS18B20_PIN 30
 
 /* ----------- ★ ここまでがユーザー設定項目 ----------- */
@@ -135,7 +141,7 @@ bool zeroModification = false;  // true: EEPROMゼロ点更新, false: 通常測
   bool  ds18b20_ok = false;
 #endif
 
-/* ======================== HX711 ピン設定 (v6 から変更なし) ======================== */
+/* ======================== HX711 ピン設定 ======================== */
 
 HX711 channels[CHANNEL_NUM];
 
@@ -154,7 +160,8 @@ float min_strain[CHANNEL_NUM];
 float mean_val[CHANNEL_NUM];
 float range_val[CHANNEL_NUM];
 float val_buf[MEDIAN_SAMPLE_NUM];
-char  payload[1200];   // グローバルに置きスタック節約
+char  payload[1200];
+bool  calibRequested = false;   // ボタン長押しで true になる
 
 /* ======================== 中央値計算 ======================== */
 float calcMedian(float* arr, int n) {
@@ -203,7 +210,7 @@ bool initLTE() {
   sendAT("AT+CMNB=3", 2000);
   sendAT("AT+CGDCONT=1,\"IP\",\"soracom.io\"", 2000);
 
-  // LTE登録待ち (AT+CREG は 2G/3G用, LTE-Mは AT+CEREG を使う)
+  // LTE登録待ち (AT+CREG は 2G/3G用, LTE-M は AT+CEREG を使う)
   Serial.println(F("ネットワーク登録待ち..."));
   bool registered = false;
   for (int i = 0; i < 12; i++) {
@@ -266,6 +273,69 @@ bool sendPayload(const char* payload) {
   return false;
 }
 
+/* ======================== ゼロ点補正 ======================== */
+void runZeroCalibration() {
+  Serial.println(F("===== Zero Calibration Start ====="));
+
+  // 補正前の EEPROM 値を表示
+  Serial.println(F("--- 現在の EEPROM 値 ---"));
+  for (int ch = 0; ch < CHANNEL_NUM; ch++) {
+    int v; EEPROM.get(ch * sizeof(int), v);
+    Serial.print(F("  CH")); Serial.print(ch + 1);
+    Serial.print(F(": ")); Serial.println(v);
+  }
+
+  // 各チャンネルのゼロ点を測定して EEPROM に保存
+  Serial.println(F("--- ゼロ点測定中 ---"));
+  for (int ch = 0; ch < CHANNEL_NUM; ch++) {
+    if (!channelEnabled[ch]) continue;
+    initial_val[ch] = (int)(channels[ch].read() / gaugeFactor[ch]);
+    EEPROM.put(ch * sizeof(int), initial_val[ch]);
+    Serial.print(F("  CH")); Serial.print(ch + 1);
+    Serial.print(F(" -> ")); Serial.println(initial_val[ch]);
+  }
+
+  Serial.println(F("===== Zero Calibration Done ====="));
+}
+
+/* ======================== 100分待機（ボタン監視付き） ======================== */
+// delay(INTERVAL_MS) の代わりに使用。
+// 待機中に D31 を 4秒長押しすると calibRequested = true になり待機を終了する。
+void waitInterval() {
+  Serial.println(F("--- 待機中 (ゼロ点補正: D31 を 4秒長押し) ---"));
+
+  unsigned long waitStart = millis();
+  unsigned long btnStart  = 0;
+  bool btnDown = false;
+
+  while (millis() - waitStart < INTERVAL_MS) {
+    delay(50);
+    bool pressed = (digitalRead(CALIB_BTN_PIN) == LOW);
+
+    if (pressed && !btnDown) {
+      // 押し始め
+      btnDown  = true;
+      btnStart = millis();
+      Serial.println(F("  [BTN] 押下 — 4秒長押しでゼロ点補正"));
+
+    } else if (pressed && btnDown) {
+      // 押し続け中: 4秒経過で確定
+      if (millis() - btnStart >= CALIB_HOLD_MS) {
+        Serial.println(F("  [BTN] 4秒長押し確認 → ゼロ点補正を実行します"));
+        // ボタンが離されるまで待つ
+        while (digitalRead(CALIB_BTN_PIN) == LOW) delay(10);
+        calibRequested = true;
+        return;   // 待機を終了して次サイクルへ
+      }
+
+    } else if (!pressed && btnDown) {
+      // 4秒未満で離した
+      Serial.println(F("  [BTN] 離れ（4秒未満 — キャンセル）"));
+      btnDown = false;
+    }
+  }
+}
+
 /* ======================== セットアップ ======================== */
 void setup() {
   Serial.begin(115200);
@@ -273,6 +343,9 @@ void setup() {
   simSerial.begin(LTE_BAUD);
 
   Serial.println(F("===== System Boot (v7) ====="));
+
+  // ゼロ点補正ボタン
+  pinMode(CALIB_BTN_PIN, INPUT_PULLUP);
 
   // SIM7080G 起動
   Serial.println(F("[1/5] SIM7080G power on..."));
@@ -284,13 +357,12 @@ void setup() {
   digitalWrite(SIM_PWRKEY_PIN, HIGH);
   delay(5000);
 
-  // HX711 初期化
+  // HX711 + 温度センサ初期化
   Serial.println(F("[2/5] HX711 + sensor initialization..."));
   for (int i = 0; i < CHANNEL_NUM; i++) {
     channels[i].begin(hxPins[i][0], hxPins[i][1]);
   }
 
-  // SHT40 初期化
 #if USE_SHT40
   Wire.begin();
   if (sht4.begin()) {
@@ -302,7 +374,6 @@ void setup() {
   }
 #endif
 
-  // DS18B20 初期化
 #if USE_DS18B20
   ds18b20.begin();
   if (ds18b20.getDeviceCount() > 0) {
@@ -334,40 +405,23 @@ void setup() {
 /* ======================== メインループ ======================== */
 void loop() {
 
-  if (zeroModification) {
-    Serial.println(F("===== EEPROM Zero Values ====="));
-    for (int ch = 0; ch < CHANNEL_NUM; ch++) {
-      int v; EEPROM.get(ch * sizeof(int), v);
-      Serial.print(F("CH")); Serial.print(ch + 1);
-      Serial.print(F(": ")); Serial.println(v);
-    }
-    Serial.println(F("=============================="));
+  // ゼロ点補正: ボタン長押し or コンパイル時フラグ
+  if (calibRequested || zeroModification) {
+    calibRequested = false;
+    runZeroCalibration();
   }
 
   Serial.println(F("===== Measurement cycle start ====="));
 
-  // 1/5 ゼロ点補正
-  if (zeroModification) {
-    Serial.println(F("[1/5] Zero modification mode active..."));
-    for (int ch = 0; ch < CHANNEL_NUM; ch++) {
-      if (!channelEnabled[ch]) continue;
-      initial_val[ch] = (int)(channels[ch].read() / gaugeFactor[ch]);
-      EEPROM.put(ch * sizeof(int), initial_val[ch]);
-      Serial.print(F("  CH")); Serial.print(ch + 1);
-      Serial.print(F(" initial = ")); Serial.println(initial_val[ch]);
-    }
-    Serial.println(F("Zero calibration values updated in EEPROM."));
-  }
-
-  // 2/5 バッファ初期化
-  Serial.println(F("[2/5] Initializing measurement buffers..."));
+  // 1/5 バッファ初期化
+  Serial.println(F("[1/5] Initializing measurement buffers..."));
   for (int ch = 0; ch < CHANNEL_NUM; ch++) {
     max_strain[ch] = -999999.0;
     min_strain[ch] =  999999.0;
   }
 
-  // 3/5 HX711 センサ読み取り
-  Serial.println(F("[3/5] Reading HX711 sensors..."));
+  // 2/5 HX711 センサ読み取り
+  Serial.println(F("[2/5] Reading HX711 sensors..."));
   for (int ch = 0; ch < CHANNEL_NUM; ch++) {
     if (!channelEnabled[ch]) {
       Serial.print(F("  -> CH")); Serial.print(ch + 1);
@@ -396,7 +450,7 @@ void loop() {
     delay(HX711_READ_DELAY_MS);
   }
 
-  // 3.5/5 温度センサ読み取り
+  // 3/5 温度センサ読み取り
 #if USE_SHT40
   if (sht40_ok) {
     sensors_event_t hum_ev, tmp_ev;
@@ -407,7 +461,6 @@ void loop() {
     Serial.print(F(" humi="));         Serial.println(sht_humi, 1);
   }
 #endif
-
 #if USE_DS18B20
   if (ds18b20_ok) {
     ds18b20.requestTemperatures();
@@ -422,7 +475,6 @@ void loop() {
   bool firstItem = true;
   pos += sprintf(payload + pos, "{");
 
-  // HX711 データ
   for (int ch = 0; ch < CHANNEL_NUM; ch++) {
     if (!channelEnabled[ch]) continue;
     if (!firstItem) pos += sprintf(payload + pos, ",");
@@ -433,7 +485,6 @@ void loop() {
       ch + 1, (int)range_val[ch]);
   }
 
-  // SHT40 データ
 #if USE_SHT40
   if (sht40_ok) {
     char st[8], sh[8];
@@ -444,8 +495,6 @@ void loop() {
     pos += sprintf(payload + pos, "\"temp_sht\":%s,\"humi\":%s", st, sh);
   }
 #endif
-
-  // DS18B20 データ
 #if USE_DS18B20
   if (ds18b20_ok) {
     char sd[8];
@@ -465,5 +514,7 @@ void loop() {
   sendPayload(payload);
 
   Serial.println(F("===== Measurement cycle complete =====\n"));
-  delay(INTERVAL_MS);
+
+  // 100分待機（ゼロ点補正ボタンを監視）
+  waitInterval();
 }
