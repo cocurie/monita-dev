@@ -39,7 +39,7 @@
 
 static const uint8_t SW_POWER_PIN  = 10;
 static const uint8_t TCA9546A_ADDR = 0x70;
-static const uint8_t MPU6050_ADDR  = 0x68;
+static const uint8_t MPU6050_ADDR  = 0x69;  // AD0=HIGH(VCC接続)の場合。AD0=GNDなら0x68
 
 MPU6050 mpu;
 

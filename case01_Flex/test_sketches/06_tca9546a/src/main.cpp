@@ -10,14 +10,17 @@
  *   0x01 = CH0, 0x02 = CH1, 0x04 = CH2, 0x08 = CH3
  *   0x00 = 全チャンネル切断
  *
- * 期待出力例（MPU6050が各CHに繋がっている場合）:
+ * 期待出力例（DS3231が各CHに繋がっている場合）:
  *   [CH0] I2Cスキャン中...
- *     0x68: MPU6050 候補
- *     検出: 1個
+ *     0x68: DS3231 (RTC)
+ *     0x57: AT24C32 EEPROM (DS3231モジュール内蔵)  ← モジュールによって有無あり
+ *     検出: 1〜2個
  *   [CH1] I2Cスキャン中...
- *     0x68: MPU6050 候補
- *     検出: 1個
- *   ...
+ *     ...
+ *
+ * DS3231 アドレス:
+ *   0x68 固定（変更不可）
+ *   AT24C32 EEPROM: 0x57（A0〜A2=GNDの場合）
  *
  * 未接続のチャンネルは「検出: 0個」になる（正常）
  *
@@ -36,8 +39,8 @@ static const uint8_t TCA9546A_ADDR = 0x70;
 // 既知アドレスに名前をつける
 static const char* knownDevice(uint8_t addr) {
   switch (addr) {
-    case 0x68: return "MPU6050/MPU9250 (加速度センサ)";
-    case 0x69: return "MPU6050/MPU9250 (AD0=HIGH)";
+    case 0x68: return "DS3231 (RTC) ✓";
+    case 0x57: return "AT24C32 EEPROM (DS3231モジュール内蔵) ✓";
     case 0x20: return "TCA9534 (メインバス側。ここに出たら配線確認)";
     default:   return "";
   }
@@ -60,7 +63,7 @@ static void tcaDisable() {
 // I2Cスキャン（現在選択中のチャンネルをスキャン）
 static int i2cScan() {
   int found = 0;
-  for (uint8_t addr = 0x01; addr < 0x7F; addr++) {
+  for (uint8_t addr = 0x08; addr < 0x78; addr++) {  // 0x00-0x07/0x78-0x7F: I2C予約済みアドレス
     // TCA9546A 自身と TCA9534 はスキップ（メインバス側のデバイス）
     if (addr == TCA9546A_ADDR || addr == 0x20) continue;
 
