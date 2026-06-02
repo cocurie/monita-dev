@@ -65,7 +65,7 @@
 // アプリ設定（ここを主に編集する）
 // ============================================================
 
-#define DEBUG_MODE           1        // 1: USB Serial デバッグログ有効。本番は 0
+#define DEBUG_MODE           0        // 1: USB Serial デバッグログ有効。本番は 0
 #define SLEEP_MINUTES        1        // 1サイクル後のスリープ時間（分）
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 #define BUTTON_LONG_PRESS_MS 5000UL  // D0 長押し閾値（ms）: 以上で tare、未満でリセット
@@ -548,6 +548,10 @@ static void hxBegin(uint8_t ch) {
   muxSelect(ch);
   // MUX 切替直後の信号安定待ち（正本でも数十 ms 待機の例あり）
   delay(10);
+  // SCK を LOW に確定してから begin（起動時に SCK が浮くと power-down になる）
+  pinMode(HX711_SCK_PIN, OUTPUT);
+  digitalWrite(HX711_SCK_PIN, LOW);
+  delay(10);
   hx.begin(HX711_DOUT_PIN, HX711_SCK_PIN);
 }
 
@@ -697,8 +701,10 @@ static void measureAll() {
 // ============================================================
 
 String hx4(int v) {
+  uint16_t u = (uint16_t)(int16_t)v;
   char b[5];
-  snprintf(b, 5, "%04X", (uint16_t)(int16_t)v);
+  // リトルエンディアン（LSB first）でバックエンドパーサーに合わせる
+  snprintf(b, 5, "%02X%02X", (uint8_t)(u & 0xFF), (uint8_t)(u >> 8));
   return String(b);
 }
 
