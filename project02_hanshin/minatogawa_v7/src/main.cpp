@@ -81,10 +81,10 @@ SoftwareSerial simSerial(SW_RX, SW_TX);
 /* ----------- ★ ユーザー設定項目 ----------- */
 
 bool channelEnabled[CHANNEL_NUM] = {
-  true, true, true, true, true,
-  true, true, true, true, true,
-  true, true, true, true, true,
-  true, true, true, true, true,
+  true, true, true, true, false,
+  false, false, false, false, true,
+  false, false, false, false, false,
+  false, false, false, false, false,
 };
 
 float gaugeFactor[CHANNEL_NUM] = {
@@ -168,14 +168,15 @@ bool initLTE() {
   if (!atOk) { Serial.println(F("✗ ATコマンド応答なし")); return false; }
 
   sendAT("AT+CNMP=38", 2000);                          // LTE only
-  sendAT("AT+CMNB=1", 2000);                           // CAT-M1
+  sendAT("AT+CMNB=3", 2000);                           // CAT-M1
   sendAT("AT+CGDCONT=1,\"IP\",\"soracom.io\"", 2000);  // SORACOM APN
 
-  // ネットワーク登録待ち (最大60秒)
+  // LTE ネットワーク登録待ち (最大60秒)
+  // AT+CREG は 2G/3G 用。LTE-M/NB-IoT は AT+CEREG を使う
   Serial.println(F("ネットワーク登録待ち..."));
   bool registered = false;
   for (int i = 0; i < 12; i++) {
-    String r = sendAT("AT+CREG?", 3000);
+    String r = sendAT("AT+CEREG?", 3000);
     if (r.indexOf("0,1") >= 0 || r.indexOf("0,5") >= 0) {
       Serial.println(F("✓ ネットワーク登録成功")); registered = true; break;
     }
