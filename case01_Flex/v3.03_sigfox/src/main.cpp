@@ -291,8 +291,8 @@ static void deepSleep(uint32_t minutes) {
   delay(5000);
 #endif
 
-  // スリープ中表示: 青・最低輝度（エラー赤より優先）
-  statusSleepBlueDim();
+  // スリープ中は LED オフ（消費電流削減）
+  rgbOff();
 
   // スリープ中は周辺 IC 用レールをオフ（消費電流削減。正本の 3V3_SW 節）
   digitalWrite(SW_POWER_PIN, LOW);
