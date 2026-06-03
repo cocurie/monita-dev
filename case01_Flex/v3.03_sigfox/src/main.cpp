@@ -754,25 +754,27 @@ static void sendSigfox() {
   return;
 #endif
 
-  // ── デューティサイクル確認（AT$GI?）──────────────────────────
-  // 応答形式: "X,Y\r\nOK\r\n"（X=RF初期化済み, Y=残送信可能数）
-  // Y=0 のときに AT$SF= を送ると即 AT_ERROR になるためスキップする。
-  // スキップはエラー扱いにしない（次サイクルで自動リトライ）。
+  // ── モジュール準備完了待ち（AT ping）────────────────────────
+  // AT$SF= を投げる前にモジュールが応答できる状態か確認する。
+  // OK が返るまで最大 10 秒リトライ。タイムアウト時は送信スキップ（エラーにしない）。
   {
-    String gi = sendAT("AT$GI?", 2000);
-#if DEBUG_MODE
-    Serial.print("[SIGFOX] AT$GI? -> ");
-    Serial.println(gi);
-#endif
-    int commaIdx = gi.indexOf(',');
-    if (commaIdx >= 0) {
-      int remaining = gi.substring(commaIdx + 1).toInt();
-      if (remaining == 0) {
-#if DEBUG_MODE
-        Serial.println("[SIGFOX] duty cycle limit: TX skipped (will retry next cycle)");
-#endif
-        return;  // エラーフラグは立てない
+    bool ready = false;
+    unsigned long t0 = millis();
+    while (millis() - t0 < 10000UL) {
+      String r = sendAT("AT", 1000);
+      if (r.indexOf("OK") >= 0) {
+        ready = true;
+        break;
       }
+#if DEBUG_MODE
+      Serial.println("[SIGFOX] waiting for module ready...");
+#endif
+    }
+    if (!ready) {
+#if DEBUG_MODE
+      Serial.println("[SIGFOX] module not ready: TX skipped (will retry next cycle)");
+#endif
+      return;  // エラーフラグは立てない
     }
   }
 
