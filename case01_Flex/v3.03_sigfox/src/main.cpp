@@ -754,6 +754,28 @@ static void sendSigfox() {
   return;
 #endif
 
+  // ── デューティサイクル確認（AT$GI?）──────────────────────────
+  // 応答形式: "X,Y\r\nOK\r\n"（X=RF初期化済み, Y=残送信可能数）
+  // Y=0 のときに AT$SF= を送ると即 AT_ERROR になるためスキップする。
+  // スキップはエラー扱いにしない（次サイクルで自動リトライ）。
+  {
+    String gi = sendAT("AT$GI?", 2000);
+#if DEBUG_MODE
+    Serial.print("[SIGFOX] AT$GI? -> ");
+    Serial.println(gi);
+#endif
+    int commaIdx = gi.indexOf(',');
+    if (commaIdx >= 0) {
+      int remaining = gi.substring(commaIdx + 1).toInt();
+      if (remaining == 0) {
+#if DEBUG_MODE
+        Serial.println("[SIGFOX] duty cycle limit: TX skipped (will retry next cycle)");
+#endif
+        return;  // エラーフラグは立てない
+      }
+    }
+  }
+
   String payload = "";
   for (int i = 0; i < 4; i++) {
     payload += hx4(ch[i]);
