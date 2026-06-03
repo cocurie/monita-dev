@@ -63,10 +63,10 @@
 // アプリ設定（ここを主に編集する）
 // ============================================================
 
-#define DEBUG_MODE           1        // 1: USB Serial デバッグログ有効。本番は 0
+#define DEBUG_MODE           0        // 1: USB Serial デバッグログ有効。本番は 0
 #define DEBUG_NO_SLEEP       0        // 1: deepSleep をスキップして即 loop() に戻る（DEBUG_MODE 1 時のみ有効）
 #define DEBUG_NO_SIGFOX      0        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
-#define SLEEP_MINUTES        600        // 1サイクル後のスリープ時間（分）
+#define SLEEP_MINUTES        900        // 1サイクル後のスリープ時間（分）
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 #define BUTTON_LONG_PRESS_MS 5000UL  // D0 長押し閾値（ms）: 以上で tare、未満でリセット
 
@@ -177,14 +177,16 @@ static void rgbHwBegin() {
 }
 
 // r,g,b は 0〜255。輝度は全体スケール（スリープ時の青は brightness 低めで指定）。
+// XIAO nRF52840 の RGB LED はアクティブ LOW（LED_STATE_ON=0）のため値を反転する。
+// analogWrite(pin, 0)=点灯 / analogWrite(pin, 255)=消灯
 static void rgbHwShow(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness8) {
 #ifdef LED_RED
   uint16_t rr = (uint16_t)r * brightness8 / 255;
   uint16_t gg = (uint16_t)g * brightness8 / 255;
   uint16_t bb = (uint16_t)b * brightness8 / 255;
-  analogWrite(LED_RED, (int)rr);
-  analogWrite(LED_GREEN, (int)gg);
-  analogWrite(LED_BLUE, (int)bb);
+  analogWrite(LED_RED,   255 - (int)rr);
+  analogWrite(LED_GREEN, 255 - (int)gg);
+  analogWrite(LED_BLUE,  255 - (int)bb);
 #endif
 }
 
@@ -198,9 +200,10 @@ static void rgbOff() {
   rgbHwShow(0, 0, 0, 1);
 #else
 #ifdef LED_RED
-  analogWrite(LED_RED, 0);
-  analogWrite(LED_GREEN, 0);
-  analogWrite(LED_BLUE, 0);
+  // アクティブ LOW: 255(HIGH) = 消灯
+  analogWrite(LED_RED,   255);
+  analogWrite(LED_GREEN, 255);
+  analogWrite(LED_BLUE,  255);
 #endif
 #endif
 }
