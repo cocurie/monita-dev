@@ -64,9 +64,9 @@
 // ============================================================
 
 #define DEBUG_MODE           1        // 1: USB Serial デバッグログ有効。本番は 0
-#define DEBUG_NO_SLEEP       1        // 1: deepSleep をスキップして即 loop() に戻る（DEBUG_MODE 1 時のみ有効）
-#define DEBUG_NO_SIGFOX      1        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
-#define SLEEP_MINUTES        1        // 1サイクル後のスリープ時間（分）
+#define DEBUG_NO_SLEEP       0        // 1: deepSleep をスキップして即 loop() に戻る（DEBUG_MODE 1 時のみ有効）
+#define DEBUG_NO_SIGFOX      0        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
+#define SLEEP_MINUTES        600        // 1サイクル後のスリープ時間（分）
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 #define BUTTON_LONG_PRESS_MS 5000UL  // D0 長押し閾値（ms）: 以上で tare、未満でリセット
 
@@ -810,12 +810,8 @@ void setup() {
   Serial.begin(115200);
   // monitor_dtr=0 では !Serial が解除されないため while(!Serial) は使わない。
   // USB 列挙後、1秒ごとに起動メッセージを送り続け、モニタが繋がれば確実に受信できるようにする。
-  for (int _i = 0; _i < 8; _i++) {
-    delay(1000);
-    Serial.println("=== DEBUG START (waiting for monitor) ===");
-    Serial.flush();
-  }
-  Serial.println("=== SETUP BEGIN ===");
+  delay(2000);  // USB CDC 安定待ち（モニタが開くまでの猶予）
+  Serial.println("=== DEBUG START ===");
   Serial.flush();
 #endif
 
