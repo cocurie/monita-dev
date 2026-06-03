@@ -63,7 +63,9 @@
 // アプリ設定（ここを主に編集する）
 // ============================================================
 
-#define DEBUG_MODE           0        // 1: USB Serial デバッグログ有効。本番は 0
+#define DEBUG_MODE           1        // 1: USB Serial デバッグログ有効。本番は 0
+#define DEBUG_NO_SLEEP       1        // 1: deepSleep をスキップして即 loop() に戻る（DEBUG_MODE 1 時のみ有効）
+#define DEBUG_NO_SIGFOX      0        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
 #define SLEEP_MINUTES        1        // 1サイクル後のスリープ時間（分）
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 #define BUTTON_LONG_PRESS_MS 5000UL  // D0 長押し閾値（ms）: 以上で tare、未満でリセット
@@ -276,6 +278,12 @@ extern "C" void RTC2_IRQHandler(void) {
 // 周辺（Sigfox・HX711 電源レール 3V3_SW）をオフにし、RTC2 で minutes 分待ってから復帰する。
 // 待機中は __WFI で CPU を止める（他割り込みで一時起床し得るが、フラグが立つまでループ継続）。
 static void deepSleep(uint32_t minutes) {
+
+#if DEBUG_MODE && DEBUG_NO_SLEEP
+  Serial.println("[Sleep SKIPPED (DEBUG_NO_SLEEP)]");
+  delay(3000);  // 次サイクルまでの最低待機
+  return;
+#endif
 
 #if DEBUG_MODE
   // USB 接続でログを見る時間を確保（この間もスリープ表示の青デューム）
@@ -730,6 +738,21 @@ static void sendSigfox() {
 #endif
     return;
   }
+
+#if DEBUG_NO_SIGFOX
+  // デバッグ時: ペイロードをログに出力するだけで実際には送信しない
+  {
+    String payload = "";
+    for (int i = 0; i < 4; i++) payload += hx4(ch[i]);
+    payload += hx4(tempV);
+    payload += hx4(battV);
+#if DEBUG_MODE
+    Serial.print("[SIGFOX] TX SKIPPED (DEBUG_NO_SIGFOX): AT$SF=");
+    Serial.println(payload);
+#endif
+  }
+  return;
+#endif
 
   String payload = "";
   for (int i = 0; i < 4; i++) {
