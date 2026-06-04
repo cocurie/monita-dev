@@ -91,7 +91,7 @@
 //   1 = HX711（ロードセル）
 //   2 = TCA 経由 MPU6050（I2C 0x68）→ ピッチ角×10
 //   3 = TCA 経由 DS3231（I2C 0x68）→ 温度×10
-const uint8_t CH_ASSIGN[4] = {0, 3, 3, 3};
+const uint8_t CH_ASSIGN[4] = {1, 1, 3, 3};
 
 // MCP9700T の温度オフセット補正（℃）。実測との差を加算する。正値で高め補正。
 #define TEMP_OFFSET_C 4.5f

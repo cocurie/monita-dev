@@ -65,8 +65,8 @@
 // アプリ設定（ここを主に編集する）
 // ============================================================
 
-#define DEBUG_MODE           0        // 1: USB Serial デバッグログ有効。本番は 0
-#define SLEEP_MINUTES        1        // 1サイクル後のスリープ時間（分）
+#define DEBUG_MODE           1        // 1: USB Serial デバッグログ有効。本番は 0
+#define SLEEP_MINUTES        6000        // 1サイクル後のスリープ時間（分）
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 #define BUTTON_LONG_PRESS_MS 5000UL  // D0 長押し閾値（ms）: 以上で tare、未満でリセット
 

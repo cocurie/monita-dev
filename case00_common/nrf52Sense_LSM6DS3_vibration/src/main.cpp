@@ -3,16 +3,16 @@
 #include "arduinoFFT.h"
 
 // ── 出力設定 ──────────────────────────────────────────────────────────────────
-#define OUTPUT_WAVEFORM   true   // 生波形を出力するか
+#define OUTPUT_WAVEFORM   false   // 生波形を出力するか
 #define OUTPUT_FFT        true   // FFT結果を出力するか
 
 // ── 軸選択 ────────────────────────────────────────────────────────────────────
 #define AXIS_X  true
-#define AXIS_Y  false
-#define AXIS_Z  false
+#define AXIS_Y  true
+#define AXIS_Z  true
 
 // ── FFT周波数レンジ ────────────────────────────────────────────────────────────
-#define FFT_FREQ_MAX_HZ  20.0   // この周波数以下のみ出力（ナイキスト100Hzまで有効）
+#define FFT_FREQ_MAX_HZ  10.0   // この周波数以下のみ出力（ナイキスト100Hzまで有効）
 
 // ── サンプリング設定 ──────────────────────────────────────────────────────────
 #define SAMPLE_RATE_HZ  200

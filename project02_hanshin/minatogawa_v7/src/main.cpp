@@ -117,7 +117,7 @@ bool zeroModification = false;
 
 /* ----------- ★ 温度センサ ON/OFF ----------- */
 #define USE_SHT40   true    // SHT40: I2C (D20=SDA, D21=SCL)
-#define USE_DS18B20 true    // DS18B20: OneWire (D30)
+#define USE_DS18B20 false    // DS18B20: OneWire (D30)
 #define DS18B20_PIN 30
 
 /* ----------- ★ ここまでがユーザー設定項目 ----------- */

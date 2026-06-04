@@ -74,7 +74,7 @@
 using namespace Adafruit_LittleFS_Namespace;
 
 // ── 出力 ─────────────────────────
-static bool const OUTPUT_RAW_LOG = false;
+static bool const OUTPUT_RAW_LOG = true;
 static bool const OUTPUT_PEOPLE  = true;
 
 // ── ログ設定 ──────────────────────
