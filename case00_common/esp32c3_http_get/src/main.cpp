@@ -11,6 +11,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <HTTPClient.h>
 #include "config.h"
 
@@ -19,6 +20,7 @@ bool connectWiFi();
 void httpGet(const char* url);
 
 // ----- グローバル変数 -----
+WiFiMulti wifiMulti;
 int requestCount = 0;
 
 // ================================================
@@ -102,16 +104,16 @@ void httpGet(const char* url) {
 }
 
 // ================================================
-// WiFi 接続
+// WiFi 接続（WiFiMulti：複数SSID自動選択）
 // ================================================
 bool connectWiFi() {
-    Serial.printf("[WiFi] SSID: %s に接続中", WIFI_SSID);
+    wifiMulti.addAP(WIFI_SSID_1, WIFI_PASSWORD_1);
+    wifiMulti.addAP(WIFI_SSID_2, WIFI_PASSWORD_2);
 
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.print("[WiFi] 接続先を探しています");
 
     int retry = 0;
-    while (WiFi.status() != WL_CONNECTED && retry < WIFI_RETRY_MAX) {
+    while (wifiMulti.run() != WL_CONNECTED && retry < WIFI_RETRY_MAX) {
         delay(500);
         Serial.print(".");
         retry++;
@@ -119,12 +121,13 @@ bool connectWiFi() {
     Serial.println();
 
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("[WiFi] ✅ 接続成功  IP: %s  RSSI: %d dBm\n",
+        Serial.printf("[WiFi] ✅ 接続成功  SSID: %s  IP: %s  RSSI: %d dBm\n",
+                      WiFi.SSID().c_str(),
                       WiFi.localIP().toString().c_str(),
                       WiFi.RSSI());
         return true;
     } else {
-        Serial.println("[WiFi] ❌ 接続失敗");
+        Serial.println("[WiFi] ❌ 接続失敗（登録済みSSIDが見つかりません）");
         return false;
     }
 }

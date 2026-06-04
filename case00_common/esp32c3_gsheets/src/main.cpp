@@ -14,6 +14,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <time.h>
@@ -28,6 +29,7 @@ bool postToSheets(float ch1, float ch2, float ch3,
 String getTimestamp();
 
 // ----- グローバル変数 -----
+WiFiMulti wifiMulti;
 int postCount = 0;
 
 // ================================================
@@ -155,15 +157,16 @@ String getTimestamp() {
 }
 
 // ================================================
-// WiFi 接続
+// WiFi 接続（WiFiMulti：複数SSID自動選択）
 // ================================================
 bool connectWiFi() {
-    Serial.printf("[WiFi] SSID: %s に接続中", WIFI_SSID);
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    wifiMulti.addAP(WIFI_SSID_1, WIFI_PASSWORD_1);
+    wifiMulti.addAP(WIFI_SSID_2, WIFI_PASSWORD_2);
+
+    Serial.print("[WiFi] 接続先を探しています");
 
     int retry = 0;
-    while (WiFi.status() != WL_CONNECTED && retry < WIFI_RETRY_MAX) {
+    while (wifiMulti.run() != WL_CONNECTED && retry < WIFI_RETRY_MAX) {
         delay(500);
         Serial.print(".");
         retry++;
@@ -171,7 +174,8 @@ bool connectWiFi() {
     Serial.println();
 
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("[WiFi] ✅ 接続成功  IP: %s\n",
+        Serial.printf("[WiFi] ✅ 接続成功  SSID: %s  IP: %s\n",
+                      WiFi.SSID().c_str(),
                       WiFi.localIP().toString().c_str());
         return true;
     }
