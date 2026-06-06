@@ -8,7 +8,8 @@
  *
  * 【役割の概要】
  *   - HX711 最大 4ch（4052 MUX 経由）または I2C 上 MPU（TCA9546A でバス切替）から荷重／姿勢を取得
- *   - アナログで温度・電池電圧を取得
+ *   - DS3231 の温度レジスタから基板温度を取得（MCP9700 アナログは廃止）
+ *   - 電池電圧をアナログで取得
  *   - Sigfox（UART）で AT$SF= にペイロードを載せて送信
  *   - 送信後、3V3_SW を落とし、内蔵 RTC2 で指定分スリープして繰り返し
  *
@@ -66,9 +67,26 @@
 #define DEBUG_MODE           0        // 1: USB Serial デバッグログ有効。本番は 0
 #define DEBUG_NO_SLEEP       0        // 1: deepSleep をスキップして即 loop() に戻る（DEBUG_MODE 1 時のみ有効）
 #define DEBUG_NO_SIGFOX      0        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
-#define SLEEP_MINUTES        15        // 1サイクル後のスリープ時間（分）
+#define SLEEP_MINUTES        15       // 1サイクル後のスリープ時間（分）
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 #define BUTTON_LONG_PRESS_MS 5000UL  // D0 長押し閾値（ms）: 以上で tare、未満でリセット
+
+// ── DS3231 RTC 設定 ────────────────────────────────────────────
+// DS3231_SET_TIME=1 にすると起動時（setup）に以下の時刻を DS3231 に書き込む。
+// 書き込み後は必ず 0 に戻してビルドし直すこと（毎起動で時刻が上書きされるため）。
+#define DS3231_SET_TIME      0        // 1: 起動時に DS3231 へ時刻を書き込む。書き込み後は 0 に戻す
+#define DS3231_INIT_YEAR     2026     // 書き込む年（西暦 4 桁）
+#define DS3231_INIT_MONTH    6        // 書き込む月（1〜12）
+#define DS3231_INIT_DAY      6        // 書き込む日（1〜31）
+#define DS3231_INIT_HOUR     10       // 書き込む時（0〜23、24h 形式）
+#define DS3231_INIT_MIN      0        // 書き込む分（0〜59）
+#define DS3231_INIT_SEC      0        // 書き込む秒（0〜59）
+
+// USE_DS3231_TIMESTAMP=1 にすると各サイクルで DS3231 の現在時刻を読み出し、
+// DEBUG_MODE=1 の場合はシリアルに出力する。
+// ※ Sigfox ペイロードは現状 12B 上限に達しているため、タイムスタンプのペイロード
+//    組み込みは送信フォーマット再設計後に対応（現バージョンではログ出力のみ）。
+#define USE_DS3231_TIMESTAMP 1        // 1: 各サイクルで時刻を読み出す
 
 // ── Sigfox 設定 ────────────────────────────────────────────
 #define SIGFOX_TX_PIN 8    // D8: XIAO TX → BRKLSM100 RX
@@ -109,8 +127,11 @@ const uint8_t CH_ASSIGN[4] = {1, 1, 1, 1};
 #define BATT_ANALOG_PIN A3
 #define TEMP_ANALOG_PIN A2
 
-// TCA9534（U7）: SN74LV4052 の A/B を I²C で駆動。A0=A1=A2=GND → 0x20
+// TCA9534（U6）: SN74LV4052 の A/B を I²C で駆動。A0=A1=A2=GND → 0x20
 #define TCA9534_ADDR 0x20
+
+// DS3231（U7）: RTC + 温度センサ。I²C アドレスは固定（0x68）
+#define DS3231_ADDR  0x68
 
 // D0 = タクトスイッチ（GND ショート、内部プルアップ）/ D1 = 予備 GPIO
 #define USER_BUTTON_PIN 0
@@ -133,6 +154,7 @@ enum : uint32_t {
   ERR_TCA_I2C = 1u << 2,
   ERR_SIGFOX_AT = 1u << 3,
   ERR_TCA9534_I2C = 1u << 4,
+  ERR_DS3231_I2C = 1u << 5,   // DS3231 I²C 通信失敗（温度・時刻読み出し／書き込み）
 };
 
 static uint32_t s_errors;
@@ -222,10 +244,6 @@ static void statusMeasureGreen() {
 
 static void statusErrorRed() {
   rgbHwShow(255, 0, 0, RGB_BRIGHT_FULL);
-}
-
-static void statusSleepBlueDim() {
-  rgbHwShow(0, 0, 255, RGB_BRIGHT_SLEEP_BLUE);
 }
 
 // Sigfox 送信中の緑点滅（ノンブロッキング）
@@ -572,17 +590,86 @@ static bool hxRead(int *out) {
 }
 
 // ============================================================
-// 温度（U4。典型的には MCP9700 系の V/T 特性を想定した換算）
+// DS3231 — RTC ＋ 温度センサ（Wire 直叩き、外部ライブラリ不要）
 //
-// 戻り値: 温度×10 を int（例: 253 = 25.3℃）。センサ実物に合わせて式は要確認。
+// I²C アドレス: 0x68（固定）
+// 温度レジスタ: 0x11(MSB, signed) / 0x12(LSB, bit7:6 = 0.25℃ 分解能)
+// 時刻レジスタ: 0x00〜0x06（BCD 形式）
+// ============================================================
+
+// BCD ↔ 10進変換
+static uint8_t bcd2dec(uint8_t b) { return (uint8_t)((b >> 4) * 10U + (b & 0x0FU)); }
+static uint8_t dec2bcd(uint8_t d) { return (uint8_t)(((d / 10U) << 4) | (d % 10U)); }
+
+// DS3231 時刻を保持する構造体
+struct Ds3231Time {
+  uint8_t  sec;    // 0〜59
+  uint8_t  min;    // 0〜59
+  uint8_t  hour;   // 0〜23
+  uint8_t  day;    // 1〜31
+  uint8_t  month;  // 1〜12
+  uint16_t year;   // 西暦 4 桁（例: 2026）
+};
+
+// DS3231 に時刻を書き込む（DS3231_SET_TIME=1 のときのみ setup で呼ぶ）
+// yr2: 西暦下 2 桁（2026 → 26）
+// __attribute__((unused)): DS3231_SET_TIME=0 のとき呼ばれないため警告抑制
+static bool __attribute__((unused)) ds3231SetTime(uint8_t yr2, uint8_t mo, uint8_t day,
+                          uint8_t hr, uint8_t mn, uint8_t sc) {
+  Wire.beginTransmission(DS3231_ADDR);
+  Wire.write(0x00);            // レジスタ先頭（seconds）から書き始める
+  Wire.write(dec2bcd(sc));     // 0x00: seconds
+  Wire.write(dec2bcd(mn));     // 0x01: minutes
+  Wire.write(dec2bcd(hr));     // 0x02: hours（24h 形式）
+  Wire.write(0x01);            // 0x03: day of week（使用しないため固定値）
+  Wire.write(dec2bcd(day));    // 0x04: date
+  Wire.write(dec2bcd(mo));     // 0x05: month（century bit は 0）
+  Wire.write(dec2bcd(yr2));    // 0x06: year（下 2 桁）
+  return Wire.endTransmission() == 0;
+}
+
+// DS3231 から現在時刻を読み出す。成功時 true、I²C 失敗時 false
+static bool ds3231GetTime(Ds3231Time &t) {
+  Wire.beginTransmission(DS3231_ADDR);
+  Wire.write(0x00);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(DS3231_ADDR, (uint8_t)7) < 7) return false;
+  t.sec   = bcd2dec(Wire.read() & 0x7FU);   // bit7 = oscillator stop flag（無視）
+  t.min   = bcd2dec(Wire.read() & 0x7FU);
+  t.hour  = bcd2dec(Wire.read() & 0x3FU);   // bit6=12h/24h bit（24h 固定前提で除く）
+  Wire.read();                                // 0x03: day of week（使用しない）
+  t.day   = bcd2dec(Wire.read() & 0x3FU);
+  t.month = bcd2dec(Wire.read() & 0x1FU);   // bit7 = century bit（除く）
+  t.year  = 2000U + bcd2dec(Wire.read());
+  return true;
+}
+
+// ============================================================
+// 温度（DS3231 内蔵センサ。v3.02 の MCP9700 アナログから変更）
+//
+// 戻り値: 温度×10 を int（例: 253 = 25.3℃）。
+// DS3231 温度精度: ±3℃（標準）。基板温度モニタ用途には十分。
 // ============================================================
 
 static int measureTemp() {
-  int raw = analogRead(TEMP_ANALOG_PIN);
-  float v = raw * (3.3 / 4095.0);
-  // MCP9700 近似: 10mV/℃, 0℃で 500mV
-  float t = (v - 0.5) / 0.01;
-  return (int)(t * 10);
+  Wire.beginTransmission(DS3231_ADDR);
+  Wire.write(0x11);  // temp MSB レジスタ
+  if (Wire.endTransmission(false) != 0) {
+    s_errors |= ERR_DS3231_I2C;
+#if DEBUG_MODE
+    Serial.println("[DS3231] temp read error");
+#endif
+    return 0;
+  }
+  if (Wire.requestFrom(DS3231_ADDR, (uint8_t)2) < 2) {
+    s_errors |= ERR_DS3231_I2C;
+    return 0;
+  }
+  int8_t  msb = (int8_t)Wire.read();   // 整数部（符号付き 8bit）
+  uint8_t lsb = Wire.read();            // 分数部（bit7:6 = 0.25℃ 単位）
+  // 温度 = MSB + (lsb >> 6) × 0.25  → ×10 で int 化
+  float temp = (float)msb + (float)(lsb >> 6) * 0.25f;
+  return (int)(temp * 10.0f);
 }
 
 // ============================================================
@@ -678,9 +765,34 @@ static void measureAll() {
   tempV = measureTemp();
   battV = measureBatt();
 
+#if USE_DS3231_TIMESTAMP
+  {
+    Ds3231Time ts;
+    if (ds3231GetTime(ts)) {
 #if DEBUG_MODE
-  Serial.print("[TEMP] ");
-  Serial.println(tempV);
+      // タイムスタンプをシリアルに出力（YYYY-MM-DD HH:MM:SS 形式）
+      char tsbuf[20];
+      snprintf(tsbuf, sizeof(tsbuf), "%04u-%02u-%02u %02u:%02u:%02u",
+               (unsigned)ts.year, (unsigned)ts.month, (unsigned)ts.day,
+               (unsigned)ts.hour, (unsigned)ts.min, (unsigned)ts.sec);
+      Serial.print("[DS3231] ");
+      Serial.println(tsbuf);
+#endif
+    } else {
+#if DEBUG_MODE
+      Serial.println("[DS3231] time read error");
+#endif
+      s_errors |= ERR_DS3231_I2C;
+    }
+  }
+#endif  // USE_DS3231_TIMESTAMP
+
+#if DEBUG_MODE
+  Serial.print("[TEMP(DS3231)] ");
+  Serial.print(tempV / 10);
+  Serial.print(".");
+  Serial.print(abs(tempV % 10));
+  Serial.println(" degC");
   Serial.print("[BATT] ");
   Serial.println(battV);
 #endif
@@ -852,6 +964,31 @@ void setup() {
   delay(200);
 
   s_errors = ERR_NONE;
+
+#if DS3231_SET_TIME
+  // ── DS3231 時刻書き込み ──────────────────────────────────────
+  // DS3231_SET_TIME=1 のときのみ実行。書き込み後は必ず 0 に戻してビルドし直すこと。
+  {
+    uint8_t yr2 = (uint8_t)((DS3231_INIT_YEAR) % 100U);
+    bool ok = ds3231SetTime(yr2,
+                            (uint8_t)(DS3231_INIT_MONTH),
+                            (uint8_t)(DS3231_INIT_DAY),
+                            (uint8_t)(DS3231_INIT_HOUR),
+                            (uint8_t)(DS3231_INIT_MIN),
+                            (uint8_t)(DS3231_INIT_SEC));
+#if DEBUG_MODE
+    if (ok) {
+      Serial.println("[DS3231] time set OK");
+    } else {
+      Serial.println("[DS3231] time set FAILED");
+    }
+#endif
+    if (!ok) {
+      s_errors |= ERR_DS3231_I2C;
+    }
+  }
+#endif  // DS3231_SET_TIME
+
   if (!tca9534Configure()) {
     s_errors |= ERR_TCA9534_I2C;
     statusErrorRed();
