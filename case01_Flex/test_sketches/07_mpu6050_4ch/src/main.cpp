@@ -1,31 +1,27 @@
 /**
- * Monita Flex v3.02 — 検証 Step7: TCA9546A経由 MPU6050 4ch読み取り
+ * Monita Flex v3.2 — 検証 Step7: TCA9546A経由 DS3231 4ch読み取り
  *
  * 確認内容:
  *   TCA9546A（0x70）の CH0〜CH3 を順に切り替えながら
- *   各チャンネル下流の MPU6050 から加速度・ジャイロを読み取る
+ *   各チャンネル下流の DS3231 から時刻・温度を読み取る
  *
  * 前提:
- *   Step6（TCA9546A チャンネル切り替え）がパスしていること
- *   MPU6050 を各 CH（CH0〜CH3）に接続すること
- *   全てのMPU6050のAD0ピンはGNDに落としてアドレスを 0x68 に固定する
+ *   DS3231 を接続するチャンネル（CH0〜CH3）に配線すること
+ *   DS3231 のアドレスは固定 0x68
  *
  * 配線:
  *   XIAO SDA/SCL → TCA9546A SDA/SCL（0x70）
- *   TCA9546A CH0 → MPU6050 #0 SDA/SCL（AD0=GND → 0x68）
- *   TCA9546A CH1 → MPU6050 #1 SDA/SCL（AD0=GND → 0x68）
- *   TCA9546A CH2 → MPU6050 #2 SDA/SCL（AD0=GND → 0x68）
- *   TCA9546A CH3 → MPU6050 #3 SDA/SCL（AD0=GND → 0x68）
+ *   TCA9546A CH0 → DS3231 #0 SDA/SCL
+ *   TCA9546A CH1 → DS3231 #1 SDA/SCL（未接続でも「応答なし」で継続）
+ *   TCA9546A CH2 → DS3231 #2 SDA/SCL
+ *   TCA9546A CH3 → DS3231 #3 SDA/SCL
  *
  * 期待出力例:
- *   [CH0] MPU6050:
- *     加速度 ax=-0.02g  ay= 0.01g  az= 1.00g
- *     ジャイロ gx=  0.5dps  gy= -0.3dps  gz=  0.1dps
- *     温度: 25.3 ℃
- *   [CH1] MPU6050: (同様)
+ *   [CH0] DS3231: OK
+ *     時刻: 2026/06/04 15:30:00 JST
+ *     温度: 27.5 ℃
+ *   [CH1] DS3231: 応答なし（未接続）
  *   ...
- *
- * 未接続のチャンネルは「[CHx] MPU6050: 応答なし」と表示（正常）
  *
  * 注意:
  *   TCA9546A は 3V3_SW 側の電源で動く。
@@ -33,15 +29,16 @@
  */
 
 #include <Arduino.h>
-#include <Adafruit_TinyUSB.h>
 #include <Wire.h>
-#include <MPU6050.h>
+#include <RTClib.h>
 
 static const uint8_t SW_POWER_PIN  = 10;
 static const uint8_t TCA9546A_ADDR = 0x70;
-static const uint8_t MPU6050_ADDR  = 0x69;  // AD0=HIGH(VCC接続)の場合。AD0=GNDなら0x68
+static const uint8_t DS3231_ADDR   = 0x68;
 
-MPU6050 mpu;
+static const int32_t TZ_OFFSET_SEC = 9 * 3600L;  // JST = UTC+9
+
+RTC_DS3231 rtc;
 
 // TCA9546A: チャンネル ch（0〜3）を有効にする
 static bool tcaSelect(uint8_t ch) {
@@ -57,52 +54,39 @@ static void tcaDisable() {
   Wire.endTransmission();
 }
 
-// MPU6050 の初期化を試みる（現在選択中のチャンネル）
-// 戻り値: true=成功, false=応答なし
-static bool mpuInit() {
-  // 応答確認
-  Wire.beginTransmission(MPU6050_ADDR);
-  if (Wire.endTransmission() != 0) return false;
-
-  mpu.initialize();
-  return mpu.testConnection();
+// DS3231 の応答確認
+static bool dsPresent() {
+  Wire.beginTransmission(DS3231_ADDR);
+  return Wire.endTransmission() == 0;
 }
 
-// MPU6050 からデータを読み取って出力
-static void mpuRead() {
-  int16_t ax_raw, ay_raw, az_raw;
-  int16_t gx_raw, gy_raw, gz_raw;
-  mpu.getMotion6(&ax_raw, &ay_raw, &az_raw, &gx_raw, &gy_raw, &gz_raw);
+// DS3231 から時刻・温度を読み取って出力
+static void dsRead() {
+  if (!rtc.begin(&Wire)) {
+    Serial.println(F("    rtc.begin() 失敗"));
+    return;
+  }
 
-  // MPU6050 デフォルト: ±2g → LSB=16384, ±250dps → LSB=131
-  float ax = ax_raw / 16384.0f;
-  float ay = ay_raw / 16384.0f;
-  float az = az_raw / 16384.0f;
-  float gx = gx_raw / 131.0f;
-  float gy = gy_raw / 131.0f;
-  float gz = gz_raw / 131.0f;
+  DateTime utc = rtc.now();
+  DateTime jst = DateTime(utc.unixtime() + TZ_OFFSET_SEC);
 
-  // 温度（MPU6050内蔵センサ）
-  float temp = mpu.getTemperature() / 340.0f + 36.53f;
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%04d/%02d/%02d %02d:%02d:%02d",
+    jst.year(), jst.month(), jst.day(),
+    jst.hour(), jst.minute(), jst.second());
 
-  Serial.print(F("    加速度 ax="));
-  Serial.print(ax, 2); Serial.print(F("g  ay="));
-  Serial.print(ay, 2); Serial.print(F("g  az="));
-  Serial.print(az, 2); Serial.println(F("g"));
-
-  Serial.print(F("    ジャイロ gx="));
-  Serial.print(gx, 1); Serial.print(F("dps  gy="));
-  Serial.print(gy, 1); Serial.print(F("dps  gz="));
-  Serial.print(gz, 1); Serial.println(F("dps"));
+  Serial.print(F("    時刻: "));
+  Serial.print(buf);
+  Serial.println(F(" JST"));
 
   Serial.print(F("    温度: "));
-  Serial.print(temp, 1);
+  Serial.print(rtc.getTemperature(), 1);
   Serial.println(F(" ℃"));
 }
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial && millis() < 5000) yield();
+  while (!Serial && millis() < 5000);
 
   pinMode(SW_POWER_PIN, OUTPUT);
   digitalWrite(SW_POWER_PIN, HIGH);
@@ -110,14 +94,14 @@ void setup() {
 
   Wire.begin();
 
-  Serial.println(F("\n[STEP7] TCA9546A経由 MPU6050 4ch読み取り"));
-  Serial.println(F("各チャンネル下流のMPU6050から加速度・ジャイロを読み取ります"));
+  Serial.println(F("\n[STEP7] TCA9546A経由 DS3231 4ch読み取り"));
+  Serial.println(F("各チャンネル下流の DS3231 から時刻・温度を読み取ります"));
   Serial.println(F("---------------------------------------------------"));
 
   // TCA9546A 自体の応答確認
   Wire.beginTransmission(TCA9546A_ADDR);
   if (Wire.endTransmission() != 0) {
-    Serial.println(F("[TCA9546A] 応答なし → Step6を先に完了させること"));
+    Serial.println(F("[TCA9546A] 応答なし → 配線/電源(3V3_SW)を確認"));
     while (true) delay(1000);
   }
   Serial.println(F("[TCA9546A] 応答OK"));
@@ -136,7 +120,7 @@ void loop() {
   for (uint8_t ch = 0; ch < 4; ch++) {
     Serial.print(F("[CH"));
     Serial.print(ch);
-    Serial.print(F("] MPU6050: "));
+    Serial.print(F("] DS3231: "));
 
     if (!tcaSelect(ch)) {
       Serial.println(F("TCA9546A チャンネル選択失敗"));
@@ -144,11 +128,11 @@ void loop() {
     }
     delay(10);
 
-    if (!mpuInit()) {
-      Serial.println(F("応答なし（未接続 or 配線確認）"));
+    if (!dsPresent()) {
+      Serial.println(F("応答なし（未接続）"));
     } else {
       Serial.println(F("OK"));
-      mpuRead();
+      dsRead();
     }
 
     tcaDisable();

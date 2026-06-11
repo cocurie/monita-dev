@@ -102,13 +102,21 @@
 #define NEOPIXEL_COUNT 1
 #endif
 
-// 各スロット i（0〜3）が CH(i+1) に相当。1=HX711、2=TCA 経由で MPU6050 等（I2C 0x68）
-const uint8_t CH_ASSIGN[4] = {1, 1, 1, 1};
+// 各スロット i（0〜3）が CH(i+1) に相当。
+//   1 = HX711（4052 MUX 経由）
+//   2 = MPU6050（TCA9546A 経由、I2C 0x68）
+//   3 = DS3231 RTC（TCA9546A 経由、I2C 0x68。温度×10 を送信）
+const uint8_t CH_ASSIGN[4] = {1, 1, 1, 1};  // DS3231 4ch テスト用
 
 // HX711 1ch あたりの生サンプル数（中央値をとる前の個数）
 #define DATA_NUM 5
 // 将来の「同一 ch 複数回平均」等用。現状コードでは未使用。
 #define REPEAT_NUM 3
+
+// ── ひずみ補正係数 ─────────────────────────────────────────────
+// HX711 生値をこの値で割ってひずみ値（int16_t 範囲）に変換する。
+// 実測で調整: raw / STRAIN_SCALE → μ（マイクロストレイン）相当
+static const float STRAIN_SCALE = 1110.0f;
 
 #ifndef PI
 #define PI 3.14159265358979323846
@@ -152,6 +160,7 @@ enum : uint32_t {
   ERR_SIGFOX_AT = 1u << 3,
   ERR_TCA9534_I2C = 1u << 4,
   ERR_LTE_AT = 1u << 5,
+  ERR_DS3231_I2C = 1u << 6,
 };
 
 static uint32_t s_errors;
@@ -296,7 +305,7 @@ extern "C" void RTC2_IRQHandler(void) {
 
 // 周辺（Sigfox・HX711 電源レール 3V3_SW）をオフにし、RTC2 で minutes 分待ってから復帰する。
 // 待機中は __WFI で CPU を止める（他割り込みで一時起床し得るが、フラグが立つまでループ継続）。
-static void deepSleep(uint32_t minutes) {
+static void deepSleep(uint32_t seconds) {
 
 #if DEBUG_MODE
   // USB 接続でログを見る時間を確保（この間もスリープ表示の青デューム）
@@ -314,19 +323,19 @@ static void deepSleep(uint32_t minutes) {
 
 #if DEBUG_MODE
   Serial.print("[RTC2 sleep] ");
-  Serial.print(minutes);
-  Serial.println(" min");
+  Serial.print(seconds);
+  Serial.println(" sec");
   Serial.flush();
 #endif
 
-  // 0 分指定は誤設定扱いで最低 1 分（CC=0 即時一致を避ける意味もある）
-  if (minutes == 0U) {
-    minutes = 1U;
+  // 0 秒指定は誤設定扱いで最低 1 秒（CC=0 即時一致を避ける意味もある）
+  if (seconds == 0U) {
+    seconds = 1U;
   }
 
-  // スリープ時間を RTC ティック数に変換（分 → 秒 → 8tick/秒）
+  // スリープ時間を RTC ティック数に変換（秒 → 8tick/秒）
   uint64_t ticks64 =
-      (uint64_t)minutes * 60ULL * (uint64_t)RTC2_TICKS_PER_SECOND;
+      (uint64_t)seconds * (uint64_t)RTC2_TICKS_PER_SECOND;
   // 24bit カウンタを超える長さは切り詰め（最大約 24 日相当）
   if (ticks64 > RTC2_COUNTER_MASK) {
     ticks64 = RTC2_COUNTER_MASK;
@@ -639,6 +648,40 @@ static int measureMPU() {
 }
 
 // ============================================================
+// DS3231 RTC — 内蔵温度センサ読み取り（TCA9546A 経由）
+//
+// レジスタ 0x11: 温度 MSB（符号付き 8bit 整数部）
+// レジスタ 0x12: 温度 LSB（bit7-6 = 0.25℃ステップの小数部）
+// 戻り値: 温度×10 を int（例: 253 = 25.3℃）
+// ============================================================
+
+static int measureDS3231() {
+  // まずデバイスの存在確認（NACK = 未接続 → エラーフラグを立てず 0 を返す）
+  Wire.beginTransmission(0x68);
+  if (Wire.endTransmission() != 0) {
+    return 0;  // センサ未接続は正常扱い。Sigfox 送信は継続する。
+  }
+  // 温度レジスタ読み取り（存在確認済みなので NACK は本当のエラー）
+  Wire.beginTransmission(0x68);
+  Wire.write(0x11);
+  if (Wire.endTransmission(false) != 0) {
+    s_errors |= ERR_DS3231_I2C;
+    statusErrorRed();
+    return 0;
+  }
+  uint8_t n = Wire.requestFrom(0x68, (uint8_t)2);
+  if (n < 2) {
+    s_errors |= ERR_DS3231_I2C;
+    statusErrorRed();
+    return 0;
+  }
+  int8_t  msb = (int8_t)Wire.read();   // 整数部（符号付き）
+  uint8_t lsb = Wire.read();           // bit7-6: 小数部（0.25℃単位）
+  float temp = (float)msb + (float)(lsb >> 6) * 0.25f;
+  return (int)(temp * 10);
+}
+
+// ============================================================
 // 1 サイクル分の計測結果（グローバル: Sigfox 組み立てで参照）
 // ============================================================
 
@@ -665,6 +708,7 @@ static void measureAll() {
       // 物理 CH は 1 origin（MUX と正本 JP の対応）
       hxBegin((uint8_t)(i + 1));
       hxRead(&ch[i]);
+      ch[i] = (int)((float)ch[i] / STRAIN_SCALE);
     } else if (CH_ASSIGN[i] == 2) {
       // MPU は TCA のチャネル i（0 origin）に合わせてバスを開く
       if (tcaSelect((uint8_t)i) != 0) {
@@ -673,6 +717,16 @@ static void measureAll() {
         ch[i] = 0;
       } else {
         ch[i] = measureMPU();
+      }
+      tcaDisable();
+    } else if (CH_ASSIGN[i] == 3) {
+      // DS3231 は TCA のチャネル i（0 origin）経由。温度×10 を返す。
+      if (tcaSelect((uint8_t)i) != 0) {
+        s_errors |= ERR_TCA_I2C;
+        statusErrorRed();
+        ch[i] = 0;
+      } else {
+        ch[i] = measureDS3231();
       }
       tcaDisable();
     }
@@ -1035,7 +1089,7 @@ void setup() {
 
   if (!lteBegin()) {
     // AT 失敗 → 計測もスキップしてスリープ
-    deepSleep(SLEEP_MINUTES);
+    deepSleep(SLEEP_SECONDS);
     return;
   }
 
@@ -1058,7 +1112,7 @@ void setup() {
   lteWaitAndPost();
 #endif
 
-  deepSleep(SLEEP_MINUTES);
+  deepSleep(SLEEP_SECONDS);
 }
 
 void loop() {
@@ -1107,7 +1161,7 @@ void loop() {
 
   if (!lteBegin()) {
     // AT 失敗 → 計測もスキップしてスリープ
-    deepSleep(SLEEP_MINUTES);
+    deepSleep(SLEEP_SECONDS);
     return;
   }
 
@@ -1132,5 +1186,5 @@ void loop() {
   lteWaitAndPost();
 #endif
 
-  deepSleep(SLEEP_MINUTES);
+  deepSleep(SLEEP_SECONDS);
 }

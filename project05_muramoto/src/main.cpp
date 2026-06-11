@@ -40,16 +40,14 @@ DallasTemperature ds18b20(&oneWire);
 // Sigfox
 // =====================================================
 
-#define SIGFOX_SERIAL  Serial1
-#define SIGFOX_BAUD    9600
+#define SIGFOX_SERIAL       Serial1
+#define SIGFOX_BAUD         9600
 #define SIGFOX_INTERVAL_MS  60000UL   // 1分
 
 unsigned long lastSigfoxMs = 0;
 
-// Sigfox ATコマンド送信（タイムアウト最大30秒）
 bool sigfoxSendAT(const char* cmd)
 {
-    // 受信バッファクリア
     while (SIGFOX_SERIAL.available()) SIGFOX_SERIAL.read();
 
     SIGFOX_SERIAL.println(cmd);
@@ -62,25 +60,17 @@ bool sigfoxSendAT(const char* cmd)
             char c = SIGFOX_SERIAL.read();
             resp += c;
         }
-        if (resp.indexOf("OK") >= 0) {
-            Serial.println("# [SF] OK");
-            return true;
-        }
-        if (resp.indexOf("ERR") >= 0) {
-            Serial.print("# [SF] ERR: "); Serial.println(resp);
-            return false;
-        }
+        if (resp.indexOf("OK") >= 0)  { Serial.println("# [SF] OK");  return true;  }
+        if (resp.indexOf("ERR") >= 0) { Serial.print("# [SF] ERR: "); Serial.println(resp); return false; }
         delay(10);
     }
     Serial.println("# [SF] タイムアウト");
     return false;
 }
 
-// 計測値をSigfoxで送信
 void sigfoxSend(float theta1, float theta2,
                 float T1, float T2, float T3, float T4)
 {
-    // int16に変換（big-endian）
     int16_t v[6];
     v[0] = (int16_t)(theta1 * 1000);
     v[1] = (int16_t)(theta2 * 1000);
@@ -102,21 +92,13 @@ void sigfoxSend(float theta1, float theta2,
 // 設定
 // =====================================================
 
-const int SAMPLE_INTERVAL_MS = 1000;
+const int SAMPLE_INTERVAL_MS = 10000;  // 10秒
 const int READ_N             = 10;
-
-// =====================================================
-// 傾き計算
-// =====================================================
 
 float calcTheta(float ax, float az)
 {
     return atan2(ax, az) * 180.0 / PI;
 }
-
-// =====================================================
-// LSM6DSO32 温度レジスタ直読み
-// =====================================================
 
 float readDSO32Temp()
 {
@@ -149,10 +131,9 @@ void setup()
 
     Wire.begin();
 
-    // Sigfox初期化
     SIGFOX_SERIAL.begin(SIGFOX_BAUD);
     delay(500);
-    sigfoxSendAT("AT");   // 疎通確認
+    sigfoxSendAT("AT");
 
     Serial.println();
     Serial.println("# ==============================");
@@ -198,14 +179,26 @@ void setup()
 // loop
 // =====================================================
 
+const int MEASURE_COUNT = 10;   // 計測回数
+int measureIndex = 0;
+
 void loop()
 {
+    if (measureIndex >= MEASURE_COUNT) {
+        // 10回完了後は停止
+        if (measureIndex == MEASURE_COUNT) {
+            Serial.println("# 10回計測完了。停止します。");
+            measureIndex++;
+        }
+        delay(10000);
+        return;
+    }
+
+    measureIndex++;
     unsigned long t = millis();
 
-    // DS18B20 変換（ブロッキング約750ms）
     ds18b20.requestTemperatures();
 
-    // 10回平均
     float ax1_sum = 0, az1_sum = 0;
     float ax2_sum = 0, az2_sum = 0;
 
@@ -234,20 +227,14 @@ void loop()
     sht40.getEvent(&humidity, &temp);
     float T4 = temp.temperature;
 
-    // CSV出力（毎秒）
-    Serial.print(t);          Serial.print(",");
-    Serial.print(theta1, 4);  Serial.print(",");
-    Serial.print(theta2, 4);  Serial.print(",");
-    Serial.print(T1,     2);  Serial.print(",");
-    Serial.print(T2,     2);  Serial.print(",");
-    Serial.print(T3,     2);  Serial.print(",");
+    Serial.print(measureIndex);   Serial.print("/10,");
+    Serial.print(t);              Serial.print(",");
+    Serial.print(theta1, 4);      Serial.print(",");
+    Serial.print(theta2, 4);      Serial.print(",");
+    Serial.print(T1,     2);      Serial.print(",");
+    Serial.print(T2,     2);      Serial.print(",");
+    Serial.print(T3,     2);      Serial.print(",");
     Serial.println(T4,   2);
-
-    // Sigfox送信（1分ごと）
-    if (millis() - lastSigfoxMs >= SIGFOX_INTERVAL_MS) {
-        lastSigfoxMs = millis();
-        sigfoxSend(theta1, theta2, T1, T2, T3, T4);
-    }
 
     delay(SAMPLE_INTERVAL_MS);
 }

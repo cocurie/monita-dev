@@ -2,7 +2,7 @@
 title: Monita Flex v3.02 検証スケッチ一覧
 domain: monita_dev
 tags: [Flex, v3.02, test, HX711, TCA9534, TCA9546A, MPU6050, XIAO nRF52840]
-updated: 2026-06-01
+updated: 2026-06-03
 ---
 
 # Monita Flex v3.02 — 検証スケッチ
@@ -18,6 +18,7 @@ v3.02基板の動作確認用。**必ずステップ順に実施すること。*
 | 5 | `05_hx711_4ch/` | HX711 4ch MUX切り替え読み取り | Step4 OK |
 | 6 | `06_tca9546a/` | TCA9546A CH0〜CH3 切り替え＋I2Cスキャン | Step2 OK |
 | 7 | `07_mpu6050_4ch/` | TCA9546A経由 MPU6050 4ch読み取り | Step6 OK、各CHにMPU6050接続 |
+| 13 | `13_strain_cal/` | HX711 4ch ひずみ補正係数確認（STRAIN_SCALE調整用） | Step5 OK、ひずみ発生装置接続 |
 
 ## アップロード方法
 

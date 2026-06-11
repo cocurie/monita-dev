@@ -30,7 +30,7 @@
 // 0 = D1直結テスト（まずこれ）
 // 1 = 4052 MUX + TCA9534 経由テスト
 // ============================================================
-#define TEST_MODE 0
+#define TEST_MODE 1
 
 static const uint8_t SW_POWER_PIN  = 10;
 
@@ -98,7 +98,7 @@ void loop() {
 #else
 // ── TEST_MODE 1: 4052 MUX + TCA9534 経由 ──────────────────
 static const uint8_t TCA9534_ADDR  = 0x20;
-static const uint8_t ONE_WIRE_PIN  = 7;   // D7 = DOUT ライン（4052経由）
+static const uint8_t ONE_WIRE_PIN  = D6;   // D7 = DOUT ライン（4052経由）
 
 OneWire           oneWire(ONE_WIRE_PIN);
 DallasTemperature sensors(&oneWire);
@@ -114,15 +114,21 @@ static bool tca9534Init() {
   return Wire.endTransmission() == 0;
 }
 
+// ★ 物理 JP コネクタ → TCA9534 出力値 マッピング
+// 診断ログより: 物理JP1 = 旧コードch=2(0x02) が確定
+// JP2=0x00, JP3=0x01, JP4=0x03 は推定（未接続時は LOW なので要確認）
+static const uint8_t JP_TO_MUX[4] = {0x02, 0x00, 0x01, 0x03};
+
 static bool muxSelect(uint8_t ch) {
-  uint8_t idx = (ch - 1) & 0x03;
-  uint8_t a = idx & 0x01;
-  uint8_t b = (idx >> 1) & 0x01;
-  uint8_t val = (uint8_t)(b | (a << 1));  // P0=B, P1=A
+  if (ch < 1 || ch > 4) return false;
+  uint8_t val = JP_TO_MUX[ch - 1];
+
   Wire.beginTransmission(TCA9534_ADDR);
   Wire.write(0x01);
-  Wire.write(val & 0x03);
-  return Wire.endTransmission() == 0;
+  Wire.write(val);
+  if (Wire.endTransmission() != 0) return false;
+
+  return true;
 }
 
 void setup() {
@@ -163,30 +169,52 @@ void loop() {
       Serial.println(F("MUX失敗"));
       continue;
     }
-    delay(50);  // MUX 安定待ち（長めに）
+    delay(200);  // ★ MUX 安定待ちを延長（50ms → 200ms）
 
-    // 1-Wire バス再初期化
+    // ピンの状態確認（プルアップ＆信号経路の診断）
+    pinMode(ONE_WIRE_PIN, INPUT);
+    int pinHigh = digitalRead(ONE_WIRE_PIN);
+    Serial.printf("  [DIAG] pin%d idle: %s\n",
+      ONE_WIRE_PIN, pinHigh ? "HIGH ✓" : "LOW ✗ (経路NG)");
+
+    // ★ raw reset で存在確認してから sensors.begin() を呼ぶ
     oneWire.reset_search();
-    sensors.begin();
-    delay(10);
-
-    // raw reset で応答を直接確認
     bool presence = oneWire.reset();
     Serial.print(F("reset="));
     Serial.print(presence ? F("OK") : F("NG"));
 
-    uint8_t count = sensors.getDeviceCount();
-    Serial.print(F(" count="));
-    Serial.print(count);
+    uint8_t count = 0;
+    if (presence) {
+      delay(10);
 
-    if (count > 0) {
-      sensors.requestTemperatures();
-      float t = sensors.getTempCByIndex(0);
-      Serial.print(F(" temp="));
-      Serial.print(t, 2);
-      Serial.print(F("℃ ✓"));
+      // ★ SKIP ROM（1チャンネル1センサ専用）
+      // ROM サーチを使わないため 4052 経由でも安定動作
+      oneWire.write(0xCC);  // SKIP ROM
+      oneWire.write(0x44);  // Convert T（温度変換開始）
+      delay(750);           // 12bit 変換待ち（最大 750ms）
+
+      bool resetOk2 = oneWire.reset();
+      if (resetOk2) {
+        oneWire.write(0xCC);  // SKIP ROM
+        oneWire.write(0xBE);  // Read Scratchpad
+
+        uint8_t lo = oneWire.read();
+        uint8_t hi = oneWire.read();
+        int16_t raw = (int16_t)(lo | (hi << 8));
+        float t = raw / 16.0f;
+
+        if (t > -55.0f && t < 125.0f) {
+          Serial.printf("  temp=%.2f℃ ✓", t);
+          count = 1;
+        } else {
+          Serial.printf("  temp=%.2f (範囲外 → 配線確認)", t);
+        }
+      } else {
+        Serial.print(F("  2回目reset失敗"));
+      }
     }
-    Serial.println();
+    Serial.print(F(" count="));
+    Serial.println(count);
     delay(50);
   }
   delay(3000);
