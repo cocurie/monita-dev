@@ -57,6 +57,9 @@
 #include <HX711.h>
 // コア同梱。将来 LittleFS 等で使う場合に備えインクルードのみ（本スケッチでは未使用でも可）
 #include <InternalFileSystem.h>
+// DS18B20（1-Wire 温度センサ）。CH_ASSIGN[i]=3 のスロットで使用
+#include <OneWire.h>
+#include <DallasTemperature.h>
 // USB CDC（Serial）。DEBUG_MODE 時のログ出力に使用
 #include <Adafruit_TinyUSB.h>
 
@@ -64,9 +67,9 @@
 // アプリ設定（ここを主に編集する）
 // ============================================================
 
-#define DEBUG_MODE           0        // 1: USB Serial デバッグログ有効。本番は 0
-#define DEBUG_NO_SLEEP       0        // 1: deepSleep をスキップして即 loop() に戻る（DEBUG_MODE 1 時のみ有効）
-#define DEBUG_NO_SIGFOX      0        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
+#define DEBUG_MODE           1        // 1: USB Serial デバッグログ有効。本番は 0
+#define DEBUG_NO_SLEEP       1        // 1: deepSleep をスキップして即 loop() に戻る（DEBUG_MODE 1 時のみ有効）
+#define DEBUG_NO_SIGFOX      1        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
 #define SLEEP_MINUTES        15       // 1サイクル後のスリープ時間（分）
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 #define BUTTON_LONG_PRESS_MS 5000UL  // D0 長押し閾値（ms）: 以上で tare、未満でリセット
@@ -103,8 +106,11 @@
 #define NEOPIXEL_COUNT 1
 #endif
 
-// 各スロット i（0〜3）が CH(i+1) に相当。1=HX711、2=TCA 経由で MPU6050 等（I2C 0x68）
-const uint8_t CH_ASSIGN[4] = {1, 1, 1, 1};
+// 各スロット i（0〜3）が CH(i+1) に相当。
+//   1 = HX711（ロードセル）
+//   2 = TCA9546A 経由で MPU6050 等（I2C 0x68）
+//   3 = DS18B20（1-Wire 温度センサ）※ 外部プルアップ 4.7kΩ（3V3_SW → CH pin3）必要
+const uint8_t CH_ASSIGN[4] = {3, 3, 3, 3};
 
 // HX711 1ch あたりの生サンプル数（中央値をとる前の個数）
 #define DATA_NUM 5
@@ -491,6 +497,53 @@ static void tcaDisable() {
 }
 
 // ============================================================
+// DS18B20（1-Wire 温度センサ）— MUX 経由でピンを共用
+//
+// 手順: muxSelect(ch) → 4052 が CHx ↔ D6（HX711_SCK_PIN）を接続
+//       → D6 上で OneWire プロトコルを実行
+// DATA ライン: JP コネクタ pin3（PD_SCK_CHx）= D6（ネットリスト確認済み）
+// 変換時間: 12bit = 最大 750ms / 9bit = 最大 94ms（CONVERT_T コマンド発行後）
+// ============================================================
+
+static OneWire      s_ow(HX711_SCK_PIN);   // D6 = CH コネクタ pin3（PD_SCK_CHx）
+static DallasTemperature s_ds(&s_ow);
+
+// 指定チャネルの DS18B20 を読む。戻り値: 温度×10（例: 253 = 25.3℃）、失敗時 0
+static int measureDS18B20(uint8_t ch) {
+  muxSelect(ch);
+  delay(10);        // MUX 切替安定待ち
+  s_ds.begin();     // MUX 切替後にバスを再スキャン（新チャネルのデバイスを認識）
+
+  // 9bit 解像度に下げて変換時間を短縮（0.5℃ 分解能、94ms）
+  DeviceAddress addr;
+  if (s_ds.getAddress(addr, 0)) {
+    s_ds.setResolution(addr, 12);  // 12bit = 0.0625℃分解能（変換時間 750ms）
+  }
+
+  s_ds.requestTemperatures();
+
+  float t = s_ds.getTempCByIndex(0);
+  if (t == DEVICE_DISCONNECTED_C) {
+#if DEBUG_MODE
+    Serial.print("[DS18B20 CH");
+    Serial.print(ch);
+    Serial.println("] not found");
+#endif
+    return 0;
+  }
+
+#if DEBUG_MODE
+  Serial.print("[DS18B20 CH");
+  Serial.print(ch);
+  Serial.print("] ");
+  Serial.print(t, 1);
+  Serial.println(" degC");
+#endif
+
+  return (int)(t * 10.0f);
+}
+
+// ============================================================
 // HX711（ライブラリ 1 インスタンスを MUX 切替で共用）
 // ============================================================
 
@@ -752,6 +805,8 @@ static void measureAll() {
         ch[i] = measureMPU();
       }
       tcaDisable();
+    } else if (CH_ASSIGN[i] == 3) {
+      ch[i] = measureDS18B20((uint8_t)(i + 1));
     }
 
 #if DEBUG_MODE
