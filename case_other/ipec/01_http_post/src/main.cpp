@@ -155,7 +155,7 @@ static bool postToIpec(const String& json) {
   delay(200);
   sendAT("AT+CSSLCFG=\"ignorertctime\",0,1", 2000);     // 証明書時刻無視
   delay(200);
-  sendAT("AT+CASSLCFG=0,\"ssl\",0", 2000);              // 接続0 ← SSLコンテキスト0
+  sendAT("AT+CASSLCFG=0,\"ssl\",1", 2000);              // 接続0: SSL 有効（1=enable, 0=disable）
   delay(200);
 
   // ── SSL TCP 接続（port 443）──
