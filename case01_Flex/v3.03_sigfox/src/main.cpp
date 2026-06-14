@@ -107,10 +107,27 @@
 #endif
 
 // 各スロット i（0〜3）が CH(i+1) に相当。
-//   1 = HX711（ロードセル）
-//   2 = TCA9546A 経由で MPU6050 等（I2C 0x68）
+//   1 = HX711（ひずみ・荷重）
+//   2 = TCA9546A 経由 I2C センサ（DS3231 温度など）
 //   3 = DS18B20（1-Wire 温度センサ）※ 外部プルアップ 4.7kΩ（3V3_SW → CH pin3）必要
-const uint8_t CH_ASSIGN[4] = {3, 3, 3, 3};
+const uint8_t CH_ASSIGN[4] = {1, 1, 1, 1};
+
+// ── ひずみ補正係数（キャリブレーション） ──────────────────────────
+//
+// 【手順】
+//   Step1: STRAIN_SCALE = 1.0f のまま生値をシリアルモニタで確認する
+//   Step2: カンチレバー等の既知荷重をかけ、生値の変化量を記録する
+//   Step3: STRAIN_SCALE = 生値変化量 / 既知ひずみ[με] で設定する
+//
+// 【変換式】
+//   送信値（με）= HX711生値 / STRAIN_SCALE
+//
+// 【参考】
+//   v3.02 実測値: STRAIN_SCALE = 1110.0f（環境・ゲージにより異なる）
+//   ゲージファクター: 金属箔ひずみゲージは通常 2.0
+//
+// ★ まず生値確認 → キャリブレーション後にこの値を更新する ★
+static const float STRAIN_SCALE = 1.0f;  // 1.0f = 生値そのまま出力（未キャリブレーション）
 
 // HX711 1ch あたりの生サンプル数（中央値をとる前の個数）
 #define DATA_NUM 5
@@ -795,6 +812,9 @@ static void measureAll() {
       // 物理 CH は 1 origin（MUX と正本 JP の対応）
       hxBegin((uint8_t)(i + 1));
       hxRead(&ch[i]);
+      // 生値 → ひずみ値（με）変換
+      // STRAIN_SCALE=1.0f のとき生値そのまま（未キャリブレーション）
+      ch[i] = (int)((float)ch[i] / STRAIN_SCALE);
     } else if (CH_ASSIGN[i] == 2) {
       // MPU は TCA のチャネル i（0 origin）に合わせてバスを開く
       if (tcaSelect((uint8_t)i) != 0) {
