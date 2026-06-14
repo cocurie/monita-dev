@@ -48,15 +48,15 @@ const char* GAS_SCRIPT_ID = "AKfycbywRcyl3059evcw-kFo9ypeejbhZWRyY9rILX9TUjlEWJ-
 
 // SIM切り替え（使う方だけ有効にする）
 // ── 1NCE SIM（KDDI回線）──
-//const char* APN      = "iot.1nce.net";
-//const char* SIM_NAME = "1NCE";
-//const char* APN_USER = "";
-//const char* APN_PASS = "";
+const char* APN      = "iot.1nce.net";
+const char* SIM_NAME = "1NCE";
+const char* APN_USER = "";
+const char* APN_PASS = "";
 // ── SORACOM SIM（ドコモ回線）（使う場合は上4行をコメントアウト）──
- const char* APN      = "soracom.io";
- const char* SIM_NAME = "SORACOM";
- const char* APN_USER = "sora";
- const char* APN_PASS = "sora";
+//const char* APN      = "soracom.io";
+//const char* SIM_NAME = "SORACOM";
+//const char* APN_USER = "sora";
+//const char* APN_PASS = "sora";
 
 // ══════════════════════════════════════════════
 // 測定間隔（現場で動かし続けるとき）
@@ -73,8 +73,10 @@ String sendAT(String cmd, int waitMs = 5000) {
   String res = "";
   while (millis() - start < waitMs) {
     while (Serial1.available()) res += (char)Serial1.read();
+    yield();  // USB タスクを生かす（これがないと USB 切断が起きる）
   }
-  Serial.println(res);
+  if (res.length() > 0) Serial.println(res);
+  else                   Serial.println(F("(応答なし)"));
   return res;
 }
 
@@ -352,6 +354,12 @@ bool initNetwork() {
 void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000) yield();
+
+  // ピン設定：使用するハードに合わせてどちらかを有効にする
+  // ── Flex v3.02 基板（D8/D9）──
+  Serial1.setPins(9, 8);   // setPins(RX=D9, TX=D8)
+  // ── ブレッドボード（D6/D7）──（こちらの場合は上の行をコメントアウト）
+  // Serial1.setPins(7, 6);   // setPins(RX=D7, TX=D6)
   Serial1.begin(115200);
 
   Serial.println(F("\n===================================="));
@@ -361,9 +369,43 @@ void setup() {
   Serial.print(F("APN: ")); Serial.println(APN);
   Serial.println();
 
-  delay(3000);
-  sendAT("AT");
-  sendAT("AT+CPIN?");
+  // SIM7080G 起動待ち（15秒 — 短すぎると AT に応答しない）
+  Serial.print(F("SIM7080G 起動待ち（15秒）"));
+  for (int i = 0; i < 15; i++) {
+    delay(1000); Serial.print('.');
+    while (Serial1.available()) Serial.write(Serial1.read()); // 起動ログ表示
+  }
+  Serial.println();
+
+  // AT 疎通確認（最大 20 回リトライ）
+  Serial.print(F("AT 疎通確認"));
+  bool atOk = false;
+  for (int t = 0; t < 20; t++) {
+    Serial.print('.');
+    Serial1.print("AT\r\n");
+    delay(500);
+    String r = "";
+    unsigned long s = millis();
+    while (millis() - s < 500) {
+      while (Serial1.available()) r += (char)Serial1.read();
+      yield();
+    }
+    if (r.indexOf("OK") >= 0) { atOk = true; break; }
+    while (Serial1.available()) Serial1.read();
+  }
+  Serial.println(atOk ? F(" OK ✓") : F(" 応答なし ✗"));
+
+  if (!atOk) {
+    Serial.println(F("[ERROR] SIM7080G が応答しません。配線・電源を確認してください。"));
+    Serial.println(F("  - M5Stamp CatM の緑LED が点灯しているか？"));
+    Serial.println(F("  - D6(TX)→SIM7080G RX、D7(RX)←SIM7080G TX の配線は正しいか？"));
+    Serial.println(F("  - XIAO 5V → M5Stamp 5V の電源は来ているか？"));
+    Serial.println(F("ATコマンドモードで継続します（手動で確認してください）。"));
+    return;
+  }
+
+  sendAT("ATE0", 2000);   // エコーオフ
+  sendAT("AT+CPIN?");     // SIM 認識確認
 
   // 接続前の電波状況
   Serial.println(F("\n=== 接続前の電波状況 ==="));
