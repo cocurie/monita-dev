@@ -566,6 +566,10 @@ static int measureDS18B20(uint8_t ch) {
 
 HX711 hx;
 
+// チャンネルごとのタレオフセット（HX711 は1インスタンス共用なのでここに保存する）
+// hx.tare() のオフセットは1つしか保持できないため、チャンネル切替のたびに set_offset() で復元する
+static long s_hx_tare_offset[4] = {0, 0, 0, 0};
+
 // HX711 全有効チャネルに tare を実行する（3V3_SW ON・Wire 初期化済みの状態で呼ぶこと）
 static void performTare() {
   if ((s_errors & ERR_TCA9534_I2C) != 0U) {
@@ -585,10 +589,13 @@ static void performTare() {
     }
     if (hx.is_ready()) {
       hx.tare();
+      s_hx_tare_offset[i] = hx.get_offset();  // チャンネルごとに保存
 #if DEBUG_MODE
       Serial.print("[TARE] CH");
       Serial.print(i + 1);
-      Serial.println(" done");
+      Serial.print(" done (offset=");
+      Serial.print(s_hx_tare_offset[i]);
+      Serial.println(")");
 #endif
     } else {
 #if DEBUG_MODE
@@ -631,6 +638,9 @@ static void hxBegin(uint8_t ch) {
   digitalWrite(HX711_SCK_PIN, LOW);
   delay(10);
   hx.begin(HX711_DOUT_PIN, HX711_SCK_PIN);
+  // チャンネルごとに保存したタレオフセットを復元
+  // （hx は1インスタンス共用のため、切替のたびに set_offset() で正しいオフセットに戻す）
+  hx.set_offset(s_hx_tare_offset[ch - 1]);
 }
 
 // true=正常、false=タイムアウト（ERR_HX711_TIMEOUT をセット）
