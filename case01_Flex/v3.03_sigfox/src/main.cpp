@@ -652,7 +652,9 @@ static bool hxRead(int *out) {
 
   float b[DATA_NUM];
   for (int i = 0; i < DATA_NUM; i++) {
-    b[i] = hx.read();
+    // get_value() = read() - tare_offset（タレ補正済み生値）
+    // read() だとタレ値が反映されないため get_value() を使う
+    b[i] = hx.get_value();
   }
 
   *out = (int)median(b, DATA_NUM);
