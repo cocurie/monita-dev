@@ -67,7 +67,7 @@
 // アプリ設定（ここを主に編集する）
 // ============================================================
 
-#define DEBUG_MODE           1        // 1: USB Serial デバッグログ有効。本番は 0
+#define DEBUG_MODE           0        // 1: USB Serial デバッグログ有効。本番は 0
 #define DEBUG_NO_SLEEP       1        // 1: deepSleep をスキップして即 loop() に戻る（DEBUG_MODE 1 時のみ有効）
 #define DEBUG_NO_SIGFOX      1        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
 #define SLEEP_MINUTES        15       // 1サイクル後のスリープ時間（分）
@@ -941,17 +941,15 @@ static void sendSigfox() {
     return;
   }
 
-#if DEBUG_NO_SIGFOX
-  // デバッグ時: ペイロードをログに出力するだけで実際には送信しない
+#if DEBUG_MODE && DEBUG_NO_SIGFOX
+  // デバッグ時のみ: ペイロードをログに出力して送信スキップ
   {
     String payload = "";
     for (int i = 0; i < 4; i++) payload += hx4(ch[i]);
     payload += hx4(tempV);
     payload += hx4(battV);
-#if DEBUG_MODE
     Serial.print("[SIGFOX] TX SKIPPED (DEBUG_NO_SIGFOX): AT$SF=");
     Serial.println(payload);
-#endif
   }
   return;
 #endif
