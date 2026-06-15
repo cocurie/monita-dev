@@ -127,7 +127,7 @@ const uint8_t CH_ASSIGN[4] = {1, 1, 1, 1};
 //   ゲージファクター: 金属箔ひずみゲージは通常 2.0
 //
 // ★ まず生値確認 → キャリブレーション後にこの値を更新する ★
-static const float STRAIN_SCALE = 1.0f;  // 1.0f = 生値そのまま出力（未キャリブレーション）
+static const float STRAIN_SCALE = 1110.0f;  // 1.0f = 生値そのまま出力（未キャリブレーション）
 
 // HX711 1ch あたりの生サンプル数（中央値をとる前の個数）
 #define DATA_NUM 5
@@ -1101,6 +1101,33 @@ void loop() {
     Serial.println("[TCA9534] re-init failed");
 #endif
   }
+  // ── ボタン処理（DEBUG_NO_SLEEP時はdeeepSleep内に入らないためここで処理）──
+  if (s_btnFlag) {
+    s_btnFlag = false;
+    delay(20);  // チャタリング除去
+    if (digitalRead(USER_BUTTON_PIN) == LOW) {
+      unsigned long pressStart = millis();
+      bool longPress = false;
+      while (digitalRead(USER_BUTTON_PIN) == LOW) {
+        if (millis() - pressStart >= BUTTON_LONG_PRESS_MS) {
+          longPress = true;
+          break;
+        }
+      }
+      if (longPress) {
+        s_pendingTare = true;
+#if DEBUG_MODE
+        Serial.println("[BTN] long press -> tare pending");
+#endif
+      } else {
+#if DEBUG_MODE
+        Serial.println("[BTN] short press -> reset");
+#endif
+        NVIC_SystemReset();
+      }
+    }
+  }
+
   if (s_pendingTare) {
     s_pendingTare = false;
     performTare();
