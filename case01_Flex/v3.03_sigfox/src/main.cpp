@@ -55,8 +55,9 @@
 #include <Wire.h>
 // 重量センサ用 ADC ブリッジ
 #include <HX711.h>
-// コア同梱。将来 LittleFS 等で使う場合に備えインクルードのみ（本スケッチでは未使用でも可）
+// コア同梱。タレオフセットのフラッシュ保存（リセット後も保持）に使用
 #include <InternalFileSystem.h>
+using namespace Adafruit_LittleFS_Namespace;
 // DS18B20（1-Wire 温度センサ）。CH_ASSIGN[i]=3 のスロットで使用
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -68,8 +69,8 @@
 // ============================================================
 
 #define DEBUG_MODE           0        // 1: USB Serial デバッグログ有効。本番は 0
-#define DEBUG_NO_SLEEP       1        // 1: deepSleep をスキップして即 loop() に戻る（DEBUG_MODE 1 時のみ有効）
-#define DEBUG_NO_SIGFOX      1        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
+#define DEBUG_NO_SLEEP       0        // 1: deepSleep をスキップして即 loop() に戻る（DEBUG_MODE 1 時のみ有効）
+#define DEBUG_NO_SIGFOX      0        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
 #define SLEEP_MINUTES        15       // 1サイクル後のスリープ時間（分）
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 #define BUTTON_LONG_PRESS_MS 5000UL  // D0 長押し閾値（ms）: 以上で tare、未満でリセット
@@ -80,9 +81,9 @@
 #define DS3231_SET_TIME      0        // 1: 起動時に DS3231 へ時刻を書き込む。書き込み後は 0 に戻す
 #define DS3231_INIT_YEAR     2026     // 書き込む年（西暦 4 桁）
 #define DS3231_INIT_MONTH    6        // 書き込む月（1〜12）
-#define DS3231_INIT_DAY      6        // 書き込む日（1〜31）
-#define DS3231_INIT_HOUR     10       // 書き込む時（0〜23、24h 形式）
-#define DS3231_INIT_MIN      0        // 書き込む分（0〜59）
+#define DS3231_INIT_DAY      16        // 書き込む日（1〜31）
+#define DS3231_INIT_HOUR     13       // 書き込む時（0〜23、24h 形式）
+#define DS3231_INIT_MIN      58        // 書き込む分（0〜59）
 #define DS3231_INIT_SEC      0        // 書き込む秒（0〜59）
 
 // USE_DS3231_TIMESTAMP=1 にすると各サイクルで DS3231 の現在時刻を読み出し、
@@ -96,6 +97,13 @@
 #define SIGFOX_RX_PIN 9    // D9: XIAO RX ← BRKLSM100 TX
 #define SIGFOX_BAUD   9600
 
+// ── I2C 加速度センサ設定 ───────────────────────────────────────
+// 対応センサ: LSM6DS3 / LSM6DSO / LSM6DSL（SA0 ピンでアドレス切替）
+//   SA0 = LOW（GND）  → 0x6A
+//   SA0 = HIGH（3V3） → 0x6B ← スキャンで確認済み
+// ※ MPU6050 を使う場合: AD0=LOW→0x68（DS3231と競合）, AD0=HIGH→0x69
+#define MPU_ADDR 0x6B  // LSM6DS SA0=HIGH
+
 // ── ステータス LED ─────────────────────────────────────────────
 // WS2812 を使う場合は 1 にし、NeoPixel のデータピン・個数と lib_deps を設定する。
 #define USE_WS2812_STATUS_LED 0
@@ -108,9 +116,10 @@
 
 // 各スロット i（0〜3）が CH(i+1) に相当。
 //   1 = HX711（ひずみ・荷重）
-//   2 = TCA9546A 経由 I2C センサ（DS3231 温度など）
+//   2 = TCA9546A 経由 I2C センサ（LSM6DS 等の加速度センサなど）
+//       ※ DS3231 はオンボード U7（0x68）と競合するため CH 接続不可
 //   3 = DS18B20（1-Wire 温度センサ）※ 外部プルアップ 4.7kΩ（3V3_SW → CH pin3）必要
-const uint8_t CH_ASSIGN[4] = {1, 1, 1, 1};
+const uint8_t CH_ASSIGN[4] = {1, 1, 3, 3};
 
 // ── ひずみ補正係数（キャリブレーション） ──────────────────────────
 //
@@ -391,6 +400,10 @@ static void deepSleep(uint32_t minutes) {
 
   NRF_RTC2->TASKS_START = 1;
 
+  // 計測・送信フェーズ中に発生したボタン押下の残りフラグをここで破棄する。
+  // スリープ中（WFI ループ内）の押下のみを有効とする。
+  s_btnFlag = false;
+
   while (!s_rtc2Compare0Wake) {
     __DSB();
     __WFI();
@@ -399,10 +412,16 @@ static void deepSleep(uint32_t minutes) {
       s_btnFlag = false;
       delay(20); // チャタリング除去
       if (digitalRead(USER_BUTTON_PIN) == LOW) {
-        unsigned long pressStart = millis();
+        // ボタンがまだ押されている → 長押し判定
+        // millis() は FreeRTOS tickless idle の影響を受けるため、
+        // すでに動作中の RTC2 カウンタで計時する（確実に 8tick/秒で進む）。
+        uint32_t startTick = NRF_RTC2->COUNTER;
+        const uint32_t longPressTicks =
+            (BUTTON_LONG_PRESS_MS / 1000UL) * RTC2_TICKS_PER_SECOND;
         bool longPress = false;
         while (digitalRead(USER_BUTTON_PIN) == LOW) {
-          if (millis() - pressStart >= BUTTON_LONG_PRESS_MS) {
+          uint32_t elapsed = (NRF_RTC2->COUNTER - startTick) & RTC2_COUNTER_MASK;
+          if (elapsed >= longPressTicks) {
             longPress = true;
             break;
           }
@@ -426,6 +445,13 @@ static void deepSleep(uint32_t minutes) {
 #endif
           NVIC_SystemReset();
         }
+      } else {
+        // ボタンはすでに離されている → 短押しとみなしてリセット
+#if DEBUG_MODE
+        Serial.println("[BTN] short press (released) -> reset");
+        Serial.flush();
+#endif
+        NVIC_SystemReset();
       }
     }
   }
@@ -529,15 +555,42 @@ static DallasTemperature s_ds(&s_ow);
 static int measureDS18B20(uint8_t ch) {
   muxSelect(ch);
   delay(10);        // MUX 切替安定待ち
-  s_ds.begin();     // MUX 切替後にバスを再スキャン（新チャネルのデバイスを認識）
 
-  // 9bit 解像度に下げて変換時間を短縮（0.5℃ 分解能、94ms）
-  DeviceAddress addr;
-  if (s_ds.getAddress(addr, 0)) {
-    s_ds.setResolution(addr, 12);  // 12bit = 0.0625℃分解能（変換時間 750ms）
+  // D6 を意図的に LOW → HIGH → INPUT と遷移させることで DS18B20 に立ち上がりエッジを与える。
+  // ※ HX711 操作後は D6 が OUTPUT LOW のままのため HIGH 遷移が機能するが、
+  //    初回起動時（D6 がデフォルト INPUT）は LOW→HIGH の遷移が発生せず DS18B20 が応答しない。
+  //    明示的に LOW を出してから HIGH にすることで初回でも確実に動作させる。
+  pinMode(HX711_SCK_PIN, OUTPUT);
+  digitalWrite(HX711_SCK_PIN, LOW);
+  delay(10);        // LOW 保持（HX711 操作後と同じ状態を作る）
+  digitalWrite(HX711_SCK_PIN, HIGH);
+  delay(2);         // HIGH 保持（立ち上がりエッジ確認用）
+  pinMode(HX711_SCK_PIN, INPUT);
+  delay(200);       // バス安定待ち（外部 4.7kΩ で HIGH に戻るまで）
+  s_ds.begin();     // MUX 切替後にバスを再スキャン
+
+  // 念のためリトライ（最大 3 回）
+  for (int retry = 0; retry < 3 && s_ds.getDeviceCount() == 0; retry++) {
+    delay(500);
+    s_ds.begin();
+#if DEBUG_MODE
+    Serial.print("[DS18B20 CH");
+    Serial.print(ch);
+    Serial.print("] retry ");
+    Serial.println(retry + 1);
+#endif
   }
 
-  s_ds.requestTemperatures();
+  DeviceAddress addr;
+  if (s_ds.getAddress(addr, 0)) {
+    // 初回電源ON直後の変換は CRC エラーになる場合がある。
+    // 9bit（94ms）でダミー変換を1回行い内部回路を安定させてから本変換を実施する。
+    s_ds.setResolution(addr, 9);   // 9bit: 変換 94ms（ダミー用）
+    s_ds.requestTemperatures();    // ダミー変換（結果は捨てる）
+    s_ds.setResolution(addr, 12);  // 12bit: 変換 750ms（本計測用）
+  }
+
+  s_ds.requestTemperatures();  // 本変換
 
   float t = s_ds.getTempCByIndex(0);
   if (t == DEVICE_DISCONNECTED_C) {
@@ -569,6 +622,47 @@ HX711 hx;
 // チャンネルごとのタレオフセット（HX711 は1インスタンス共用なのでここに保存する）
 // hx.tare() のオフセットは1つしか保持できないため、チャンネル切替のたびに set_offset() で復元する
 static long s_hx_tare_offset[4] = {0, 0, 0, 0};
+
+// ── タレオフセット フラッシュ保存／復元 ──────────────────────────────
+// s_hx_tare_offset は SRAM 変数のため、スリープ中に MCU がリセットされると失われる。
+// InternalFS（LittleFS）に書き出すことでリセット後も保持する。
+
+static const char TARE_FILE[] = "/tare.bin";
+
+// タレ実行後に呼ぶ。オフセット配列をフラッシュへ書き込む。
+static void saveTareOffsets() {
+  if (!InternalFS.begin()) return;
+  InternalFS.remove(TARE_FILE);
+  File f(InternalFS);
+  if (f.open(TARE_FILE, FILE_O_WRITE)) {
+    f.write((const uint8_t*)s_hx_tare_offset, sizeof(s_hx_tare_offset));
+    f.close();
+#if DEBUG_MODE
+    Serial.println("[TARE] offsets saved to flash");
+#endif
+  }
+}
+
+// 起動時に呼ぶ。フラッシュからオフセット配列を復元する。
+// ファイルが存在しない（初回起動・全消去後）場合は {0,0,0,0} のまま。
+static void loadTareOffsets() {
+  if (!InternalFS.begin()) return;
+  File f(InternalFS);
+  if (f.open(TARE_FILE, FILE_O_READ)) {
+    if ((size_t)f.size() == sizeof(s_hx_tare_offset)) {
+      f.read((uint8_t*)s_hx_tare_offset, sizeof(s_hx_tare_offset));
+#if DEBUG_MODE
+      Serial.print("[TARE] offsets loaded: ");
+      for (int i = 0; i < 4; i++) {
+        Serial.print(s_hx_tare_offset[i]);
+        if (i < 3) Serial.print(", ");
+      }
+      Serial.println();
+#endif
+    }
+    f.close();
+  }
+}
 
 // HX711 全有効チャネルに tare を実行する（3V3_SW ON・Wire 初期化済みの状態で呼ぶこと）
 static void performTare() {
@@ -605,6 +699,8 @@ static void performTare() {
 #endif
     }
   }
+  // タレ完了後にオフセットをフラッシュへ保存（リセット後も保持するため）
+  saveTareOffsets();
 }
 
 // 小さな配列のバブルソートで中央値（外れ値に強い簡易ロバスト化）
@@ -768,29 +864,67 @@ static int measureBatt() {
 }
 
 // ============================================================
-// MPU6050 系（I2C 0x68）— 加速度から簡易ピッチ（度×10）
+// MPU6050（I2C MPU_ADDR）— 加速度から簡易ピッチ（度×10）
 //
+// アドレス: MPU_ADDR（デフォルト 0x69 / AD0=HIGH）
 // レジスタ 0x3B から加速度 XYZ 各 2byte。姿勢は pitch のみ算出。
+//
+// 【初期化について】
+//   MPU6050 は電源投入直後スリープ状態。レジスタ 0x6B（PWR_MGMT_1）に
+//   0x00 を書いてスリープ解除が必要。tcaSelect() 後・measureMPU() 前に
+//   mpuWakeup() を呼ぶか、measureMPU() 内で毎回実行する。
+//   3V3_SW サイクルごとに電源が切れるため、毎サイクル初期化が必要。
 // ============================================================
 
+// LSM6DS 系（LSM6DS3 / LSM6DSO / LSM6DSL）初期化
+// 電源投入後またはリセット後に加速度計を有効化する（デフォルト OFF）
+// CTRL1_XL (0x10): ODR=104Hz, FS=±2g → 0x40
+static bool mpuWakeup() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x10);   // CTRL1_XL: 加速度計設定レジスタ
+  Wire.write(0x40);   // ODR_XL=104Hz, FS_XL=±2g, LPF1_BW=ODR/2
+  return Wire.endTransmission() == 0;
+}
+
 static int measureMPU() {
-  Wire.beginTransmission(0x68);
-  Wire.write(0x3B);
+  // 毎回初期化（3V3_SW サイクルで電源断されるため）
+  if (!mpuWakeup()) {
+    s_errors |= ERR_MPU_I2C;
+    statusErrorRed();
+#if DEBUG_MODE
+    Serial.print("[LSM6] init failed (addr=0x");
+    Serial.print(MPU_ADDR, HEX);
+    Serial.println(")");
+#endif
+    return 0;
+  }
+  delay(20);  // ODR=104Hz → 初回変換完了まで約10ms、余裕を持って20ms
+
+  // OUTX_L_A (0x28) から加速度 XYZ 各 2byte（リトルエンディアン）
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x28);
   if (Wire.endTransmission(false) != 0) {
     s_errors |= ERR_MPU_I2C;
     statusErrorRed();
     return 0;
   }
-  uint8_t n = Wire.requestFrom(0x68, (uint8_t)6);
+  uint8_t n = Wire.requestFrom(MPU_ADDR, (uint8_t)6);
   if (n < 6) {
     s_errors |= ERR_MPU_I2C;
     statusErrorRed();
     return 0;
   }
 
-  int16_t ax = Wire.read() << 8 | Wire.read();
-  int16_t ay = Wire.read() << 8 | Wire.read();
-  int16_t az = Wire.read() << 8 | Wire.read();
+  // LSM6DS はリトルエンディアン（LSB first）
+  int16_t ax = (int16_t)(Wire.read() | Wire.read() << 8);
+  int16_t ay = (int16_t)(Wire.read() | Wire.read() << 8);
+  int16_t az = (int16_t)(Wire.read() | Wire.read() << 8);
+
+#if DEBUG_MODE
+  Serial.print("[LSM6] ax="); Serial.print(ax);
+  Serial.print(" ay="); Serial.print(ay);
+  Serial.print(" az="); Serial.println(az);
+#endif
 
   float pitch =
       atan2f((float)ax, sqrtf((float)ay * (float)ay + (float)az * (float)az)) * 180.0f / (float)PI;
@@ -814,21 +948,37 @@ static void measureAll() {
   // 計測フェーズ: 緑点灯（電源 ON の強青 500 ms は setup で済ませ、その後〜計測開始は setup がディム青）
   statusMeasureGreen();
 
+  // ── パス1: DS18B20（CH_ASSIGN=3）を最初に計測 ────────────────────
+  // HX711 が D6 を OUTPUT に設定する前に 1-Wire 通信を完了させる。
+  // 本番モード（DEBUG_MODE=0）で HX711 → DS18B20 の順に処理すると
+  // D6 の状態干渉により DS18B20 が応答しない問題を根本回避する。
+  for (int i = 0; i < 4; i++) {
+    if (CH_ASSIGN[i] == 3) {
+      ch[i] = measureDS18B20((uint8_t)(i + 1));
+#if DEBUG_MODE
+      Serial.print("[CH");
+      Serial.print(i + 1);
+      Serial.print("] ");
+      Serial.println(ch[i]);
+#endif
+    }
+  }
+
+  // ── パス2: HX711 / I2C を計測 ────────────────────────────────────
   for (int i = 0; i < 4; i++) {
 
     if (CH_ASSIGN[i] == 1) {
       if ((s_errors & ERR_TCA9534_I2C) != 0U) {
         ch[i] = 0;
-        continue;
+      } else {
+        // 物理 CH は 1 origin（MUX と正本 JP の対応）
+        hxBegin((uint8_t)(i + 1));
+        hxRead(&ch[i]);
+        // 生値 → ひずみ値（με）変換
+        ch[i] = (int)((float)ch[i] / STRAIN_SCALE);
       }
-      // 物理 CH は 1 origin（MUX と正本 JP の対応）
-      hxBegin((uint8_t)(i + 1));
-      hxRead(&ch[i]);
-      // 生値 → ひずみ値（με）変換
-      // STRAIN_SCALE=1.0f のとき生値そのまま（未キャリブレーション）
-      ch[i] = (int)((float)ch[i] / STRAIN_SCALE);
     } else if (CH_ASSIGN[i] == 2) {
-      // MPU は TCA のチャネル i（0 origin）に合わせてバスを開く
+      // TCA9546A のチャネル i（0 origin）を選択して MPU を読む
       if (tcaSelect((uint8_t)i) != 0) {
         s_errors |= ERR_TCA_I2C;
         statusErrorRed();
@@ -837,8 +987,9 @@ static void measureAll() {
         ch[i] = measureMPU();
       }
       tcaDisable();
-    } else if (CH_ASSIGN[i] == 3) {
-      ch[i] = measureDS18B20((uint8_t)(i + 1));
+    } else {
+      // CH_ASSIGN[i] == 3 はパス1で処理済み → スキップ
+      continue;
     }
 
 #if DEBUG_MODE
@@ -1081,6 +1232,10 @@ void setup() {
     Serial.println("[TCA9534] init failed");
 #endif
   }
+
+  // フラッシュから前回のタレオフセットを復元（リセット後も継続して有効にするため）
+  loadTareOffsets();
+
   measureAll();
   sendSigfox();
 
@@ -1111,11 +1266,12 @@ void loop() {
     Serial.println("[TCA9534] re-init failed");
 #endif
   }
-  // ── ボタン処理（DEBUG_NO_SLEEP時はdeeepSleep内に入らないためここで処理）──
+  // ── ボタン処理（DEBUG_NO_SLEEP時 or スリープ中に押されてloop()到達時に処理）──
   if (s_btnFlag) {
     s_btnFlag = false;
     delay(20);  // チャタリング除去
     if (digitalRead(USER_BUTTON_PIN) == LOW) {
+      // ボタンがまだ押されている → 長押し判定
       unsigned long pressStart = millis();
       bool longPress = false;
       while (digitalRead(USER_BUTTON_PIN) == LOW) {
@@ -1135,6 +1291,12 @@ void loop() {
 #endif
         NVIC_SystemReset();
       }
+    } else {
+      // ボタンはすでに離されている（計測中等に押されてloop()到達時に検知）→ 短押しとみなしてリセット
+#if DEBUG_MODE
+      Serial.println("[BTN] short press (released) -> reset");
+#endif
+      NVIC_SystemReset();
     }
   }
 
