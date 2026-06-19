@@ -4,6 +4,7 @@
  * 目的:
  *   DM3AT-SF-PEJM5 に挿した microSD カードへの読み書きを確認する。
  *   SPI ピンを nRF52840 のデフォルト（D8/D9/D10）から再マップして使用。
+ *   標準 SD ライブラリはカスタム SPI 非対応のため SdFat v2 を使用。
  *
  * テスト内容:
  *   Step1: SD 初期化・カード種別・容量の表示
@@ -13,39 +14,43 @@
  *   Step5: 100行書き込み速度計測
  *
  * 配線（テスト環境 / プルアップなし）:
- *   DM3AT pin2 CD/DAT3 (CS)   → XIAO D3
- *   DM3AT pin3 CMD    (MOSI)  → XIAO D1
+ *   DM3AT pin2 CD/DAT3 (CS)   → XIAO D3  (P0.29)
+ *   DM3AT pin3 CMD    (MOSI)  → XIAO D1  (P0.03)
  *   DM3AT pin4 VDD            → 3.3V
- *   DM3AT pin5 CLK    (SCK)   → XIAO D10
+ *   DM3AT pin5 CLK    (SCK)   → XIAO D10 (P1.15)
  *   DM3AT pin6 VSS            → GND
- *   DM3AT pin7 DAT0   (MISO)  → XIAO D2  ※プルアップなし
- *   DM3AT pin1 DAT2           → 浮き      ※プルアップなし（テスト環境）
- *   DM3AT pin8 DAT1           → 浮き      ※プルアップなし（テスト環境）
+ *   DM3AT pin7 DAT0   (MISO)  → XIAO D2  (P0.28)  ※プルアップなし
+ *   DM3AT pin1 DAT2           → 浮き               ※プルアップなし（テスト環境）
+ *   DM3AT pin8 DAT1           → 浮き               ※プルアップなし（テスト環境）
  *
  * 注意:
  *   MISO・DAT1・DAT2 のプルアップがないため初期化が不安定な場合がある。
- *   失敗時は SPI_SPEED を 1000000 (1MHz) に下げて再試行すること。
+ *   失敗時は SPI_SPEED_MHZ を 1 に下げて再試行すること。
  */
 
 #include <Arduino.h>
 #include <Adafruit_TinyUSB.h>
 #include <SPI.h>
-#include <SD.h>
+#include <SdFat.h>
 
 // ══════════════════════════════════════════════
-// ▼ ピン定義
+// ▼ ピン定義・速度設定
 // ══════════════════════════════════════════════
 #define PIN_SD_CS   D3
-#define PIN_SD_MISO D2
-#define PIN_SD_SCK  D10
-#define PIN_SD_MOSI D1
+#define PIN_SD_MISO D2   // P0.28
+#define PIN_SD_SCK  D10  // P1.15
+#define PIN_SD_MOSI D1   // P0.03
 
-// 初期化失敗時は 1000000 に下げる
-#define SPI_SPEED   4000000UL
+// 初期化失敗時は 1 に下げる
+#define SPI_SPEED_MHZ 4
 
-#define TEST_FILE   "test.txt"
-#define BENCH_FILE  "bench.txt"
+#define TEST_FILE  "test.txt"
+#define BENCH_FILE "bench.txt"
 #define BENCH_LINES 100
+
+// デフォルト SPI (NRF_SPIM3) とは別のペリフェラルでカスタムピンを使う
+static SPIClass SD_SPI(NRF_SPIM2, PIN_SD_MISO, PIN_SD_SCK, PIN_SD_MOSI);
+static SdFat sd;
 
 // ══════════════════════════════════════════════
 // ▼ ユーティリティ
@@ -63,21 +68,19 @@ static void printSeparator(const char* title) {
 static bool stepInit() {
   printSeparator("Step1: SD 初期化");
 
-  SPI.setPins(PIN_SD_MISO, PIN_SD_SCK, PIN_SD_MOSI);
-
-  if (!SD.begin(PIN_SD_CS, SPI_SPEED)) {
-    Serial.println("[FAIL] SD.begin() failed");
+  SdSpiConfig cfg(PIN_SD_CS, DEDICATED_SPI, SD_SCK_MHZ(SPI_SPEED_MHZ), &SD_SPI);
+  if (!sd.begin(cfg)) {
+    Serial.println("[FAIL] sd.begin() failed");
+    sd.initErrorPrint(&Serial);
     Serial.println("  → カードが挿さっているか確認");
-    Serial.println("  → SPI_SPEED を 1000000 に下げて再試行");
+    Serial.println("  → SPI_SPEED_MHZ を 1 に下げて再試行");
     return false;
   }
-  Serial.println("[OK] SD.begin() succeeded");
+  Serial.println("[OK] sd.begin() succeeded");
 
   // カード種別
-  Sd2Card card;
-  card.init(SPI_HALF_SPEED, PIN_SD_CS);
   Serial.print("  カード種別: ");
-  switch (card.type()) {
+  switch (sd.card()->type()) {
     case SD_CARD_TYPE_SD1:  Serial.println("SD1");  break;
     case SD_CARD_TYPE_SD2:  Serial.println("SD2");  break;
     case SD_CARD_TYPE_SDHC: Serial.println("SDHC"); break;
@@ -85,14 +88,10 @@ static bool stepInit() {
   }
 
   // 容量
-  SdVolume volume;
-  if (volume.init(card)) {
-    uint32_t volumesize = volume.blocksPerCluster() * volume.clusterCount();
-    volumesize /= 2;        // blocks → KB
-    Serial.print("  容量: ");
-    Serial.print(volumesize / 1024);
-    Serial.println(" MB");
-  }
+  uint32_t sizeMB = (uint32_t)(0.000512 * sd.card()->sectorCount());
+  Serial.print("  容量: ");
+  Serial.print(sizeMB);
+  Serial.println(" MB");
 
   return true;
 }
@@ -103,9 +102,9 @@ static bool stepInit() {
 static bool stepWrite() {
   printSeparator("Step2: 書き込み");
 
-  if (SD.exists(TEST_FILE)) SD.remove(TEST_FILE);
+  if (sd.exists(TEST_FILE)) sd.remove(TEST_FILE);
 
-  File f = SD.open(TEST_FILE, FILE_WRITE);
+  FsFile f = sd.open(TEST_FILE, O_WRITE | O_CREAT);
   if (!f) {
     Serial.println("[FAIL] ファイルを開けません");
     return false;
@@ -125,7 +124,7 @@ static bool stepWrite() {
 static bool stepRead() {
   printSeparator("Step3: 読み返し");
 
-  File f = SD.open(TEST_FILE);
+  FsFile f = sd.open(TEST_FILE, O_READ);
   if (!f) {
     Serial.println("[FAIL] ファイルを開けません");
     return false;
@@ -146,7 +145,7 @@ static bool stepRead() {
 static bool stepAppend() {
   printSeparator("Step4: 追記");
 
-  File f = SD.open(TEST_FILE, FILE_WRITE);
+  FsFile f = sd.open(TEST_FILE, O_WRITE | O_APPEND);
   if (!f) {
     Serial.println("[FAIL] ファイルを開けません");
     return false;
@@ -154,8 +153,7 @@ static bool stepAppend() {
   f.println("Appended line");
   f.close();
 
-  // 追記後に全行読み返し
-  f = SD.open(TEST_FILE);
+  f = sd.open(TEST_FILE, O_READ);
   if (!f) {
     Serial.println("[FAIL] 追記後の読み返し失敗");
     return false;
@@ -176,9 +174,9 @@ static bool stepAppend() {
 static bool stepBenchmark() {
   printSeparator("Step5: 書き込み速度計測（100行）");
 
-  if (SD.exists(BENCH_FILE)) SD.remove(BENCH_FILE);
+  if (sd.exists(BENCH_FILE)) sd.remove(BENCH_FILE);
 
-  File f = SD.open(BENCH_FILE, FILE_WRITE);
+  FsFile f = sd.open(BENCH_FILE, O_WRITE | O_CREAT);
   if (!f) {
     Serial.println("[FAIL] ファイルを開けません");
     return false;
@@ -228,6 +226,4 @@ void setup() {
   Serial.println("=============================");
 }
 
-void loop() {
-  // テスト完了後は何もしない
-}
+void loop() {}
