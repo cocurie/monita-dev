@@ -1,5 +1,5 @@
 /**
- * Monita Flex v3.02 — 検証 Step12: BLE親機（スキャン・シリアルモニタ確認用）
+ * Monita Flex v3.02 — 検証 Step12: BLE親機（スキャン・SD カード記録）
  *
  * 動作:
  *   1. 初回スキャン: 120秒（子機の起動タイミングが不明なため長めに設定）
@@ -7,7 +7,8 @@
  *      スキャン開始 = 前回受信時刻 + next_wake_sec - SCAN_PRE_MARGIN_SEC
  *      スキャン時間 = SCAN_WINDOW_SEC（60秒）
  *   3. スキャン終了後にシリアルモニタへ平均値・受信パケット数を表示
- *   4. LTE-M 送信なし（BLE受信確認のみ）
+ *   4. ENABLE_SD_LOG=1 の場合、集計結果を SD カードの CSV に追記
+ *   5. LTE-M 送信なし（BLE受信確認のみ）
  *
  * フィルタ条件:
  *   Manufacturer Data の Company ID = 0xFFFF、Pkt type = 0x01、Device ID = 0x01
@@ -16,32 +17,41 @@
  *   [0-1]  Company ID  0xFF 0xFF
  *   [2]    Pkt type    0x01
  *   [3]    Device ID   0x01 = "test01"
- *   [4-5]  CH1 ひずみ  int16_t LE
+ *   [4-5]  CH1 ひずみ  int16_t LE（生値 / 100）
  *   [6-7]  CH2 ひずみ  int16_t LE
  *   [8-9]  CH3 ひずみ  int16_t LE
  *   [10-11] CH4 ひずみ int16_t LE
  *   [12-13] バッテリー uint16_t LE（mV）
  *   [14-15] 次回計測まで uint16_t LE（秒）
  *
+ * SD カード CSV フォーマット（log.csv）:
+ *   session,elapsed_sec,pkt_count,ch1_avg,ch2_avg,ch3_avg,ch4_avg,batt_mv,next_wake_sec
+ *   ※ elapsed_sec は起動からの経過秒（RTC 未実装のため）
+ *   ※ ch*_avg は ×100 の整数値（子機パケットそのまま）
+ *
  * LED:
  *   Blue 点灯    : スキャン中
- *   Green 2チカ  : データ受信・集計完了
+ *   Green 2チカ  : データ受信・集計完了（SD 書き込み成功含む）
  *   Red 3チカ    : スキャンウィンドウ内でデータ未受信
+ *   Red 1チカ    : SD 書き込みエラー
  *   Blue heartbeat: 次回スキャン待ち（5秒ごと）
  *
- * スキャン取りこぼし率の目安（子機 1000ms 間隔・30パケットの場合）:
- *   BLE scan interval = window = 100ms（連続スキャン） → 取りこぼし 0%
- *   BLE scan interval=1000ms / window=100ms (10%デューティ) → 取りこぼし 4.2%
- *   → 本スケッチは連続スキャン（interval = window = 100ms）を採用
+ * SD カード配線（v3.04 本番ピン / テスト環境と同じ）:
+ *   DM3AT pin2 CS   → D3
+ *   DM3AT pin3 MOSI → D1
+ *   DM3AT pin5 SCK  → D10
+ *   DM3AT pin7 MISO → D2
  */
 
 #include <Arduino.h>
 #include <Adafruit_TinyUSB.h>
+#include <SPI.h>
+#include <SdFat.h>
 #include <bluefruit.h>
 #include <string.h>
 
 // ══════════════════════════════════════════════
-// ▼ 設定
+// ▼ 設定（ここを変更する）
 // ══════════════════════════════════════════════
 static const uint8_t  TARGET_DEVICE_ID  = 0x01;   // 受信対象の子機 ID
 static const uint8_t  MFR_COMPANY_LO    = 0xFF;   // Company ID（子機と一致させる）
@@ -51,27 +61,48 @@ static const uint8_t  PKT_TYPE          = 0x01;
 // スキャン時間設定
 static const uint32_t FIRST_SCAN_SEC    = 120;    // 初回スキャン時間（秒）
 static const uint32_t SCAN_WINDOW_SEC   = 60;     // 2回目以降スキャン時間（秒）
-// SCAN_PRE_MARGIN_SEC は子機側の NEXT_WAKE_SEC に含まれているため親機側の計算では不要
 
 // BLE スキャンパラメータ: interval = window = 100ms → 連続スキャン（取りこぼし 0%）
-// 100ms / 0.625ms = 160 units
-static const uint16_t BLE_SCAN_UNITS = 160;
+static const uint16_t BLE_SCAN_UNITS = 160;  // 160 × 0.625ms = 100ms
+
+// ── SD カード設定 ──────────────────────────────
+// 0: SD 記録なし（シリアルモニタのみ）
+// 1: SD カードに CSV 追記
+#define ENABLE_SD_LOG   1
+
+#define PIN_SD_CS   D3
+#define PIN_SD_MISO D2
+#define PIN_SD_SCK  D10
+#define PIN_SD_MOSI D1
+#define SD_SPEED_MHZ 4
+
+#define LOG_FILE "log.csv"
+// ─────────────────────────────────────────────
+
+// ══════════════════════════════════════════════
+// SD カード
+// ══════════════════════════════════════════════
+#if ENABLE_SD_LOG
+static SPIClass  SD_SPI(NRF_SPIM2, PIN_SD_MISO, PIN_SD_SCK, PIN_SD_MOSI);
+static SdFat     sd;
+static bool      s_sdReady = false;
+#endif
 
 // ══════════════════════════════════════════════
 // 状態管理
 // ══════════════════════════════════════════════
-static bool     s_scanning       = false;
-static bool     s_firstScan      = true;
-static uint32_t s_scanEndMs      = 0;     // スキャン終了時刻（millis）
-static uint32_t s_nextScanStartMs = 0;    // 次回スキャン開始時刻（millis）
-static uint32_t s_lastRxMs       = 0;     // 最後にデータを受信した millis
+static bool     s_scanning        = false;
+static bool     s_firstScan       = true;
+static uint32_t s_scanEndMs       = 0;
+static uint32_t s_nextScanStartMs = 0;
+static uint32_t s_lastPktMs       = 0;
+static uint32_t s_sessionNo       = 0;    // スキャン回数カウンタ
 
 // 受信データ集計（同一スキャンウィンドウ内）
-static int32_t  s_sum[4]         = {0};
-static int32_t  s_battSum        = 0;
-static uint16_t s_nextWakeSec    = 600;   // 子機から受け取った「次回計測まで秒数」
-static int      s_pktCount       = 0;     // 受信パケット数
-static uint32_t s_lastPktMs      = 0;     // 最後のパケット受信時刻（スケジュール計算用）
+static int32_t  s_sum[4]      = {0};
+static int32_t  s_battSum     = 0;
+static uint16_t s_nextWakeSec = 600;
+static int      s_pktCount    = 0;
 
 // ══════════════════════════════════════════════
 // LED ヘルパー（アクティブ LOW）
@@ -88,6 +119,72 @@ static void ledBlink(uint8_t pin, int n) {
 }
 
 // ══════════════════════════════════════════════
+// SD 初期化
+// ══════════════════════════════════════════════
+#if ENABLE_SD_LOG
+static void sdInit() {
+  SdSpiConfig cfg(PIN_SD_CS, DEDICATED_SPI, SD_SCK_MHZ(SD_SPEED_MHZ), &SD_SPI);
+  if (!sd.begin(cfg)) {
+    Serial.println(F("[SD] 初期化失敗 — SD 記録をスキップします"));
+    sd.initErrorPrint(&Serial);
+    s_sdReady = false;
+    ledBlink(LED_RED, 1);
+    return;
+  }
+  s_sdReady = true;
+  Serial.println(F("[SD] 初期化 OK"));
+
+  // ヘッダ行がなければ書き込む
+  if (!sd.exists(LOG_FILE)) {
+    FsFile f = sd.open(LOG_FILE, O_WRITE | O_CREAT);
+    if (f) {
+      f.println(F("session,elapsed_sec,pkt_count,ch1_avg,ch2_avg,ch3_avg,ch4_avg,batt_mv,next_wake_sec"));
+      f.close();
+      Serial.println(F("[SD] " LOG_FILE " を新規作成しました"));
+    }
+  } else {
+    Serial.println(F("[SD] " LOG_FILE " に追記します"));
+  }
+}
+#endif
+
+// ══════════════════════════════════════════════
+// SD 書き込み（1行 CSV 追記）
+// ══════════════════════════════════════════════
+#if ENABLE_SD_LOG
+static void sdLog(uint32_t sessionNo, int pktCount,
+                  int32_t ch1, int32_t ch2, int32_t ch3, int32_t ch4,
+                  uint32_t battMv, uint16_t nextWakeSec) {
+  if (!s_sdReady) return;
+
+  FsFile f = sd.open(LOG_FILE, O_WRITE | O_APPEND);
+  if (!f) {
+    Serial.println(F("[SD] 書き込みエラー"));
+    ledBlink(LED_RED, 1);
+    return;
+  }
+
+  uint32_t elapsedSec = millis() / 1000UL;
+  f.print(sessionNo);     f.print(',');
+  f.print(elapsedSec);    f.print(',');
+  f.print(pktCount);      f.print(',');
+  f.print(ch1);           f.print(',');
+  f.print(ch2);           f.print(',');
+  f.print(ch3);           f.print(',');
+  f.print(ch4);           f.print(',');
+  f.print(battMv);        f.print(',');
+  f.println(nextWakeSec);
+  f.close();
+
+  Serial.print(F("[SD] 書き込み完了 → session="));
+  Serial.print(sessionNo);
+  Serial.print(F(" elapsed="));
+  Serial.print(elapsedSec);
+  Serial.println(F("s"));
+}
+#endif
+
+// ══════════════════════════════════════════════
 // スキャン開始・停止
 // ══════════════════════════════════════════════
 static void startScan(uint32_t durationSec) {
@@ -97,19 +194,17 @@ static void startScan(uint32_t durationSec) {
   s_lastPktMs = 0;
   s_scanning  = true;
   s_scanEndMs = millis() + durationSec * 1000UL;
+  s_sessionNo++;
 
-  Bluefruit.Scanner.start(0);  // 0 = 無期限（手動 stop）
+  Bluefruit.Scanner.start(0);
   pinOn(LED_BLUE);
 
   Serial.println(F("\n──────────────────────────────────"));
-  Serial.print(F("[SCAN START] duration="));
+  Serial.print(F("[SCAN START] session="));
+  Serial.print(s_sessionNo);
+  Serial.print(F("  duration="));
   Serial.print(durationSec);
-  Serial.print(F("s  until +"));
-  Serial.print(durationSec);
-  Serial.println(F("s from now"));
-  Serial.print(F("  BLE scan: interval=window="));
-  Serial.print((uint32_t)BLE_SCAN_UNITS * 625 / 1000);
-  Serial.println(F("ms (連続スキャン)"));
+  Serial.println(F("s"));
 }
 
 static void stopScan() {
@@ -122,34 +217,35 @@ static void stopScan() {
   Serial.println(s_pktCount);
 
   if (s_pktCount > 0) {
+    int32_t avgCh[4];
+    for (int i = 0; i < 4; i++) avgCh[i] = s_sum[i] / s_pktCount;
+    uint32_t avgBatt = (uint32_t)s_battSum / (uint32_t)s_pktCount;
+
     Serial.println(F("  ─── 平均値 ───────────────────────"));
     for (int i = 0; i < 4; i++) {
-      int32_t avg = s_sum[i] / s_pktCount;
       Serial.print(F("  CH")); Serial.print(i + 1);
-      Serial.print(F(" ひずみ(×100): ")); Serial.println(avg);
+      Serial.print(F(" ひずみ(×100): ")); Serial.println(avgCh[i]);
     }
-    Serial.print(F("  バッテリー: "));
-    Serial.print((uint32_t)s_battSum / (uint32_t)s_pktCount);
-    Serial.println(F(" mV"));
-    Serial.print(F("  次回計測まで: "));
-    Serial.print(s_nextWakeSec);
-    Serial.println(F(" sec"));
+    Serial.print(F("  バッテリー: ")); Serial.print(avgBatt); Serial.println(F(" mV"));
+    Serial.print(F("  次回計測まで: ")); Serial.print(s_nextWakeSec); Serial.println(F(" sec"));
     Serial.println(F("  ──────────────────────────────────"));
 
-    // 次回スキャン開始時刻を計算
-    // next_wake_sec = 「最後のパケットからスキャン開始までの秒数」（マージン込み）
+#if ENABLE_SD_LOG
+    sdLog(s_sessionNo, s_pktCount,
+          avgCh[0], avgCh[1], avgCh[2], avgCh[3],
+          avgBatt, s_nextWakeSec);
+#endif
+
+    // 次回スキャン開始時刻
     s_nextScanStartMs = s_lastPktMs + (uint32_t)s_nextWakeSec * 1000UL;
-
     uint32_t waitSec = (s_nextScanStartMs - millis()) / 1000UL;
-    Serial.print(F("  次回スキャン開始まで約 "));
-    Serial.print(waitSec);
-    Serial.println(F(" 秒"));
+    Serial.print(F("  次回スキャン開始まで約 ")); Serial.print(waitSec); Serial.println(F(" 秒"));
 
-    ledBlink(LED_GREEN, 2);  // Green 2チカ = 受信成功
+    ledBlink(LED_GREEN, 2);
   } else {
     Serial.println(F("  [警告] データ受信なし → 60秒後に再スキャン"));
-    s_nextScanStartMs = millis() + 60000UL;  // 1分後に再試行
-    ledBlink(LED_RED, 3);  // Red 3チカ = 受信なし
+    s_nextScanStartMs = millis() + 60000UL;
+    ledBlink(LED_RED, 3);
   }
 }
 
@@ -157,19 +253,16 @@ static void stopScan() {
 // BLE スキャンコールバック
 // ══════════════════════════════════════════════
 static void scanCallback(ble_gap_evt_adv_report_t* report) {
-  // Manufacturer Data を取得
   uint8_t buf[32];
   uint8_t len = Bluefruit.Scanner.parseReportByType(
       report, BLE_GAP_AD_TYPE_MANUFACTURER_SPECIFIC_DATA, buf, sizeof(buf));
 
-  // 16バイト以上 + Company ID + Pkt type + Device ID のチェック
   if (len >= 16
       && buf[0] == MFR_COMPANY_LO
       && buf[1] == MFR_COMPANY_HI
       && buf[2] == PKT_TYPE
       && buf[3] == TARGET_DEVICE_ID) {
 
-    // パース（LE バイトオーダー）
     int16_t  ch[4];
     uint16_t battMv, nextWake;
     for (int i = 0; i < 4; i++) {
@@ -178,14 +271,12 @@ static void scanCallback(ble_gap_evt_adv_report_t* report) {
     battMv   = (uint16_t)(buf[12] | ((uint16_t)buf[13] << 8));
     nextWake = (uint16_t)(buf[14] | ((uint16_t)buf[15] << 8));
 
-    // 集計
     for (int i = 0; i < 4; i++) s_sum[i] += ch[i];
     s_battSum    += battMv;
     s_nextWakeSec = nextWake;
     s_pktCount++;
     s_lastPktMs = millis();
 
-    // 最初のパケット受信時にヘッダ表示、以降はドットのみ
     if (s_pktCount == 1) {
       Serial.println(F("\n  [子機検出] ─────────────────────"));
       char mac[18];
@@ -201,7 +292,7 @@ static void scanCallback(ble_gap_evt_adv_report_t* report) {
       Serial.print(F("  BATT: ")); Serial.print(battMv); Serial.println(F(" mV"));
       Serial.print(F("  next_wake: ")); Serial.print(nextWake); Serial.println(F(" sec"));
     } else if (s_pktCount % 5 == 0) {
-      Serial.print('.');  // 5パケットごとにドット
+      Serial.print('.');
     }
   }
 
@@ -218,28 +309,32 @@ void setup() {
   ledInit();
   ledBlink(LED_BLUE, 2);
 
-  Serial.println(F("\n[STEP12] BLE親機 スキャン確認"));
+  Serial.println(F("\n[STEP12] BLE親機 スキャン + SD カード記録"));
+  Serial.print(F("SD ログ: "));
+#if ENABLE_SD_LOG
+  Serial.println(F("有効 (ENABLE_SD_LOG=1)"));
+  sdInit();
+#else
+  Serial.println(F("無効 (ENABLE_SD_LOG=0)"));
+#endif
+
   Serial.println(F("フィルタ: Company=0xFFFF / Type=0x01 / DeviceID=0x01(test01)"));
-  Serial.println(F("スキャン: interval=window=100ms（連続スキャン）"));
   Serial.print(F("初回スキャン: ")); Serial.print(FIRST_SCAN_SEC); Serial.println(F("秒"));
   Serial.print(F("2回目以降:    ")); Serial.print(SCAN_WINDOW_SEC); Serial.println(F("秒"));
-  Serial.println(F("スキャン開始マージン: 子機 NEXT_WAKE_SEC に含まれる（親機側計算不要）"));
   Serial.println(F("──────────────────────────────────"));
 
-  Bluefruit.begin(0, 1);  // 0 peripheral, 1 central（スキャン専用）
+  Bluefruit.begin(0, 1);
   Bluefruit.setName("Monita-Parent");
-
   Bluefruit.Scanner.setRxCallback(scanCallback);
   Bluefruit.Scanner.useActiveScan(false);
-  Bluefruit.Scanner.setInterval(BLE_SCAN_UNITS, BLE_SCAN_UNITS);  // interval = window（連続）
+  Bluefruit.Scanner.setInterval(BLE_SCAN_UNITS, BLE_SCAN_UNITS);
 
-  // 初回スキャン即開始
   s_nextScanStartMs = 0;
   startScan(FIRST_SCAN_SEC);
 }
 
 // ══════════════════════════════════════════════
-// loop: スキャン終了判定 + 次回スキャンスケジュール
+// loop
 // ══════════════════════════════════════════════
 static uint32_t s_lastHeartbeat = 0;
 
@@ -247,18 +342,14 @@ void loop() {
   uint32_t now = millis();
 
   if (s_scanning) {
-    // スキャン中: 終了時刻に達したら停止
     if (now >= s_scanEndMs) {
       stopScan();
       s_firstScan = false;
     }
   } else {
-    // 待機中: Blue heartbeat（5秒ごと）
     if (now - s_lastHeartbeat >= 5000UL) {
       s_lastHeartbeat = now;
       ledBlink(LED_BLUE, 1);
-
-      // 次回スキャン開始まで何秒か表示
       if (now < s_nextScanStartMs) {
         uint32_t remain = (s_nextScanStartMs - now) / 1000UL;
         Serial.print(F("[待機] 次回スキャンまで "));
@@ -266,8 +357,6 @@ void loop() {
         Serial.println(F(" 秒"));
       }
     }
-
-    // 次回スキャン開始時刻に達したら開始
     if (now >= s_nextScanStartMs) {
       startScan(s_firstScan ? FIRST_SCAN_SEC : SCAN_WINDOW_SEC);
     }
