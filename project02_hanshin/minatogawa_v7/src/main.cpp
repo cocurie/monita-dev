@@ -2,6 +2,27 @@
  *  Multi-Channel Strain Measurement System ver 7.0
  *  Arduino Mega 2560 + HX711 x20 + M5Stamp SIM7080G (SORACOM)
  *
+ *  【概要】
+ *    阪神高速 湊川IC付近の橋梁に設置する多チャンネルひずみ計測システム。
+ *    HX711（ひずみゲージ用ADC）で最大20chの計測を行い、
+ *    SIM7080G（LTE-M通信モジュール）でSORACOM経由にデータを送信する。
+ *
+ *  【動作フロー】
+ *    起動 → ゼロ点読み込み → LTE接続 → 計測 → 送信 → 100分待機 → 繰り返し
+ *
+ *  【ゼロ点補正のやり方】
+ *    ① 無負荷状態（計測対象に荷重がかかっていない状態）にする
+ *    ② D31-GND ボタンを 4秒間長押しする
+ *    ③ シリアルモニタに "Zero Calibration Done" と表示されれば完了
+ *    ※ ゼロ点はEEPROMに保存されるため、電源を切っても保持される
+ *
+ *  【Arduino IDEで使う場合の注意】
+ *    - このファイルを minatogawa_v7.ino にリネームして使用すること
+ *    - ボード: Arduino Mega or Mega 2560
+ *    - 必要ライブラリ（ライブラリマネージャからインストール）:
+ *        HX711 by Bogdan Necula
+ *        Adafruit SHT4x Library（SHT40温度センサを使う場合）
+ *
  *  v6 からの主な変更点:
  *    - 通信モジュール: SARA-R410M → SIM7080G
  *    - SIM: SORACOM (APN: soracom.io)
@@ -66,28 +87,35 @@
  ************************************************************/
 
 /* ======================== 通信設定 ======================== */
-#define INTERVAL_MS     (600000UL * 10)   // 100分
-#define ENDPOINT        "uni.soracom.io"
-#define ENDPOINT_PORT   23080
-#define LTE_BAUD        9600
-#define SIM_PWRKEY_PIN  36
-#define SW_RX           10
-#define SW_TX           11
+// 【変更不要】SORACOM Unified Endpoint へ TCP で送信する設定
+#define INTERVAL_MS     (600000UL * 10)   // 計測間隔: 100分（600000ms × 10）
+#define ENDPOINT        "uni.soracom.io"  // SORACOM 送信先ホスト名
+#define ENDPOINT_PORT   23080             // SORACOM Unified Endpoint ポート番号
+#define LTE_BAUD        9600              // SIM7080G との通信速度（bps）
+#define SIM_PWRKEY_PIN  36                // SIM7080G の電源キーピン
+#define SW_RX           10                // SoftwareSerial RX（SIM7080G TXD から受信）
+#define SW_TX           11                // SoftwareSerial TX（SIM7080G RXD へ送信）
 
 /* ======================== EEPROM設定 ======================== */
+// ゼロ点補正値の保存に使用。電源を切っても値が保持される。
 #include <EEPROM.h>
 
 /* ======================== SoftwareSerial ======================== */
+// Arduino Mega のハードウェアUARTはHX711ピンと競合するため、ソフトウェアUARTを使用
 #include <SoftwareSerial.h>
 SoftwareSerial simSerial(SW_RX, SW_TX);
 
 /* ======================== HX711 設定 ======================== */
+// HX711: ひずみゲージ用の高精度ADCモジュール
 #include <HX711.h>
 
-#define CHANNEL_NUM 20
+#define CHANNEL_NUM 20  // 使用するHX711チャンネル数（最大20）
 
-/* ----------- ★ ユーザー設定項目 ----------- */
+/* ----------- ★ ユーザー設定項目（必要に応じて変更してください） ----------- */
 
+// 【チャンネル有効/無効設定】
+// 使用しないチャンネルを false にすると、そのchは計測・送信をスキップする
+// 例: CH1〜CH5だけ使う場合 → 先頭5つを true、残り15を false にする
 bool channelEnabled[CHANNEL_NUM] = {
   true, true, true, true, true,
   true, true, true, true, true,
@@ -95,6 +123,10 @@ bool channelEnabled[CHANNEL_NUM] = {
   true, true, true, true, true,
 };
 
+// 【ゲージファクター（感度係数）】
+// HX711の生の読み値をひずみ値（με）に変換するための係数。
+// センサの種類・配線によって異なる。現在は全チャンネル 1065 に設定。
+// ※ キャリブレーションで実測した値に変更すること
 float gaugeFactor[CHANNEL_NUM] = {
   1065, 1065, 1065, 1065, 1065,
   1065, 1065, 1065, 1065, 1065,
@@ -102,23 +134,33 @@ float gaugeFactor[CHANNEL_NUM] = {
   1065, 1065, 1065, 1065, 1065,
 };
 
+// 【計測精度の設定】
+// MEDIAN_SAMPLE_NUM:  中央値計算に使うサンプル数（ノイズ除去のため奇数推奨）
+// REPEAT_MEASURE_NUM: 1チャンネルあたりの繰り返し計測回数（max/min の幅を求めるため）
+// HX711_READ_DELAY_MS: 各チャンネル計測後の待機時間（ms）
 #define MEDIAN_SAMPLE_NUM   5
 #define REPEAT_MEASURE_NUM  5
 #define HX711_READ_DELAY_MS 1000
 
 /* ----------- ★ ゼロ点補正ボタン設定 ----------- */
 // D31 と GND の間にボタンを接続（内部プルアップ使用）
-#define CALIB_BTN_PIN  31
-#define CALIB_HOLD_MS  4000UL   // 長押し判定時間 (ms)
+// 4秒長押しでゼロ点補正を実行する
+#define CALIB_BTN_PIN  31       // ゼロ点補正ボタンのピン番号
+#define CALIB_HOLD_MS  4000UL  // 長押し判定時間（ミリ秒）
 
-/* ----------- ★ ゼロ点補正フラグ (コンパイル時強制実行用) ----------- */
-// ボタンが使えない場合の代替手段。通常は false のまま
+/* ----------- ★ ゼロ点補正フラグ（コンパイル時強制実行用） ----------- */
+// 通常は false のまま使用する。
+// ボタンが使えない場合の代替手段として、true に書き換えて書き込むと
+// 起動直後にゼロ点補正が自動実行される。実行後は必ず false に戻すこと。
 bool zeroModification = false;
 
 /* ----------- ★ 温度センサ ON/OFF ----------- */
-#define USE_SHT40   true    // SHT40: I2C (D20=SDA, D21=SCL)
-#define USE_DS18B20 false    // DS18B20: OneWire (D30)
-#define DS18B20_PIN 30
+// 使用するセンサを true にする。使用しない場合は false のまま。
+// SHT40: I2C 接続（D20=SDA, D21=SCL）
+// DS18B20: 1-Wire 接続（D30）
+#define USE_SHT40   true    // SHT40 温度・湿度センサ
+#define USE_DS18B20 false   // DS18B20 温度センサ（現在未使用）
+#define DS18B20_PIN 30      // DS18B20 データピン
 
 /* ----------- ★ ここまでがユーザー設定項目 ----------- */
 
@@ -142,7 +184,7 @@ bool zeroModification = false;
 #endif
 
 /* ======================== HX711 ピン設定 ======================== */
-
+// 各チャンネルのHX711インスタンスとピン配置（DATA, CLK の順）
 HX711 channels[CHANNEL_NUM];
 
 const uint8_t hxPins[CHANNEL_NUM][2] = {
@@ -153,17 +195,17 @@ const uint8_t hxPins[CHANNEL_NUM][2] = {
 };
 
 /* ======================== 変数定義 ======================== */
-
-int   initial_val[CHANNEL_NUM];
-float max_strain[CHANNEL_NUM];
-float min_strain[CHANNEL_NUM];
-float mean_val[CHANNEL_NUM];
-float range_val[CHANNEL_NUM];
-float val_buf[MEDIAN_SAMPLE_NUM];
-char  payload[1200];
-bool  calibRequested = false;   // ボタン長押しで true になる
+int   initial_val[CHANNEL_NUM];   // ゼロ点補正値（EEPROMから読み込む）
+float max_strain[CHANNEL_NUM];    // 1サイクル中の最大ひずみ値
+float min_strain[CHANNEL_NUM];    // 1サイクル中の最小ひずみ値
+float mean_val[CHANNEL_NUM];      // 平均値（max+min の中間値）
+float range_val[CHANNEL_NUM];     // レンジ（max - min）
+float val_buf[MEDIAN_SAMPLE_NUM]; // 中央値計算用バッファ
+char  payload[1200];              // 送信するJSONデータ文字列
+bool  calibRequested = false;     // ゼロ点補正ボタンが押されたときに true になる
 
 /* ======================== 中央値計算 ======================== */
+// ノイズ除去のため、複数サンプルの中央値を使用する
 float calcMedian(float* arr, int n) {
   float tmp[MEDIAN_SAMPLE_NUM];
   memcpy(tmp, arr, n * sizeof(float));
@@ -178,6 +220,8 @@ float calcMedian(float* arr, int n) {
 }
 
 /* ======================== ATコマンド送信 ======================== */
+// SIM7080G に AT コマンドを送り、応答を返す。
+// timeoutMs: 応答を待つ最大時間（ミリ秒）
 String sendAT(const String& cmd, int timeoutMs = 5000) {
   Serial.print(F(">> "));
   Serial.println(cmd);
@@ -196,9 +240,12 @@ String sendAT(const String& cmd, int timeoutMs = 5000) {
 }
 
 /* ======================== LTE 初期化 ======================== */
+// SIM7080G を起動し、SORACOM ネットワークに接続する。
+// 成功すると true、失敗すると false を返す。
 bool initLTE() {
   Serial.println(F("--- LTE初期化 ---"));
 
+  // AT コマンドが通るまで最大10回リトライ
   bool atOk = false;
   for (int i = 0; i < 10; i++) {
     if (sendAT("AT", 1000).indexOf("OK") >= 0) { atOk = true; break; }
@@ -206,15 +253,17 @@ bool initLTE() {
   }
   if (!atOk) { Serial.println(F("✗ ATコマンド応答なし")); return false; }
 
-  sendAT("AT+CNMP=38", 2000);
-  sendAT("AT+CMNB=3", 2000);
-  sendAT("AT+CGDCONT=1,\"IP\",\"soracom.io\"", 2000);
+  // LTE-M（Cat-M1）モードに設定、APN を SORACOM に指定
+  sendAT("AT+CNMP=38", 2000);                        // LTE only モード
+  sendAT("AT+CMNB=3", 2000);                         // Cat-M1 + NB-IoT
+  sendAT("AT+CGDCONT=1,\"IP\",\"soracom.io\"", 2000); // SORACOM APN 設定
 
-  // LTE登録待ち (AT+CREG は 2G/3G用, LTE-M は AT+CEREG を使う)
+  // ネットワーク登録を最大60秒待つ（12回 × 5秒）
   Serial.println(F("ネットワーク登録待ち..."));
   bool registered = false;
   for (int i = 0; i < 12; i++) {
     String r = sendAT("AT+CEREG?", 3000);
+    // 0,1 = 登録済み（ローミングなし）/ 0,5 = 登録済み（ローミング中）
     if (r.indexOf("0,1") >= 0 || r.indexOf("0,5") >= 0) {
       Serial.println(F("✓ ネットワーク登録成功")); registered = true; break;
     }
@@ -222,6 +271,7 @@ bool initLTE() {
   }
   if (!registered) { Serial.println(F("✗ 登録タイムアウト")); return false; }
 
+  // データ通信を有効化してIPアドレスを取得
   sendAT("AT+CNACT=0,1", 15000);
   delay(2000);
   String cnact = sendAT("AT+CNACT?", 3000);
@@ -234,12 +284,16 @@ bool initLTE() {
 }
 
 /* ======================== SORACOM uni TCP送信 ======================== */
+// SORACOM Unified Endpoint（uni.soracom.io:23080）へ JSON データを TCP 送信する。
+// SORACOM 側で受信後、Harvest / Funnel 等に転送可能。
 bool sendPayload(const char* payload) {
   Serial.println(F("--- TCP送信 ---"));
 
+  // 既存の接続を閉じてからオープン（二重接続防止）
   sendAT("AT+CACLOSE=0", 3000);
   delay(300);
 
+  // TCP 接続を開く
   String openCmd = String(F("AT+CAOPEN=0,0,\"TCP\",\"")) + ENDPOINT + "\"," + ENDPOINT_PORT;
   String res = sendAT(openCmd, 15000);
   if (res.indexOf("+CAOPEN: 0,0") < 0) {
@@ -249,6 +303,7 @@ bool sendPayload(const char* payload) {
   Serial.println(F("✓ TCP接続成功"));
   delay(300);
 
+  // データ送信（CASEND コマンドでバイト数を先に伝えてからペイロードを送る）
   int len = strlen(payload);
   simSerial.print("AT+CASEND=0,");
   simSerial.print(len);
@@ -256,6 +311,7 @@ bool sendPayload(const char* payload) {
   delay(1000);
   simSerial.print(payload);
 
+  // 送信結果を3秒待って確認
   long t = millis();
   String sendResp = "";
   while (millis() - t < 3000) {
@@ -274,10 +330,12 @@ bool sendPayload(const char* payload) {
 }
 
 /* ======================== ゼロ点補正 ======================== */
+// 無負荷状態で各チャンネルを計測し、その値をゼロ点としてEEPROMに保存する。
+// 以降の計測では この値を差し引いて相対値（変化量）を算出する。
 void runZeroCalibration() {
   Serial.println(F("===== Zero Calibration Start ====="));
 
-  // 補正前の EEPROM 値を表示
+  // 補正前の EEPROM 値を表示（確認用）
   Serial.println(F("--- 現在の EEPROM 値 ---"));
   for (int ch = 0; ch < CHANNEL_NUM; ch++) {
     int v; EEPROM.get(ch * sizeof(int), v);
@@ -285,12 +343,12 @@ void runZeroCalibration() {
     Serial.print(F(": ")); Serial.println(v);
   }
 
-  // 各チャンネルのゼロ点を測定して EEPROM に保存
+  // 各チャンネルの無負荷時の値を計測して EEPROM に保存
   Serial.println(F("--- ゼロ点測定中 ---"));
   for (int ch = 0; ch < CHANNEL_NUM; ch++) {
     if (!channelEnabled[ch]) continue;
     initial_val[ch] = (int)(channels[ch].read() / gaugeFactor[ch]);
-    EEPROM.put(ch * sizeof(int), initial_val[ch]);
+    EEPROM.put(ch * sizeof(int), initial_val[ch]);  // EEPROM に永続保存
     Serial.print(F("  CH")); Serial.print(ch + 1);
     Serial.print(F(" -> ")); Serial.println(initial_val[ch]);
   }
@@ -299,8 +357,8 @@ void runZeroCalibration() {
 }
 
 /* ======================== 100分待機（ボタン監視付き） ======================== */
-// delay(INTERVAL_MS) の代わりに使用。
-// 待機中に D31 を 4秒長押しすると calibRequested = true になり待機を終了する。
+// 100分の待機中もゼロ点補正ボタン（D31）を監視する。
+// 4秒長押しを検出すると待機を中断し、次サイクルの冒頭でゼロ点補正を実行する。
 void waitInterval() {
   Serial.println(F("--- 待機中 (ゼロ点補正: D31 を 4秒長押し) ---"));
 
@@ -310,26 +368,25 @@ void waitInterval() {
 
   while (millis() - waitStart < INTERVAL_MS) {
     delay(50);
-    bool pressed = (digitalRead(CALIB_BTN_PIN) == LOW);
+    bool pressed = (digitalRead(CALIB_BTN_PIN) == LOW);  // LOW = ボタン押下中
 
     if (pressed && !btnDown) {
-      // 押し始め
+      // 押し始めを検出
       btnDown  = true;
       btnStart = millis();
       Serial.println(F("  [BTN] 押下 — 4秒長押しでゼロ点補正"));
 
     } else if (pressed && btnDown) {
-      // 押し続け中: 4秒経過で確定
+      // 押し続け中: 4秒経過で補正確定
       if (millis() - btnStart >= CALIB_HOLD_MS) {
         Serial.println(F("  [BTN] 4秒長押し確認 → ゼロ点補正を実行します"));
-        // ボタンが離されるまで待つ
-        while (digitalRead(CALIB_BTN_PIN) == LOW) delay(10);
+        while (digitalRead(CALIB_BTN_PIN) == LOW) delay(10);  // 離されるまで待つ
         calibRequested = true;
-        return;   // 待機を終了して次サイクルへ
+        return;  // 待機を終了して次サイクルへ（ゼロ点補正が実行される）
       }
 
     } else if (!pressed && btnDown) {
-      // 4秒未満で離した
+      // 4秒未満で離した場合はキャンセル
       Serial.println(F("  [BTN] 離れ（4秒未満 — キャンセル）"));
       btnDown = false;
     }
@@ -337,17 +394,19 @@ void waitInterval() {
 }
 
 /* ======================== セットアップ ======================== */
+// 電源投入・リセット後に1回だけ実行される初期化処理
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(115200);   // USB シリアルモニタ（デバッグ用、115200bps）
   delay(1000);
-  simSerial.begin(LTE_BAUD);
+  simSerial.begin(LTE_BAUD);  // SIM7080G との UART 通信開始
 
   Serial.println(F("===== System Boot (v7) ====="));
 
-  // ゼロ点補正ボタン
+  // ゼロ点補正ボタンを入力（内部プルアップ）として設定
+  // → ボタンを押していない状態が HIGH、押すと LOW になる
   pinMode(CALIB_BTN_PIN, INPUT_PULLUP);
 
-  // SIM7080G 起動
+  // SIM7080G をパワーキーで起動（LOW→HIGH のパルスで電源ON）
   Serial.println(F("[1/5] SIM7080G power on..."));
   pinMode(SIM_PWRKEY_PIN, OUTPUT);
   digitalWrite(SIM_PWRKEY_PIN, HIGH);
@@ -355,9 +414,9 @@ void setup() {
   digitalWrite(SIM_PWRKEY_PIN, LOW);
   delay(1000);
   digitalWrite(SIM_PWRKEY_PIN, HIGH);
-  delay(5000);
+  delay(5000);  // モジュール起動完了まで待機
 
-  // HX711 + 温度センサ初期化
+  // HX711 と温度センサの初期化
   Serial.println(F("[2/5] HX711 + sensor initialization..."));
   for (int i = 0; i < CHANNEL_NUM; i++) {
     channels[i].begin(hxPins[i][0], hxPins[i][1]);
@@ -386,16 +445,18 @@ void setup() {
   }
 #endif
 
-  // EEPROM からゼロ点読み込み
+  // EEPROM に保存された前回のゼロ点補正値を読み込む
+  // 初回（EEPROM未書込み）は不定値になるため、起動後に必ずゼロ点補正を実施すること
   Serial.println(F("[3/5] Loading calibration from EEPROM..."));
   for (int ch = 0; ch < CHANNEL_NUM; ch++) {
     EEPROM.get(ch * sizeof(int), initial_val[ch]);
   }
 
-  // LTE 初期化
+  // LTE-M ネットワークへの接続
   Serial.println(F("[4/5] LTE initialization..."));
   if (!initLTE()) {
     Serial.println(F("✗ LTE初期化失敗 — 送信なしで測定続行"));
+    // LTE が失敗しても計測は継続する
   }
 
   Serial.println(F("[5/5] Setup done!"));
@@ -403,17 +464,18 @@ void setup() {
 }
 
 /* ======================== メインループ ======================== */
+// setup() 完了後、繰り返し実行される計測・送信サイクル
 void loop() {
 
-  // ゼロ点補正: ボタン長押し or コンパイル時フラグ
+  // ゼロ点補正: ボタン長押し検出 or コンパイル時フラグ（zeroModification=true）
   if (calibRequested || zeroModification) {
     calibRequested = false;
-    runZeroCalibration();
+    runZeroCalibration();  // 無負荷状態でゼロ点を計測・保存
   }
 
   Serial.println(F("===== Measurement cycle start ====="));
 
-  // 1/5 バッファ初期化
+  // 1/5 バッファ初期化（max/min を極端な値でリセット）
   Serial.println(F("[1/5] Initializing measurement buffers..."));
   for (int ch = 0; ch < CHANNEL_NUM; ch++) {
     max_strain[ch] = -999999.0;
@@ -421,6 +483,7 @@ void loop() {
   }
 
   // 2/5 HX711 センサ読み取り
+  // 各チャンネルを REPEAT_MEASURE_NUM 回計測し、max/min/mean/range を求める
   Serial.println(F("[2/5] Reading HX711 sensors..."));
   for (int ch = 0; ch < CHANNEL_NUM; ch++) {
     if (!channelEnabled[ch]) {
@@ -434,7 +497,9 @@ void loop() {
     Serial.println(F(" measurement start"));
 
     for (int repeat = 0; repeat < REPEAT_MEASURE_NUM; repeat++) {
+      // MEDIAN_SAMPLE_NUM 個のサンプルを取得し中央値でノイズ除去
       for (int i = 0; i < MEDIAN_SAMPLE_NUM; i++) {
+        // ゼロ点（initial_val）を差し引いて相対ひずみ値を算出
         val_buf[i] = (channels[ch].read() / gaugeFactor[ch]) - initial_val[ch];
       }
       float smoothed = calcMedian(val_buf, MEDIAN_SAMPLE_NUM);
@@ -442,6 +507,7 @@ void loop() {
       min_strain[ch] = min(min_strain[ch], smoothed);
     }
 
+    // 平均値（最大と最小の中間）とレンジ（最大 - 最小）を計算
     range_val[ch] = max_strain[ch] - min_strain[ch];
     mean_val[ch]  = (max_strain[ch] + min_strain[ch]) / 2.0;
 
@@ -470,6 +536,7 @@ void loop() {
 #endif
 
   // 4/5 JSONペイロード生成
+  // 送信フォーマット例: {"mean1":10,"range1":3,"mean2":5,"range2":1,...,"temp_sht":23.5,"humi":60.2}
   Serial.println(F("[4/5] Creating payload..."));
   int pos = 0;
   bool firstItem = true;
@@ -479,6 +546,7 @@ void loop() {
     if (!channelEnabled[ch]) continue;
     if (!firstItem) pos += sprintf(payload + pos, ",");
     firstItem = false;
+    // mean: 平均ひずみ値（με）/ range: ひずみ変動幅（με）
     pos += sprintf(payload + pos,
       "\"mean%d\":%d,\"range%d\":%d",
       ch + 1, (int)mean_val[ch],
@@ -509,12 +577,12 @@ void loop() {
   Serial.print(F("Payload: ")); Serial.println(payload);
   Serial.print(F("Length: ")); Serial.println(pos);
 
-  // 5/5 LTE送信
+  // 5/5 LTE送信（SORACOM Unified Endpoint へ TCP 送信）
   Serial.println(F("[5/5] Sending data via LTE..."));
   sendPayload(payload);
 
   Serial.println(F("===== Measurement cycle complete =====\n"));
 
-  // 100分待機（ゼロ点補正ボタンを監視）
+  // 100分待機（この間もゼロ点補正ボタンを監視する）
   waitInterval();
 }
