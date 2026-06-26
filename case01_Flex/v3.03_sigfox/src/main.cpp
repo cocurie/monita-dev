@@ -63,14 +63,40 @@ using namespace Adafruit_LittleFS_Namespace;
 #include <DallasTemperature.h>
 // USB CDC（Serial）。DEBUG_MODE 時のログ出力に使用
 #include <Adafruit_TinyUSB.h>
+// BLE モード時のみ使用
+#ifdef COMM_MODE_BLE
+#include <bluefruit.h>
+#endif
+
+// ============================================================
+// 通信モード選択
+// platformio.ini の build_flags で指定する:
+//   -D COMM_MODE_SIGFOX  … Sigfox 送信モード
+//   -D COMM_MODE_BLE     … BLE アドバタイズモード（Gateway 経由でクラウド送信）
+// ============================================================
+#if !defined(COMM_MODE_SIGFOX) && !defined(COMM_MODE_BLE)
+  #error "platformio.ini の build_flags に -D COMM_MODE_SIGFOX または -D COMM_MODE_BLE を指定してください"
+#endif
+
+// ============================================================
+// BLE モード設定（COMM_MODE_BLE 時のみ有効）
+// ============================================================
+#ifdef COMM_MODE_BLE
+static const uint8_t  DEVICE_ID           = 0x01;  // 子機 ID（複数台時は変える: 0x01〜0xFF）
+static const uint32_t MEASURE_INTERVAL_MIN = 20;   // 計測間隔（分）
+static const uint32_t ADV_DURATION_MIN     = 10;   // アドバタイズ継続時間（分）
+static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のときアドバタイズ
+// 1: 時刻条件・スリープをスキップして常時アドバタイズ（Gateway テスト用）。本番は 0。
+#define TEST_ADV_MODE  1
+#endif
 
 // ============================================================
 // アプリ設定（ここを主に編集する）
 // ============================================================
 
-#define DEBUG_MODE           0        // 1: USB Serial デバッグログ有効。本番は 0
-#define DEBUG_NO_SLEEP       0        // 1: deepSleep をスキップして即 loop() に戻る（DEBUG_MODE 1 時のみ有効）
-#define DEBUG_NO_SIGFOX      0        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
+#define DEBUG_MODE           1        // 1: USB Serial デバッグログ有効。本番は 0
+#define DEBUG_NO_SLEEP       1        // 1: deepSleep をスキップして即 loop() に戻る（DEBUG_MODE 1 時のみ有効）
+#define DEBUG_NO_SIGFOX      1        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
 #define SLEEP_MINUTES        15       // 1サイクル後のスリープ時間（分）
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 #define BUTTON_LONG_PRESS_MS 5000UL  // D0 長押し閾値（ms）: 以上で tare、未満でリセット
@@ -119,7 +145,7 @@ using namespace Adafruit_LittleFS_Namespace;
 //   2 = TCA9546A 経由 I2C センサ（LSM6DS 等の加速度センサなど）
 //       ※ DS3231 はオンボード U7（0x68）と競合するため CH 接続不可
 //   3 = DS18B20（1-Wire 温度センサ）※ 外部プルアップ 4.7kΩ（3V3_SW → CH pin3）必要
-const uint8_t CH_ASSIGN[4] = {1, 1, 3, 3};
+const uint8_t CH_ASSIGN[4] = {1, 1, 1, 1};
 
 // ── ひずみ補正係数（キャリブレーション） ──────────────────────────
 //
@@ -349,8 +375,10 @@ static void deepSleep(uint32_t minutes) {
 
   // スリープ中は周辺 IC 用レールをオフ（消費電流削減。正本の 3V3_SW 節）
   digitalWrite(SW_POWER_PIN, LOW);
-  // モジュール電源オフ後は UART を閉じる（フロートやリーク対策の一環）
+#ifdef COMM_MODE_SIGFOX
+  // Sigfox モジュール電源オフ後は UART を閉じる（フロートやリーク対策）
   Serial1.end();
+#endif
 
 #if DEBUG_MODE
   Serial.print("[RTC2 sleep] ");
@@ -1162,6 +1190,60 @@ static void sendSigfox() {
 }
 
 // ============================================================
+// BLE アドバタイズ（COMM_MODE_BLE 時のみ）
+//
+// MSD フォーマット（16 バイト）:
+//   [0-1]  Company ID : 0xFF 0xFF
+//   [2]    Pkt type   : 0x03（Monita Flex v3.03）
+//   [3]    Device ID  : DEVICE_ID
+//   [4-5]  CH1        : int16_t LE
+//   [6-7]  CH2        : int16_t LE
+//   [8-9]  CH3        : int16_t LE
+//   [10-11] CH4       : int16_t LE
+//   [12-13] BATT      : uint16_t LE（mV）
+//   [14]   Hour       : uint8_t
+//   [15]   Minute     : uint8_t
+// ============================================================
+#ifdef COMM_MODE_BLE
+static void bleAdvertise(uint8_t hour, uint8_t min_val) {
+  uint8_t buf[16];
+  buf[0]  = 0xFF;
+  buf[1]  = 0xFF;
+  buf[2]  = 0x03;          // Pkt type: Monita Flex v3.03
+  buf[3]  = DEVICE_ID;
+  for (int i = 0; i < 4; i++) {
+    int16_t v = (int16_t)ch[i];
+    buf[4 + i * 2]     = (uint8_t)(v & 0xFF);
+    buf[4 + i * 2 + 1] = (uint8_t)((v >> 8) & 0xFF);
+  }
+  uint16_t batt = (uint16_t)battV;
+  buf[12] = (uint8_t)(batt & 0xFF);
+  buf[13] = (uint8_t)((batt >> 8) & 0xFF);
+  buf[14] = hour;
+  buf[15] = min_val;
+
+  Bluefruit.Advertising.stop();
+  Bluefruit.Advertising.clearData();
+  Bluefruit.ScanResponse.clearData();
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addManufacturerData(buf, sizeof(buf));
+  Bluefruit.ScanResponse.addName();
+  Bluefruit.Advertising.setInterval(1600, 1600);  // 1000ms 間隔
+  Bluefruit.Advertising.setFastTimeout(0);
+  Bluefruit.Advertising.start(0);
+
+#if DEBUG_MODE
+  Serial.print("[BLE] アドバタイズ開始 ID=0x");
+  Serial.print(DEVICE_ID, HEX);
+  Serial.print(" CH=");
+  for (int i = 0; i < 4; i++) { Serial.print(ch[i]); Serial.print(" "); }
+  Serial.print("BATT="); Serial.print(battV);
+  Serial.print(" TIME="); Serial.print(hour); Serial.print(":"); Serial.println(min_val);
+#endif
+}
+#endif  // COMM_MODE_BLE
+
+// ============================================================
 // Arduino エントリ
 // ============================================================
 
@@ -1190,10 +1272,22 @@ void setup() {
   Serial.flush();
 #endif
 
+#ifdef COMM_MODE_SIGFOX
   // nRF UART ピン割当（setPins の引数順: RX, TX）
   Serial1.setPins(SIGFOX_RX_PIN, SIGFOX_TX_PIN);
   Serial1.begin(SIGFOX_BAUD);
   delay(3000);  // BRKLSM100 コールドスタート待ち
+#endif
+
+#ifdef COMM_MODE_BLE
+  Bluefruit.begin();
+  char bleName[16];
+  snprintf(bleName, sizeof(bleName), "Monita-%02X", DEVICE_ID);
+  Bluefruit.setName(bleName);
+#if DEBUG_MODE
+  Serial.println("[BLE] init OK");
+#endif
+#endif
 
   Wire.begin();
   analogReadResolution(12);
@@ -1237,9 +1331,31 @@ void setup() {
   loadTareOffsets();
 
   measureAll();
-  sendSigfox();
 
+#ifdef COMM_MODE_SIGFOX
+  sendSigfox();
   deepSleep(SLEEP_MINUTES);
+#endif
+
+#ifdef COMM_MODE_BLE
+  {
+    Ds3231Time rtcT = {};
+    bool rtcOk = ds3231GetTime(rtcT);
+#if TEST_ADV_MODE
+    bleAdvertise(rtcOk ? rtcT.hour : 0, rtcOk ? rtcT.min : 0);
+    delay(10000);
+#else
+    if (rtcOk && rtcT.min <= ADV_TRIGGER_MIN) {
+      bleAdvertise(rtcT.hour, rtcT.min);
+      uint32_t advMs = (uint32_t)ADV_DURATION_MIN * 60000UL;
+      uint32_t t0 = millis();
+      while (millis() - t0 < advMs) { delay(1000); yield(); }
+      Bluefruit.Advertising.stop();
+    }
+    deepSleep(MEASURE_INTERVAL_MIN);
+#endif
+  }
+#endif
 }
 
 void loop() {
@@ -1247,10 +1363,12 @@ void loop() {
   statusIdleBlueDim();
   digitalWrite(SW_POWER_PIN, HIGH);  // 3V3_SW 再投入
 
+#ifdef COMM_MODE_SIGFOX
   // スリープ中に Serial1.end() しているため再初期化
   Serial1.setPins(SIGFOX_RX_PIN, SIGFOX_TX_PIN);
   Serial1.begin(SIGFOX_BAUD);
   delay(3000);  // BRKLSM100 再起動待ち
+#endif
 
   Wire.begin();
 
@@ -1305,7 +1423,29 @@ void loop() {
     performTare();
   }
   measureAll();
-  sendSigfox();
 
+#ifdef COMM_MODE_SIGFOX
+  sendSigfox();
   deepSleep(SLEEP_MINUTES);
+#endif
+
+#ifdef COMM_MODE_BLE
+  {
+    Ds3231Time rtcT = {};
+    bool rtcOk = ds3231GetTime(rtcT);
+#if TEST_ADV_MODE
+    bleAdvertise(rtcOk ? rtcT.hour : 0, rtcOk ? rtcT.min : 0);
+    delay(10000);
+#else
+    if (rtcOk && rtcT.min <= ADV_TRIGGER_MIN) {
+      bleAdvertise(rtcT.hour, rtcT.min);
+      uint32_t advMs = (uint32_t)ADV_DURATION_MIN * 60000UL;
+      uint32_t t0 = millis();
+      while (millis() - t0 < advMs) { delay(1000); yield(); }
+      Bluefruit.Advertising.stop();
+    }
+    deepSleep(MEASURE_INTERVAL_MIN);
+#endif
+  }
+#endif
 }
