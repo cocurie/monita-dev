@@ -1,0 +1,582 @@
+/**
+ * 豊能町公園人流測定 — Monita Flex v3.04
+ * Phase-1: BLE スキャン + SD カード記録
+ *
+ * ハード: Monita Flex v3.04 + Seeed XIAO nRF52840 Sense
+ *
+ * ─────────────────────────────────────────────
+ * 起動シーケンス
+ *   i2cInit() [GPIO bit-bang, Wire/TWIM 不使用]
+ *   → TCA9534 初期化 (P2=HIGH → 3V3_SW ON, P3=HIGH → SD CS デアサート)
+ *   → SD カード初期化 (SdFat v2 / SPI)
+ *   → BLE スキャン開始
+ *
+ * Wire (TWIM) 非使用の理由
+ *   BLE SoftDevice が Wire.begin() より前に有効化されているため、
+ *   TWIM の IRQ 優先度が SoftDevice の予約帯と競合しハングする。
+ *   GPIO ビットバン I2C で TCA9534 のみ制御することで回避する。
+ *
+ * SD CS について (v3.04 基板)
+ *   PCB では SD の CS は TCA9534 P3 が能動駆動 (I2C 経由)。
+ *   SdFat は GPIO CS を前提とするため、以下の方式で回避する:
+ *     1. P3=HIGH でプリクロック (80 clk) → SD の電源投入シーケンスを満たす
+ *     2. P3=LOW に固定 (= CS を常にアサート)
+ *     3. SdFat には D9 をダミー CS として渡す (PCB 上 SD とは無接続)
+ *   SPI バス上に SD のみなので CS 常時アサートは実用上問題なし。
+ *   SdFat が D9 を操作しても SD の CS には影響しない。
+ *
+ * SPI ピン (v3.04)
+ *   D10 = SCK, D1 = MOSI, D2 = MISO
+ *   TCA9534 P3 → SD CS (I2C 制御)
+ *
+ * CSV ログ (SD /log.csv)
+ *   timestamp,people,devices
+ * ─────────────────────────────────────────────
+ *
+ * シリアルコマンド (115200bps / LF)
+ *   d        ログ全件出力
+ *   e        ログ削除 (次回書込時にヘッダ付き新規作成)
+ *   c<N>     キャリブレーション開始 (例: c5)
+ *   r        キャリブレーション途中経過表示
+ *   x        キャリブレーション終了
+ *
+ * フェーズ別有効化
+ *   Phase-2: PIR (D8) → 本ファイル末尾の PIR ブロックを参照
+ *   Phase-3: 音声 (PDM) → 本ファイル末尾の AUDIO ブロックを参照
+ */
+
+#include <Arduino.h>
+#include <Adafruit_TinyUSB.h>
+#include <SPI.h>
+#include <SdFat.h>
+#include <bluefruit.h>
+#include <math.h>
+#include <string.h>
+
+// ═══════════════════════════════════════
+// ▼ 設定パラメータ
+// ═══════════════════════════════════════
+
+// ── TCA9534 ──────────────────────────
+#define TCA9534_ADDR  0x20
+
+// ── SD カード SPI ピン (v3.04) ─────────
+#define PIN_SD_MISO       D2   // P0.28
+#define PIN_SD_SCK        D10  // P1.15
+#define PIN_SD_MOSI       D1   // P0.03
+#define PIN_SD_CS_DUMMY   D9   // SdFat CS管理用ダミー (Sigfox RX ピン / SD 未接続)
+#define SPI_SPEED_MHZ     4    // 失敗時は 1 に落とす
+
+// ── ログ ─────────────────────────────
+static bool       const ENABLE_LOGGING = true;
+static char const*      LOG_FILE       = "/log.csv";
+
+// ── スキャン / スリープ ────────────────
+static uint32_t const SCAN_DURATION_MS  = 30000;  // スキャン時間 (ms)
+static uint32_t const SLEEP_DURATION_MS = 90000;  // スリープ時間 (ms)
+
+// ── BLE クラスタリングパラメータ ─────────
+static int   const MIN_HITS       = 12;   // 有効デバイスのヒット最小回数
+static int   const RSSI_THRESHOLD = -65;  // 採用 RSSI 下限 (dBm)
+static int   const RSSI_MERGE_GAP = 3;   // 同一人物とみなす RSSI 差 (dBm)
+static float const CALIBRATION    = 1.0f; // 人数補正係数
+
+// ── BLE スキャン設定 ──────────────────
+static uint16_t const SCAN_INTERVAL_MS = 150;
+static uint16_t const SCAN_WINDOW_MS   = 100;
+
+// ── LED ──────────────────────────────
+static uint32_t const LED_BLINK_MS = 1000;
+
+// ── キャリブレーション ──────────────────
+#define CALIB_MIN_SAMPLES 5
+
+// ═══════════════════════════════════════
+// ▼ グローバル
+// ═══════════════════════════════════════
+
+// SPI / SD
+static SPIClass SD_SPI(NRF_SPIM2, PIN_SD_MISO, PIN_SD_SCK, PIN_SD_MOSI);
+static SdFat    sd;
+
+// BLE デバイス保持
+#define MAX_DEVICES 64
+struct Device {
+  uint8_t mac[6];
+  int     count;
+  int     rssi_sum;
+};
+static Device devices[MAX_DEVICES];
+static int    deviceCount = 0;
+
+// TCA9534 出力レジスタキャッシュ
+static uint8_t s_tca9534Out = 0x00;
+
+// SD カード初期化済みフラグ
+static bool s_sdReady = false;
+
+// キャリブレーション状態
+static bool  calibMode       = false;
+static int   calibActual     = 0;
+static int   calibSamples    = 0;
+static float calibRatioSum   = 0.0f;
+static int   calibMinHitsSum = 0;
+
+// シリアルコマンドバッファ
+static char cmdBuf[16];
+static int  cmdLen = 0;
+
+// ═══════════════════════════════════════
+// ▼ TCA9534 ソフト I2C (Wire/TWIM 不使用)
+// ─ BLE SoftDevice との IRQ 競合を回避するため GPIO ビットバン実装 ─
+// ═══════════════════════════════════════
+
+#define I2C_SDA   D4   // P0.04
+#define I2C_SCL   D5   // P0.05
+
+// SDA はオープンドレイン (INPUT_PULLUP=解放 / OUTPUT+LOW=駆動)
+// SCL はプッシュプル (TCA9534 はクロックストレッチなし)
+static void sdaHi() { pinMode(I2C_SDA, INPUT_PULLUP); delayMicroseconds(5); }
+static void sdaLo() { pinMode(I2C_SDA, OUTPUT); digitalWrite(I2C_SDA, LOW); delayMicroseconds(5); }
+static void sclHi() { digitalWrite(I2C_SCL, HIGH); delayMicroseconds(5); }
+static void sclLo() { digitalWrite(I2C_SCL, LOW);  delayMicroseconds(5); }
+
+static void i2cInit() {
+  pinMode(I2C_SCL, OUTPUT);
+  sclHi(); sdaHi();
+  delayMicroseconds(50);
+}
+
+static void i2cStart() { sdaHi(); sclHi(); sdaLo(); sclLo(); }
+static void i2cStop()  { sdaLo(); sclHi(); sdaHi(); }
+
+static bool i2cWriteByte(uint8_t b) {
+  for (int i = 7; i >= 0; i--) {
+    if ((b >> i) & 1) sdaHi(); else sdaLo();
+    sclHi(); sclLo();
+  }
+  sdaHi();  // SDA 解放 → TCA9534 が ACK=LOW を返す
+  sclHi();
+  bool ack = (digitalRead(I2C_SDA) == LOW);
+  sclLo();
+  return ack;
+}
+
+static bool tca9534WriteReg(uint8_t reg, uint8_t val) {
+  i2cStart();
+  bool ok = i2cWriteByte((uint8_t)((TCA9534_ADDR << 1) | 0x00));
+  ok &= i2cWriteByte(reg);
+  ok &= i2cWriteByte(val);
+  i2cStop();
+  return ok;
+}
+
+/**
+ * v3.04 用 TCA9534 初期化
+ *   P2 = MOSFET_GATE (3V3_SW)   → OUTPUT HIGH (周辺電源 ON)
+ *   P3 = SPI CS (SD カード)     → OUTPUT HIGH (CS デアサート)
+ *   P0/P1/P4〜P7                 → INPUT
+ */
+static bool tca9534Init() {
+  // 極性レジスタ: 正論理
+  if (!tca9534WriteReg(0x02, 0x00)) return false;
+  // 方向レジスタ (0=OUT, 1=IN): P2/P3=OUT, 他=IN → 0b11110011 = 0xF3
+  if (!tca9534WriteReg(0x03, 0xF3)) return false;
+  // 出力初期値: P2=1 (3V3_SW ON), P3=1 (CS deassert) → 0b00001100 = 0x0C
+  s_tca9534Out = 0x0C;
+  return tca9534WriteReg(0x01, s_tca9534Out);
+}
+
+/** ビット単位でポート出力を変更しキャッシュを更新する */
+static bool tca9534SetBit(uint8_t bit, uint8_t val) {
+  if (val) s_tca9534Out |=  (uint8_t)(1u << bit);
+  else     s_tca9534Out &= ~(uint8_t)(1u << bit);
+  return tca9534WriteReg(0x01, s_tca9534Out);
+}
+
+// ── SdFat CS オーバーライド ─────────────────
+// SD_CHIP_SELECT_MODE=1 で sdCsInit/sdCsWrite が __attribute__((weak)) になるため
+// ここで上書きし、TCA9534 P3 を SdFat の CS 管理に直結させる。
+// SdFat が sdCsWrite(pin, true) → P3=HIGH (deassert)
+//           sdCsWrite(pin, false) → P3=LOW  (assert)   を呼ぶので
+// 電源投入後の 80 クロック→CMD0 シーケンスが正しく動作する。
+void sdCsInit(SdCsPin_t pin)            { (void)pin; }
+void sdCsWrite(SdCsPin_t pin, bool lvl) {
+  (void)pin;
+  Serial.print("[CS] "); Serial.println(lvl ? "HIGH(deassert)" : "LOW(assert)");
+  tca9534SetBit(3, lvl ? 1 : 0);
+}
+
+// ═══════════════════════════════════════
+// ▼ SD カード ユーティリティ
+// ═══════════════════════════════════════
+
+/**
+ * SD カード初期化
+ *
+ * sdCsWrite() オーバーライドにより SdFat の CS 操作が TCA9534 P3 に直結する。
+ * SdFat が内部で行う「CS=HIGH → 80クロック → CS=LOW → CMD0」シーケンスが
+ * そのまま TCA9534 P3 のアサート/デアサートとして機能する。
+ */
+static bool initSd() {
+  delay(150);  // 3V3_SW 安定待ち
+
+  // SdFat に D9 (ダミーピン) を渡す。CS の実体は sdCsWrite() 経由で TCA9534 P3 が担う
+  pinMode(PIN_SD_CS_DUMMY, OUTPUT);
+  digitalWrite(PIN_SD_CS_DUMMY, HIGH);
+
+  SdSpiConfig cfg(PIN_SD_CS_DUMMY, DEDICATED_SPI, SD_SCK_MHZ(SPI_SPEED_MHZ), &SD_SPI);
+  if (!sd.begin(cfg)) {
+    Serial.print("[SD] 4MHz failed  err=0x");
+    Serial.print(sd.card()->errorCode(), HEX);
+    Serial.print("/0x");
+    Serial.println(sd.card()->errorData(), HEX);
+    SdSpiConfig cfgSlow(PIN_SD_CS_DUMMY, DEDICATED_SPI, SD_SCK_MHZ(1), &SD_SPI);
+    if (!sd.begin(cfgSlow)) {
+      Serial.print("[SD] 1MHz failed  err=0x");
+      Serial.print(sd.card()->errorCode(), HEX);
+      Serial.print("/0x");
+      Serial.println(sd.card()->errorData(), HEX);
+      Serial.println("[SD] init failed — カード未挿入 or 配線不良");
+      return false;
+    }
+    Serial.println("[SD] init OK (1MHz fallback)");
+  } else {
+    Serial.print("[SD] init OK (4MHz)  capacity=");
+    Serial.print((uint32_t)(0.000512f * sd.card()->sectorCount()));
+    Serial.println("MB");
+  }
+
+  // ログファイル: 存在しなければヘッダ行を作成
+  if (ENABLE_LOGGING && !sd.exists(LOG_FILE)) {
+    FsFile f = sd.open(LOG_FILE, O_WRITE | O_CREAT);
+    if (f) {
+      f.println("timestamp,people,devices");
+      f.close();
+      Serial.println("[SD] /log.csv created");
+    }
+  }
+  return true;
+}
+
+/** 1 サイクル分のデータを /log.csv に追記する */
+static void logRecord(int people, int devCount) {
+  if (!ENABLE_LOGGING || !s_sdReady) return;
+
+  FsFile f = sd.open(LOG_FILE, O_WRITE | O_APPEND);
+  if (!f) { Serial.println("[SD] open failed"); return; }
+
+  uint32_t s = millis() / 1000UL;
+  char ts[10];
+  snprintf(ts, sizeof(ts), "%02lu:%02lu:%02lu",
+           s / 3600, (s % 3600) / 60, s % 60);
+
+  f.print(ts);   f.print(",");
+  f.print(people); f.print(",");
+  f.println(devCount);
+  f.close();
+}
+
+/** SD ログを全件シリアル出力 */
+static void dumpLog() {
+  if (!ENABLE_LOGGING) { Serial.println("[LOG] disabled"); return; }
+  FsFile f = sd.open(LOG_FILE, O_READ);
+  if (!f) { Serial.println("[LOG] no file"); return; }
+  Serial.println("=== LOG DUMP ===");
+  while (f.available()) Serial.write(f.read());
+  f.close();
+  Serial.println("=== END ===");
+}
+
+/** SD ログを削除 */
+static void eraseLog() {
+  if (!ENABLE_LOGGING) { Serial.println("[LOG] disabled"); return; }
+  if (sd.exists(LOG_FILE)) {
+    sd.remove(LOG_FILE);
+    Serial.println("[LOG] erased");
+  } else {
+    Serial.println("[LOG] no file");
+  }
+}
+
+// ═══════════════════════════════════════
+// ▼ ユーティリティ
+// ═══════════════════════════════════════
+
+static void printTimestamp() {
+  uint32_t s = millis() / 1000UL;
+  char buf[10];
+  snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu",
+           s / 3600, (s % 3600) / 60, s % 60);
+  Serial.print(buf);
+}
+
+// ═══════════════════════════════════════
+// ▼ BLE スキャン (xiao_ble_scan と同一ロジック)
+// ═══════════════════════════════════════
+
+static int findDevice(uint8_t *mac) {
+  for (int i = 0; i < deviceCount; i++)
+    if (memcmp(devices[i].mac, mac, 6) == 0) return i;
+  return -1;
+}
+
+static void updateDevice(uint8_t *mac, int rssi) {
+  if (rssi < RSSI_THRESHOLD) return;
+  int idx = findDevice(mac);
+  if (idx >= 0) {
+    devices[idx].count++;
+    devices[idx].rssi_sum += rssi;
+  } else if (deviceCount < MAX_DEVICES) {
+    memcpy(devices[deviceCount].mac, mac, 6);
+    devices[deviceCount].count    = 1;
+    devices[deviceCount].rssi_sum = rssi;
+    deviceCount++;
+  }
+}
+
+static int estimatePeople() {
+  int rssiList[MAX_DEVICES];
+  int n = 0;
+
+  for (int i = 0; i < deviceCount; i++) {
+    if (devices[i].count >= MIN_HITS)
+      rssiList[n++] = devices[i].rssi_sum / devices[i].count;
+  }
+  if (n == 0) return 0;
+
+  // 降順ソート
+  for (int i = 0; i < n - 1; i++)
+    for (int j = i + 1; j < n; j++)
+      if (rssiList[i] < rssiList[j]) { int t = rssiList[i]; rssiList[i] = rssiList[j]; rssiList[j] = t; }
+
+  // RSSI クラスタリング
+  int  people = 0;
+  bool used[MAX_DEVICES] = {};
+  for (int i = 0; i < n; i++) {
+    if (used[i]) continue;
+    people++; used[i] = true;
+    for (int j = i + 1; j < n; j++)
+      if (!used[j] && abs(rssiList[i] - rssiList[j]) <= RSSI_MERGE_GAP)
+        used[j] = true;
+  }
+  return (int)(people * CALIBRATION);
+}
+
+static void scanCallback(ble_gap_evt_adv_report_t *report) {
+  updateDevice(report->peer_addr.addr, report->rssi);
+  Bluefruit.Scanner.resume();
+}
+
+// ═══════════════════════════════════════
+// ▼ キャリブレーション
+// ═══════════════════════════════════════
+
+static void findBestParams(int actual, int &outMinHits, float &outCalib) {
+  outMinHits = MIN_HITS;
+  outCalib   = CALIBRATION;
+  float bestScore = 1e9f;
+  for (int minH = 1; minH <= 20; minH++) {
+    int q = 0;
+    for (int i = 0; i < deviceCount; i++)
+      if (devices[i].count >= minH) q++;
+    if (q == 0) break;
+    float calib = (float)actual / (float)q;
+    float score = fabsf(calib - 1.0f);
+    if (score < bestScore) { bestScore = score; outMinHits = minH; outCalib = calib; }
+  }
+}
+
+static void printCalibResult() {
+  if (calibSamples == 0) { Serial.println("[CALIB] No data. Send c<N>"); return; }
+  int   minHits = (calibMinHitsSum + calibSamples / 2) / calibSamples;
+  float calib   = calibRatioSum / (float)calibSamples;
+  Serial.println("=== CALIB RESULT ===");
+  Serial.print("  Samples : "); Serial.println(calibSamples);
+  Serial.println("  --- Paste into your code ---");
+  Serial.print("  static int   const MIN_HITS    = "); Serial.print(minHits);    Serial.println(";");
+  Serial.print("  static float const CALIBRATION = "); Serial.print(calib, 2); Serial.println(";");
+  Serial.println("====================");
+}
+
+// ═══════════════════════════════════════
+// ▼ シリアルコマンド
+// ═══════════════════════════════════════
+
+static void processCommand(const char *cmd) {
+  if (!cmd[0]) return;
+  if      (cmd[0]=='d'||cmd[0]=='D') dumpLog();
+  else if (cmd[0]=='e'||cmd[0]=='E') eraseLog();
+  else if (cmd[0]=='c'||cmd[0]=='C') {
+    int n = atoi(cmd + 1);
+    if (n > 0) {
+      calibMode = true; calibActual = n;
+      calibSamples = 0; calibRatioSum = 0.0f; calibMinHitsSum = 0;
+      Serial.print("[CALIB] actual="); Serial.print(n);
+      Serial.print("  collecting "); Serial.print(CALIB_MIN_SAMPLES); Serial.println(" samples...");
+    } else {
+      Serial.println("[CALIB] Usage: c<N>  e.g. c5");
+    }
+  }
+  else if (cmd[0]=='r'||cmd[0]=='R') printCalibResult();
+  else if (cmd[0]=='x'||cmd[0]=='X') { calibMode = false; Serial.println("[CALIB] exited"); }
+  else Serial.println("[CMD] d=dump  e=erase  c<N>=calib  r=result  x=exit");
+}
+
+static void handleSerial() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (cmdLen > 0) { cmdBuf[cmdLen] = '\0'; processCommand(cmdBuf); cmdLen = 0; }
+    } else if (cmdLen < (int)sizeof(cmdBuf) - 1) {
+      cmdBuf[cmdLen++] = c;
+    }
+  }
+}
+
+// ═══════════════════════════════════════
+// ▼ setup
+// ═══════════════════════════════════════
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000) yield();
+
+  Serial.println("\n=== Toyono Park Monitor (Flex v3.04 / Phase-1: BLE+SD) ===");
+  Serial.println("    Commands: d=dump  e=erase  c<N>=calib  r=result  x=exit");
+
+  // ソフト I2C 初期化 → TCA9534 (3V3_SW ON / SD CS=HIGH)
+  i2cInit();
+  if (!tca9534Init()) {
+    Serial.println("[ERROR] TCA9534 init failed — I2C 配線を確認してください");
+  } else {
+    Serial.println("[TCA9534] OK  P2=HIGH(3V3_SW ON)  P3=HIGH(CS deassert)");
+  }
+
+  // SD カード初期化 (3V3_SW ON 後に呼ぶこと)
+  s_sdReady = initSd();
+
+  // LED
+  pinMode(LED_BLUE, OUTPUT);
+  digitalWrite(LED_BLUE, HIGH);  // 消灯 (アクティブ LOW)
+
+  // BLE
+  Bluefruit.begin(1, 0);
+  Bluefruit.setName("ParkMonitor_Flex");
+  Bluefruit.Scanner.setRxCallback(scanCallback);
+  Bluefruit.Scanner.useActiveScan(false);
+  Bluefruit.Scanner.setInterval(
+    (uint16_t)(SCAN_INTERVAL_MS * 1000 / 625),
+    (uint16_t)(SCAN_WINDOW_MS   * 1000 / 625)
+  );
+
+  Serial.println("[READY]");
+}
+
+// ═══════════════════════════════════════
+// ▼ loop — スキャン(30s) → 記録 → スリープ(90s)
+// ═══════════════════════════════════════
+
+void loop() {
+
+  // ① スキャン開始
+  deviceCount = 0;
+  Bluefruit.Scanner.start(0);
+  Serial.print("[SCAN] "); Serial.print(SCAN_DURATION_MS / 1000); Serial.println("s start");
+
+  uint32_t scanEnd   = millis() + SCAN_DURATION_MS;
+  uint32_t lastBlink = millis();
+  bool     ledOn     = false;
+
+  while (millis() < scanEnd) {
+    handleSerial();
+    if (millis() - lastBlink >= LED_BLINK_MS) {
+      ledOn = !ledOn;
+      digitalWrite(LED_BLUE, ledOn ? LOW : HIGH);
+      lastBlink = millis();
+    }
+    delay(10);
+  }
+
+  // ② スキャン停止 / LED 消灯
+  Bluefruit.Scanner.stop();
+  digitalWrite(LED_BLUE, HIGH);
+
+  // ③ 人数推定 + 出力 + ログ
+  int people = estimatePeople();
+  Serial.println("------------------------------");
+  Serial.print("["); printTimestamp(); Serial.print("]");
+  Serial.print("  People="); Serial.print(people);
+  Serial.print("  devices="); Serial.println(deviceCount);
+  logRecord(people, deviceCount);
+
+  // ④ キャリブレーション
+  if (calibMode) {
+    int   bestMinHits;
+    float bestCalib;
+    findBestParams(calibActual, bestMinHits, bestCalib);
+    calibMinHitsSum += bestMinHits;
+    calibRatioSum   += bestCalib;
+    calibSamples++;
+    Serial.print("[CALIB] #"); Serial.print(calibSamples);
+    Serial.print("  actual=");        Serial.print(calibActual);
+    Serial.print("  MIN_HITS→");     Serial.print(bestMinHits);
+    Serial.print("  CALIBRATION→");  Serial.println(bestCalib, 2);
+    if (calibSamples >= CALIB_MIN_SAMPLES) { printCalibResult(); calibMode = false; }
+  }
+
+  // ⑤ スリープ (nRF52 delay は低消費電力スリープ)
+  Serial.print("[SLEEP] "); Serial.print(SLEEP_DURATION_MS / 1000); Serial.println("s");
+  Serial.flush();
+
+  uint32_t sleepEnd = millis() + SLEEP_DURATION_MS;
+  while (millis() < sleepEnd) { handleSerial(); delay(10); }
+}
+
+
+// ╔══════════════════════════════════════════════════════════╗
+// ║  Phase-2: PIR センサ (有効化手順)                        ║
+// ║  配線: Sigfox コネクタライン                              ║
+// ║    D8 = PIR OUT, D9 = (未使用), VCC/GND も同列           ║
+// ║  → D9 は SD CS ダミー用途から PIR 用 GND に変更可         ║
+// ╚══════════════════════════════════════════════════════════╝
+//
+// Step 1: 以下のコメントを外す
+//
+// #define PIR_PIN D8
+// static int s_pirHits = 0;
+//
+// Step 2: setup() 末尾に追加
+//   pinMode(PIR_PIN, INPUT);
+//
+// Step 3: loop() の while (millis() < scanEnd) ブロック内に追加
+//   if (digitalRead(PIR_PIN) == HIGH) s_pirHits++;
+//
+// Step 4: ③ 人数推定 + 出力 の行を変更
+//   Serial.print("  PIR="); Serial.println(s_pirHits);
+//   logRecord(people, deviceCount, s_pirHits);  // ← 引数追加
+//   s_pirHits = 0;
+//
+// Step 5: logRecord() のシグネチャと CSV ヘッダを更新
+//   "timestamp,people,devices,pir"
+//
+// ─────────────────────────────────────────────────────────────
+//
+// ╔══════════════════════════════════════════════════════════╗
+// ║  Phase-3: 音声 (PDM) センサ (有効化手順)                 ║
+// ║  必要ハード: XIAO nRF52840 Sense (PDM マイク内蔵)        ║
+// ╚══════════════════════════════════════════════════════════╝
+//
+// Step 1: platformio.ini の kosme/arduinoFFT のコメントを外す
+//
+// Step 2: 以下のインクルードを追加
+//   #include <PDM.h>
+//   #include <arduinoFFT.h>
+//
+// Step 3: 音声取得 + FFT の実装は以下を参照:
+//   case00_common/nrf52Sense_pdm_sound_monitor/src/main.cpp
+//   主要パラメータ: PDM_GAIN=30, FFT_SIZE=256, SAMPLE_RATE=16000
+//   4バンド: L(125-500Hz), ML(500-2kHz), MH(2-4kHz), H(4-8kHz)
+//
+// Step 4: logRecord() に音声値を追加し CSV ヘッダを更新
+//   "timestamp,people,devices,pir,rms_dbfs,L,ML,MH,H"
