@@ -60,9 +60,6 @@
 // ── TCA9534 ──────────────────────────
 #define TCA9534_ADDR  0x20
 
-// ── DS3231 RTC ───────────────────────
-#define DS3231_ADDR   0x68
-
 // ── SD カード SPI ピン (v3.04) ─────────
 #define PIN_SD_MISO       D2   // P0.28
 #define PIN_SD_SCK        D10  // P1.15
@@ -166,24 +163,11 @@ static bool i2cWriteByte(uint8_t b) {
     if ((b >> i) & 1) sdaHi(); else sdaLo();
     sclHi(); sclLo();
   }
-  sdaHi();  // SDA 解放 → スレーブが ACK=LOW を返す
+  sdaHi();  // SDA 解放 → TCA9534 が ACK=LOW を返す
   sclHi();
   bool ack = (digitalRead(I2C_SDA) == LOW);
   sclLo();
   return ack;
-}
-
-static uint8_t i2cReadByte(bool sendAck) {
-  uint8_t b = 0;
-  sdaHi();
-  for (int i = 7; i >= 0; i--) {
-    sclHi();
-    b = (uint8_t)((b << 1) | (digitalRead(I2C_SDA) ? 1 : 0));
-    sclLo();
-  }
-  if (sendAck) sdaLo(); else sdaHi();
-  sclHi(); sclLo(); sdaHi();
-  return b;
 }
 
 static bool tca9534WriteReg(uint8_t reg, uint8_t val) {
@@ -221,52 +205,6 @@ static bool tca9534SetBit(uint8_t bit, uint8_t val) {
   if (val) s_tca9534Out |=  (uint8_t)(1u << bit);
   else     s_tca9534Out &= ~(uint8_t)(1u << bit);
   return tca9534WriteReg(0x01, s_tca9534Out);
-}
-
-// ═══════════════════════════════════════
-// ▼ DS3231 RTC (ビットバン I2C 共用)
-// ═══════════════════════════════════════
-
-static uint8_t bcdToDec(uint8_t b) { return (uint8_t)((b >> 4) * 10 + (b & 0x0F)); }
-static uint8_t decToBcd(uint8_t d) { return (uint8_t)(((d / 10) << 4) | (d % 10)); }
-
-// DS3231 から時刻を読む (24h モード前提)
-static bool ds3231Read(uint16_t &Y, uint8_t &Mo, uint8_t &D,
-                        uint8_t &h, uint8_t &mi, uint8_t &s) {
-  // レジスタポインタを 0x00 にセット
-  i2cStart();
-  if (!i2cWriteByte((DS3231_ADDR << 1) | 0x00)) { i2cStop(); return false; }
-  if (!i2cWriteByte(0x00))                       { i2cStop(); return false; }
-  i2cStop();
-  // 7 バイト連続読み出し
-  i2cStart();
-  if (!i2cWriteByte((DS3231_ADDR << 1) | 0x01)) { i2cStop(); return false; }
-  s   = bcdToDec(i2cReadByte(true)  & 0x7F);  // reg0: 秒
-  mi  = bcdToDec(i2cReadByte(true)  & 0x7F);  // reg1: 分
-  h   = bcdToDec(i2cReadByte(true)  & 0x3F);  // reg2: 時 (24h)
-  (void)i2cReadByte(true);                     // reg3: 曜日 (スキップ)
-  D   = bcdToDec(i2cReadByte(true)  & 0x3F);  // reg4: 日
-  Mo  = bcdToDec(i2cReadByte(true)  & 0x1F);  // reg5: 月 (世紀ビット除去)
-  Y   = (uint16_t)(2000 + bcdToDec(i2cReadByte(false)));  // reg6: 年 (NACK)
-  i2cStop();
-  return (Mo >= 1 && Mo <= 12 && D >= 1 && D <= 31 && h <= 23 && mi <= 59 && s <= 59);
-}
-
-// DS3231 に時刻を書く (24h モード)
-static bool ds3231Write(uint16_t Y, uint8_t Mo, uint8_t D,
-                         uint8_t h, uint8_t mi, uint8_t s) {
-  i2cStart();
-  if (!i2cWriteByte((DS3231_ADDR << 1) | 0x00)) { i2cStop(); return false; }
-  if (!i2cWriteByte(0x00)) { i2cStop(); return false; }  // register 0x00
-  i2cWriteByte(decToBcd(s));
-  i2cWriteByte(decToBcd(mi));
-  i2cWriteByte(decToBcd(h));
-  i2cWriteByte(0x01);                         // day of week = 1 (固定)
-  i2cWriteByte(decToBcd(D));
-  i2cWriteByte(decToBcd(Mo));
-  i2cWriteByte(decToBcd((uint8_t)(Y - 2000)));
-  i2cStop();
-  return true;
 }
 
 // ── SdFat CS オーバーライド ─────────────────
@@ -411,18 +349,12 @@ static void fromEpoch2000(uint32_t e,
 }
 
 // タイムスタンプ文字列を buf に書く
-//   DS3231 読取成功:  "2026-07-01 14:30:00" (19 chars)
-//   millis フォールバック設定済み: 同上
-//   未設定:            "00:01:37"            (8 chars, 起動からの経過時間)
+//   時刻設定済み: "2026-07-01 14:30:00" (19 chars)
+//   未設定:       "00:01:37"            (8 chars, 起動からの経過時間)
 static void getTimestamp(char *buf, size_t len) {
-  uint16_t Y; uint8_t Mo, D, h, mi, s;
-  if (ds3231Read(Y, Mo, D, h, mi, s)) {
-    snprintf(buf, len, "%04u-%02u-%02u %02u:%02u:%02u", Y, Mo, D, h, mi, s);
-    return;
-  }
-  // DS3231 読み取り失敗: millis() オフセットにフォールバック
   if (s_rtcSet) {
     uint32_t now = s_rtcBase + (millis() - s_rtcSetMs) / 1000;
+    uint16_t Y; uint8_t Mo, D, h, mi, s;
     fromEpoch2000(now, Y, Mo, D, h, mi, s);
     snprintf(buf, len, "%04u-%02u-%02u %02u:%02u:%02u", Y, Mo, D, h, mi, s);
   } else {
@@ -562,11 +494,6 @@ static void processCommand(const char *cmd) {
       s_rtcBase  = toEpoch2000(Y, Mo, D, h, mi, s);
       s_rtcSetMs = millis();
       s_rtcSet   = true;
-      if (ds3231Write(Y, Mo, D, h, mi, s)) {
-        Serial.println("[TIME] DS3231 set OK");
-      } else {
-        Serial.println("[TIME] DS3231 set FAILED (millis fallback active)");
-      }
       char ts[24]; getTimestamp(ts, sizeof(ts));
       Serial.print("[TIME] "); Serial.println(ts);
     } else {
@@ -596,7 +523,7 @@ void setup() {
   while (!Serial && millis() < 3000) yield();
 
   Serial.println("\n=== Toyono Park Monitor (Flex v3.04 / Phase-1: BLE+SD) ===");
-  Serial.println("    Commands: d=dump  e=erase  c<N>=calib  r=result  x=exit  t<YYYYMMDDHHMMSS>=settime(DS3231)");
+  Serial.println("    Commands: d=dump  e=erase  c<N>=calib  r=result  x=exit  t<YYYYMMDDHHMMSS>=settime");
 
   // ソフト I2C 初期化 → TCA9534 (3V3_SW ON / SD CS=HIGH)
   i2cInit();
@@ -604,16 +531,6 @@ void setup() {
     Serial.println("[ERROR] TCA9534 init failed — I2C 配線を確認してください");
   } else {
     Serial.println("[TCA9534] OK  P2=HIGH(3V3_SW ON)  P3=LOW(CS assert)");
-  }
-
-  // DS3231 時刻確認
-  {
-    uint16_t Y; uint8_t Mo, D, h, mi, s;
-    if (ds3231Read(Y, Mo, D, h, mi, s)) {
-      Serial.printf("[DS3231] %04u-%02u-%02u %02u:%02u:%02u\n", Y, Mo, D, h, mi, s);
-    } else {
-      Serial.println("[DS3231] read failed — 未接続 or t<YYYYMMDDHHMMSS> で時刻設定してください");
-    }
   }
 
   // SD カード初期化 (3V3_SW ON 後に呼ぶこと)
