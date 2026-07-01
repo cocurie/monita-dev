@@ -96,7 +96,7 @@ static uint32_t const LED_BLINK_MS = 1000;
 // ═══════════════════════════════════════
 
 // SPI / SD
-static SPIClass SD_SPI(NRF_SPIM2, PIN_SD_MISO, PIN_SD_SCK, PIN_SD_MOSI);
+static SPIClass SD_SPI(NRF_SPIM1, PIN_SD_MISO, PIN_SD_SCK, PIN_SD_MOSI);
 static SdFat    sd;
 
 // BLE デバイス保持
@@ -174,16 +174,21 @@ static bool tca9534WriteReg(uint8_t reg, uint8_t val) {
 /**
  * v3.04 用 TCA9534 初期化
  *   P2 = MOSFET_GATE (3V3_SW)   → OUTPUT HIGH (周辺電源 ON)
- *   P3 = SPI CS (SD カード)     → OUTPUT HIGH (CS デアサート)
+ *   P3 = SPI CS (SD カード)     → OUTPUT LOW  (CS 常時アサート)
  *   P0/P1/P4〜P7                 → INPUT
+ *
+ * CS を常時アサート（LOW固定）にする理由:
+ *   sdCsWrite 経由の I2C トグルは1回 ~250µs かかり SdFat の
+ *   CS タイミング要件を満たせない場合がある。SPI バス上に SD
+ *   のみ存在するため CS 常時アサートで実用上問題なし。
  */
 static bool tca9534Init() {
   // 極性レジスタ: 正論理
   if (!tca9534WriteReg(0x02, 0x00)) return false;
   // 方向レジスタ (0=OUT, 1=IN): P2/P3=OUT, 他=IN → 0b11110011 = 0xF3
   if (!tca9534WriteReg(0x03, 0xF3)) return false;
-  // 出力初期値: P2=1 (3V3_SW ON), P3=1 (CS deassert) → 0b00001100 = 0x0C
-  s_tca9534Out = 0x0C;
+  // 出力初期値: P2=1 (3V3_SW ON), P3=0 (CS 常時アサート) → 0b00000100 = 0x04
+  s_tca9534Out = 0x04;
   return tca9534WriteReg(0x01, s_tca9534Out);
 }
 
@@ -195,17 +200,10 @@ static bool tca9534SetBit(uint8_t bit, uint8_t val) {
 }
 
 // ── SdFat CS オーバーライド ─────────────────
-// SD_CHIP_SELECT_MODE=1 で sdCsInit/sdCsWrite が __attribute__((weak)) になるため
-// ここで上書きし、TCA9534 P3 を SdFat の CS 管理に直結させる。
-// SdFat が sdCsWrite(pin, true) → P3=HIGH (deassert)
-//           sdCsWrite(pin, false) → P3=LOW  (assert)   を呼ぶので
-// 電源投入後の 80 クロック→CMD0 シーケンスが正しく動作する。
+// CS は tca9534Init() で P3=LOW に固定済み。
+// SdFat の CS 操作（sdCsWrite）は no-op とし、D9 ダミーピンへの操作を無視する。
 void sdCsInit(SdCsPin_t pin)            { (void)pin; }
-void sdCsWrite(SdCsPin_t pin, bool lvl) {
-  (void)pin;
-  Serial.print("[CS] "); Serial.println(lvl ? "HIGH(deassert)" : "LOW(assert)");
-  tca9534SetBit(3, lvl ? 1 : 0);
-}
+void sdCsWrite(SdCsPin_t pin, bool lvl) { (void)pin; (void)lvl; }
 
 // ═══════════════════════════════════════
 // ▼ SD カード ユーティリティ
@@ -219,33 +217,44 @@ void sdCsWrite(SdCsPin_t pin, bool lvl) {
  * そのまま TCA9534 P3 のアサート/デアサートとして機能する。
  */
 static bool initSd() {
-  delay(150);  // 3V3_SW 安定待ち
+  delay(500);  // 3V3_SW 安定待ち（TCA9534 VCC ジャンパ接触不良対策で延長）
 
-  // SdFat に D9 (ダミーピン) を渡す。CS の実体は sdCsWrite() 経由で TCA9534 P3 が担う
   pinMode(PIN_SD_CS_DUMMY, OUTPUT);
   digitalWrite(PIN_SD_CS_DUMMY, HIGH);
 
-  SdSpiConfig cfg(PIN_SD_CS_DUMMY, DEDICATED_SPI, SD_SCK_MHZ(SPI_SPEED_MHZ), &SD_SPI);
-  if (!sd.begin(cfg)) {
+  // 最大3回リトライ（電源不安定・接触不良対策）
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    Serial.print("[SD] init attempt "); Serial.print(attempt); Serial.println("/3");
+
+    SdSpiConfig cfg(PIN_SD_CS_DUMMY, DEDICATED_SPI, SD_SCK_MHZ(SPI_SPEED_MHZ), &SD_SPI);
+    if (sd.begin(cfg)) {
+      Serial.print("[SD] init OK (4MHz)  capacity=");
+      Serial.print((uint32_t)(0.000512f * sd.card()->sectorCount()));
+      Serial.println("MB");
+      goto sd_init_done;
+    }
     Serial.print("[SD] 4MHz failed  err=0x");
     Serial.print(sd.card()->errorCode(), HEX);
     Serial.print("/0x");
     Serial.println(sd.card()->errorData(), HEX);
+
     SdSpiConfig cfgSlow(PIN_SD_CS_DUMMY, DEDICATED_SPI, SD_SCK_MHZ(1), &SD_SPI);
-    if (!sd.begin(cfgSlow)) {
-      Serial.print("[SD] 1MHz failed  err=0x");
-      Serial.print(sd.card()->errorCode(), HEX);
-      Serial.print("/0x");
-      Serial.println(sd.card()->errorData(), HEX);
-      Serial.println("[SD] init failed — カード未挿入 or 配線不良");
-      return false;
+    if (sd.begin(cfgSlow)) {
+      Serial.println("[SD] init OK (1MHz fallback)");
+      goto sd_init_done;
     }
-    Serial.println("[SD] init OK (1MHz fallback)");
-  } else {
-    Serial.print("[SD] init OK (4MHz)  capacity=");
-    Serial.print((uint32_t)(0.000512f * sd.card()->sectorCount()));
-    Serial.println("MB");
+    Serial.print("[SD] 1MHz failed  err=0x");
+    Serial.print(sd.card()->errorCode(), HEX);
+    Serial.print("/0x");
+    Serial.println(sd.card()->errorData(), HEX);
+
+    if (attempt < 3) delay(500);  // リトライ前に待機
   }
+
+  Serial.println("[SD] init failed — カード未挿入 or 配線不良");
+  return false;
+
+  sd_init_done:
 
   // ログファイル: 存在しなければヘッダ行を作成
   if (ENABLE_LOGGING && !sd.exists(LOG_FILE)) {
@@ -450,7 +459,7 @@ void setup() {
   if (!tca9534Init()) {
     Serial.println("[ERROR] TCA9534 init failed — I2C 配線を確認してください");
   } else {
-    Serial.println("[TCA9534] OK  P2=HIGH(3V3_SW ON)  P3=HIGH(CS deassert)");
+    Serial.println("[TCA9534] OK  P2=HIGH(3V3_SW ON)  P3=LOW(CS assert)");
   }
 
   // SD カード初期化 (3V3_SW ON 後に呼ぶこと)
