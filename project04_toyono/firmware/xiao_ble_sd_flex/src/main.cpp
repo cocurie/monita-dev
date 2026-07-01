@@ -40,15 +40,22 @@
  *   r        キャリブレーション途中経過表示
  *   x        キャリブレーション終了
  *
- * DS3231 時刻設定方法
+ * DS3231 時刻設定方法 (どちらか一方を使う)
+ *
+ * 【方法 A: スケッチ書き込み時に自動設定 (推奨)】
+ *   1. 本ファイル冒頭の  #define SET_RTC_ON_BOOT  0  を  1  に変更
+ *   2. ビルド & フラッシュ → 起動時にビルド時刻が DS3231 に書き込まれる
+ *      (シリアルに "[DS3231] SET_RTC_ON_BOOT: 2026-07-01 14:30:00" と表示)
+ *   3. SET_RTC_ON_BOOT を 0 に戻して再フラッシュ (毎回上書きを防ぐ)
+ *   ※ フラッシュからデバイス起動まで数秒〜数十秒ずれる場合がある
+ *
+ * 【方法 B: シリアルコマンドで設定】
  *   1. シリアルモニタを 115200bps / 改行コード LF で開く
- *   2. 以下の形式で送信する (14桁固定):
- *        t<YYYYMMDDHHMMSS>
- *        例: t20260701143000  → 2026-07-01 14:30:00
- *   3. 「[TIME] DS3231 set OK」と表示されれば DS3231 への書き込み成功
- *      「DS3231 set FAILED」の場合は配線・アドレス(0x68)を確認
- *   4. 以降は電源を切っても DS3231 が時刻を保持する (CR2032 バックアップ電源が必要)
- *   ※ DS3231 未接続時は millis() 起点の経過時間をタイムスタンプとして記録する
+ *   2. t<YYYYMMDDHHMMSS> の形式で送信 (例: t20260701143000)
+ *   3. 「[TIME] DS3231 set OK」と表示されれば成功
+ *
+ *   どちらの方法でも DS3231 は電源オフ後も時刻を保持する (CR2032 必要)
+ *   DS3231 未接続時は millis() 起点の経過時間をタイムスタンプとして記録する
  *
  * フェーズ別有効化
  *   Phase-2: PIR (D8) → 本ファイル末尾の PIR ブロックを参照
@@ -79,6 +86,11 @@
 #define PIN_SD_MOSI       D1   // P0.03
 #define PIN_SD_CS_DUMMY   D9   // SdFat CS管理用ダミー (Sigfox RX ピン / SD 未接続)
 #define SPI_SPEED_MHZ     4    // 失敗時は 1 に落とす
+
+// ── DS3231 初期時刻設定 ───────────────
+// 1 にしてフラッシュするとビルド時刻を DS3231 に書き込む。
+// 設定後は 0 に戻して再フラッシュすること（毎回上書きを防ぐため）。
+#define SET_RTC_ON_BOOT  0
 
 // ── ログ ─────────────────────────────
 static bool       const ENABLE_LOGGING = true;
@@ -277,6 +289,32 @@ static bool ds3231Write(uint16_t Y, uint8_t Mo, uint8_t D,
   i2cWriteByte(decToBcd((uint8_t)(Y - 2000)));
   i2cStop();
   return true;
+}
+
+// ビルド時刻 (__DATE__ / __TIME__) を DS3231 に書き込む
+// __DATE__ 形式: "Jul  1 2026"   __TIME__ 形式: "14:30:00"
+static uint8_t parseMonth(const char *s) {
+  const char *m = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  for (uint8_t i = 0; i < 12; i++)
+    if (strncmp(s, m + i * 3, 3) == 0) return i + 1;
+  return 1;
+}
+
+static void setRtcFromCompileTime() {
+  const char *date = __DATE__;   // "Jul  1 2026"
+  const char *time = __TIME__;   // "14:30:00"
+  uint8_t  mo = parseMonth(date);
+  uint8_t  d  = (uint8_t)atoi(date + 4);
+  uint16_t y  = (uint16_t)atoi(date + 7);
+  uint8_t  h  = (uint8_t)atoi(time);
+  uint8_t  mi = (uint8_t)atoi(time + 3);
+  uint8_t  s  = (uint8_t)atoi(time + 6);
+  Serial.printf("[DS3231] SET_RTC_ON_BOOT: %04u-%02u-%02u %02u:%02u:%02u\n", y, mo, d, h, mi, s);
+  if (ds3231Write(y, mo, d, h, mi, s)) {
+    Serial.println("[DS3231] write OK");
+  } else {
+    Serial.println("[DS3231] write FAILED");
+  }
 }
 
 // ── SdFat CS オーバーライド ─────────────────
@@ -615,6 +653,11 @@ void setup() {
   } else {
     Serial.println("[TCA9534] OK  P2=HIGH(3V3_SW ON)  P3=LOW(CS assert)");
   }
+
+  // DS3231 初期時刻設定 (SET_RTC_ON_BOOT=1 のときのみ)
+#if SET_RTC_ON_BOOT
+  setRtcFromCompileTime();
+#endif
 
   // DS3231 時刻確認
   {
