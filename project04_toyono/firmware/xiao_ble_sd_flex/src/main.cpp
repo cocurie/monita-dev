@@ -225,7 +225,7 @@ void sdCsWrite(SdCsPin_t pin, bool lvl) { (void)pin; (void)lvl; }
  * そのまま TCA9534 P3 のアサート/デアサートとして機能する。
  */
 static bool initSd() {
-  delay(500);  // 3V3_SW 安定待ち（TCA9534 VCC ジャンパ接触不良対策で延長）
+  delay(2000);  // 3V3_SW 安定待ち (500ms では不安定なため 2000ms に延長)
 
   pinMode(PIN_SD_CS_DUMMY, OUTPUT);
   digitalWrite(PIN_SD_CS_DUMMY, HIGH);
