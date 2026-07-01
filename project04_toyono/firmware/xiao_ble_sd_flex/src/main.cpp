@@ -40,6 +40,20 @@
  *   r        キャリブレーション途中経過表示
  *   x        キャリブレーション終了
  *
+ * DS3231 時刻設定方法 (どちらか一方を使う)
+ *
+ * 【方法 A: フラッシュ時に自動設定 (推奨)】
+ *   1. 93行目の  #define SET_RTC_ON_BOOT  0  を  1  に変更
+ *   2. ビルド & フラッシュ → 起動時にビルド時刻が DS3231 に書き込まれる
+ *   3. SET_RTC_ON_BOOT を 0 に戻して再フラッシュ (毎回上書きを防ぐ)
+ *   ※ フラッシュ完了〜起動まで数秒ずれる場合がある
+ *
+ * 【方法 B: シリアルコマンドで設定】
+ *   t<YYYYMMDDHHMMSS> を送信 (例: t20260701143000 → 2026-07-01 14:30:00)
+ *
+ *   DS3231 は電源オフ後も時刻を保持する (CR2032 バックアップ電源が必要)
+ *   DS3231 未接続時は millis() 起点の経過時間をタイムスタンプとして記録する
+ *
  * フェーズ別有効化
  *   Phase-2: PIR (D8) → 本ファイル末尾の PIR ブロックを参照
  *   Phase-3: 音声 (PDM) → 本ファイル末尾の AUDIO ブロックを参照
@@ -59,6 +73,14 @@
 
 // ── TCA9534 ──────────────────────────
 #define TCA9534_ADDR  0x20
+
+// ── DS3231 RTC ───────────────────────
+#define DS3231_ADDR   0x68
+
+// ── DS3231 初期時刻設定 ───────────────
+// 1 にしてフラッシュするとビルド時刻を DS3231 に書き込む。
+// 設定後は 0 に戻して再フラッシュすること（毎回上書きを防ぐため）。
+#define SET_RTC_ON_BOOT  0
 
 // ── SD カード SPI ピン (v3.04) ─────────
 #define PIN_SD_MISO       D2   // P0.28
@@ -163,11 +185,24 @@ static bool i2cWriteByte(uint8_t b) {
     if ((b >> i) & 1) sdaHi(); else sdaLo();
     sclHi(); sclLo();
   }
-  sdaHi();  // SDA 解放 → TCA9534 が ACK=LOW を返す
+  sdaHi();  // SDA 解放 → スレーブが ACK=LOW を返す
   sclHi();
   bool ack = (digitalRead(I2C_SDA) == LOW);
   sclLo();
   return ack;
+}
+
+static uint8_t i2cReadByte(bool sendAck) {
+  uint8_t b = 0;
+  sdaHi();
+  for (int i = 7; i >= 0; i--) {
+    sclHi();
+    b = (uint8_t)((b << 1) | (digitalRead(I2C_SDA) ? 1 : 0));
+    sclLo();
+  }
+  if (sendAck) sdaLo(); else sdaHi();
+  sclHi(); sclLo(); sdaHi();
+  return b;
 }
 
 static bool tca9534WriteReg(uint8_t reg, uint8_t val) {
@@ -207,6 +242,69 @@ static bool tca9534SetBit(uint8_t bit, uint8_t val) {
   return tca9534WriteReg(0x01, s_tca9534Out);
 }
 
+// ═══════════════════════════════════════
+// ▼ DS3231 RTC (ビットバン I2C 共用)
+// ═══════════════════════════════════════
+
+static uint8_t bcdToDec(uint8_t b) { return (uint8_t)((b >> 4) * 10 + (b & 0x0F)); }
+static uint8_t decToBcd(uint8_t d) { return (uint8_t)(((d / 10) << 4) | (d % 10)); }
+
+static bool ds3231Read(uint16_t &Y, uint8_t &Mo, uint8_t &D,
+                        uint8_t &h, uint8_t &mi, uint8_t &s) {
+  i2cStart();
+  if (!i2cWriteByte((DS3231_ADDR << 1) | 0x00)) { i2cStop(); return false; }
+  if (!i2cWriteByte(0x00))                       { i2cStop(); return false; }
+  i2cStop();
+  i2cStart();
+  if (!i2cWriteByte((DS3231_ADDR << 1) | 0x01)) { i2cStop(); return false; }
+  s   = bcdToDec(i2cReadByte(true)  & 0x7F);
+  mi  = bcdToDec(i2cReadByte(true)  & 0x7F);
+  h   = bcdToDec(i2cReadByte(true)  & 0x3F);
+  (void)i2cReadByte(true);                       // 曜日スキップ
+  D   = bcdToDec(i2cReadByte(true)  & 0x3F);
+  Mo  = bcdToDec(i2cReadByte(true)  & 0x1F);
+  Y   = (uint16_t)(2000 + bcdToDec(i2cReadByte(false)));
+  i2cStop();
+  return (Mo >= 1 && Mo <= 12 && D >= 1 && D <= 31 && h <= 23 && mi <= 59 && s <= 59);
+}
+
+static bool ds3231Write(uint16_t Y, uint8_t Mo, uint8_t D,
+                         uint8_t h, uint8_t mi, uint8_t s) {
+  i2cStart();
+  if (!i2cWriteByte((DS3231_ADDR << 1) | 0x00)) { i2cStop(); return false; }
+  if (!i2cWriteByte(0x00))                       { i2cStop(); return false; }
+  i2cWriteByte(decToBcd(s));
+  i2cWriteByte(decToBcd(mi));
+  i2cWriteByte(decToBcd(h));
+  i2cWriteByte(0x01);
+  i2cWriteByte(decToBcd(D));
+  i2cWriteByte(decToBcd(Mo));
+  i2cWriteByte(decToBcd((uint8_t)(Y - 2000)));
+  i2cStop();
+  return true;
+}
+
+// ビルド時刻 (__DATE__ / __TIME__) を DS3231 に書き込む
+// SET_RTC_ON_BOOT=1 のときのみ呼ばれる
+static uint8_t parseMonth(const char *s) {
+  const char *m = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  for (uint8_t i = 0; i < 12; i++)
+    if (strncmp(s, m + i * 3, 3) == 0) return i + 1;
+  return 1;
+}
+
+static void setRtcFromCompileTime() {
+  // __DATE__ = "Jul  1 2026"  __TIME__ = "14:30:00"
+  uint8_t  mo = parseMonth(__DATE__);
+  uint8_t  d  = (uint8_t)atoi(__DATE__ + 4);
+  uint16_t y  = (uint16_t)atoi(__DATE__ + 7);
+  uint8_t  h  = (uint8_t)atoi(__TIME__);
+  uint8_t  mi = (uint8_t)atoi(__TIME__ + 3);
+  uint8_t  s  = (uint8_t)atoi(__TIME__ + 6);
+  Serial.printf("[DS3231] SET_RTC_ON_BOOT: %04u-%02u-%02u %02u:%02u:%02u\n", y, mo, d, h, mi, s);
+  Serial.println(ds3231Write(y, mo, d, h, mi, s) ? "[DS3231] write OK" : "[DS3231] write FAILED");
+}
+
 // ── SdFat CS オーバーライド ─────────────────
 // CS は tca9534Init() で P3=LOW に固定済み。
 // SdFat の CS 操作（sdCsWrite）は no-op とし、D9 ダミーピンへの操作を無視する。
@@ -230,39 +328,17 @@ static bool initSd() {
   pinMode(PIN_SD_CS_DUMMY, OUTPUT);
   digitalWrite(PIN_SD_CS_DUMMY, HIGH);
 
-  // 最大3回リトライ（電源不安定・接触不良対策）
-  for (int attempt = 1; attempt <= 3; attempt++) {
-    Serial.print("[SD] init attempt "); Serial.print(attempt); Serial.println("/3");
-
-    SdSpiConfig cfg(PIN_SD_CS_DUMMY, DEDICATED_SPI, SD_SCK_MHZ(SPI_SPEED_MHZ), &SD_SPI);
-    if (sd.begin(cfg)) {
-      Serial.print("[SD] init OK (4MHz)  capacity=");
-      Serial.print((uint32_t)(0.000512f * sd.card()->sectorCount()));
-      Serial.println("MB");
-      goto sd_init_done;
-    }
-    Serial.print("[SD] 4MHz failed  err=0x");
+  SdSpiConfig cfg(PIN_SD_CS_DUMMY, DEDICATED_SPI, SD_SCK_MHZ(SPI_SPEED_MHZ), &SD_SPI);
+  if (!sd.begin(cfg)) {
+    Serial.print("[SD] init failed  err=0x");
     Serial.print(sd.card()->errorCode(), HEX);
     Serial.print("/0x");
     Serial.println(sd.card()->errorData(), HEX);
-
-    SdSpiConfig cfgSlow(PIN_SD_CS_DUMMY, DEDICATED_SPI, SD_SCK_MHZ(1), &SD_SPI);
-    if (sd.begin(cfgSlow)) {
-      Serial.println("[SD] init OK (1MHz fallback)");
-      goto sd_init_done;
-    }
-    Serial.print("[SD] 1MHz failed  err=0x");
-    Serial.print(sd.card()->errorCode(), HEX);
-    Serial.print("/0x");
-    Serial.println(sd.card()->errorData(), HEX);
-
-    if (attempt < 3) delay(500);  // リトライ前に待機
+    return false;
   }
-
-  Serial.println("[SD] init failed — カード未挿入 or 配線不良");
-  return false;
-
-  sd_init_done:
+  Serial.print("[SD] init OK  capacity=");
+  Serial.print((uint32_t)(0.000512f * sd.card()->sectorCount()));
+  Serial.println("MB");
 
   // ログファイル: 存在しなければヘッダ行を作成
   if (ENABLE_LOGGING && !sd.exists(LOG_FILE)) {
@@ -349,12 +425,18 @@ static void fromEpoch2000(uint32_t e,
 }
 
 // タイムスタンプ文字列を buf に書く
-//   時刻設定済み: "2026-07-01 14:30:00" (19 chars)
-//   未設定:       "00:01:37"            (8 chars, 起動からの経過時間)
+//   DS3231 読取成功:  "2026-07-01 14:30:00" (19 chars)
+//   millis フォールバック設定済み: 同上
+//   未設定:            "00:01:37"            (8 chars, 起動からの経過時間)
 static void getTimestamp(char *buf, size_t len) {
+  uint16_t Y; uint8_t Mo, D, h, mi, s;
+  if (ds3231Read(Y, Mo, D, h, mi, s)) {
+    snprintf(buf, len, "%04u-%02u-%02u %02u:%02u:%02u", Y, Mo, D, h, mi, s);
+    return;
+  }
+  // DS3231 読み取り失敗: millis() オフセットにフォールバック
   if (s_rtcSet) {
     uint32_t now = s_rtcBase + (millis() - s_rtcSetMs) / 1000;
-    uint16_t Y; uint8_t Mo, D, h, mi, s;
     fromEpoch2000(now, Y, Mo, D, h, mi, s);
     snprintf(buf, len, "%04u-%02u-%02u %02u:%02u:%02u", Y, Mo, D, h, mi, s);
   } else {
@@ -494,6 +576,7 @@ static void processCommand(const char *cmd) {
       s_rtcBase  = toEpoch2000(Y, Mo, D, h, mi, s);
       s_rtcSetMs = millis();
       s_rtcSet   = true;
+      Serial.println(ds3231Write(Y, Mo, D, h, mi, s) ? "[DS3231] set OK" : "[DS3231] set FAILED");
       char ts[24]; getTimestamp(ts, sizeof(ts));
       Serial.print("[TIME] "); Serial.println(ts);
     } else {
@@ -531,6 +614,21 @@ void setup() {
     Serial.println("[ERROR] TCA9534 init failed — I2C 配線を確認してください");
   } else {
     Serial.println("[TCA9534] OK  P2=HIGH(3V3_SW ON)  P3=LOW(CS assert)");
+  }
+
+  // DS3231 初期時刻設定 (SET_RTC_ON_BOOT=1 のときのみ)
+#if SET_RTC_ON_BOOT
+  setRtcFromCompileTime();
+#endif
+
+  // DS3231 時刻確認
+  {
+    uint16_t Y; uint8_t Mo, D, h, mi, s;
+    if (ds3231Read(Y, Mo, D, h, mi, s)) {
+      Serial.printf("[DS3231] %04u-%02u-%02u %02u:%02u:%02u\n", Y, Mo, D, h, mi, s);
+    } else {
+      Serial.println("[DS3231] 未接続 — t<YYYYMMDDHHMMSS> または SET_RTC_ON_BOOT=1 で時刻設定");
+    }
   }
 
   // SD カード初期化 (3V3_SW ON 後に呼ぶこと)
