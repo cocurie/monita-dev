@@ -339,8 +339,8 @@ static bool stepSendDummy() {
     return false;
   }
 
-  // ダミーペイロード（テスト用: 1台分の固定データ）
-  String params = "ts=TEST&sim=";
+  // ダミーペイロード（テスト用: 1台分の固定データ、タイムスタンプはDS3231から取得）
+  String params = "ts=" + getTimestamp() + "&sim=";
   params += SIM_NAME;
   params += "&n=1&m0=AA-BB-CC-DD-EE-FF&p0=DEADBEEF&r0=-70";
 
