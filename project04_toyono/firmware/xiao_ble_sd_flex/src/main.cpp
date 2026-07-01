@@ -123,8 +123,16 @@ static float calibRatioSum   = 0.0f;
 static int   calibMinHitsSum = 0;
 
 // シリアルコマンドバッファ
-static char cmdBuf[16];
+static char cmdBuf[16];  // 最大 t<YYYYMMDDHHMMSS> (15 chars) + null
 static int  cmdLen = 0;
+
+// 時刻 (tコマンドで設定; RTC なし・millis() オフセット方式)
+static uint32_t s_rtcBase  = 0;    // 2000-01-01 00:00:00 = 0 の秒値
+static uint32_t s_rtcSetMs = 0;    // 時刻設定時の millis()
+static bool     s_rtcSet   = false;
+
+// 前方宣言 (実装は eraseLog 以降の「時刻ユーティリティ」セクション)
+static void getTimestamp(char *buf, size_t len);
 
 // ═══════════════════════════════════════
 // ▼ TCA9534 ソフト I2C (Wire/TWIM 不使用)
@@ -260,7 +268,7 @@ static bool initSd() {
   if (ENABLE_LOGGING && !sd.exists(LOG_FILE)) {
     FsFile f = sd.open(LOG_FILE, O_WRITE | O_CREAT);
     if (f) {
-      f.println("timestamp,people,devices");
+      f.println("datetime,people,devices");
       f.close();
       Serial.println("[SD] /log.csv created");
     }
@@ -275,14 +283,10 @@ static void logRecord(int people, int devCount) {
   FsFile f = sd.open(LOG_FILE, O_WRITE | O_APPEND);
   if (!f) { Serial.println("[SD] open failed"); return; }
 
-  uint32_t s = millis() / 1000UL;
-  char ts[10];
-  snprintf(ts, sizeof(ts), "%02lu:%02lu:%02lu",
-           s / 3600, (s % 3600) / 60, s % 60);
+  char ts[24];
+  getTimestamp(ts, sizeof(ts));
 
-  f.print(ts);   f.print(",");
-  f.print(people); f.print(",");
-  f.println(devCount);
+  f.print(ts); f.print(","); f.print(people); f.print(","); f.println(devCount);
   f.close();
 }
 
@@ -309,14 +313,63 @@ static void eraseLog() {
 }
 
 // ═══════════════════════════════════════
+// ▼ 時刻ユーティリティ
+// ═══════════════════════════════════════
+
+static bool isLeapYear(uint16_t y) {
+  return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+}
+static uint8_t daysInMonth(uint8_t m, uint16_t y) {
+  const uint8_t d[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  return (m == 2 && isLeapYear(y)) ? 29 : d[m - 1];
+}
+
+// Y/Mo/D h:mi:s → 2000-01-01 起点の秒値
+static uint32_t toEpoch2000(uint16_t Y, uint8_t Mo, uint8_t D,
+                             uint8_t h, uint8_t mi, uint8_t s) {
+  uint32_t days = 0;
+  for (uint16_t y = 2000; y < Y; y++) days += isLeapYear(y) ? 366 : 365;
+  for (uint8_t m = 1; m < Mo; m++) days += daysInMonth(m, Y);
+  days += D - 1;
+  return days * 86400UL + h * 3600UL + mi * 60UL + s;
+}
+
+// 2000-01-01 起点の秒値 → Y/Mo/D h:mi:s
+static void fromEpoch2000(uint32_t e,
+                           uint16_t &Y, uint8_t &Mo, uint8_t &D,
+                           uint8_t &h, uint8_t &mi, uint8_t &s) {
+  s  = (uint8_t)(e % 60); e /= 60;
+  mi = (uint8_t)(e % 60); e /= 60;
+  h  = (uint8_t)(e % 24); e /= 24;
+  Y  = 2000;
+  while (true) { uint16_t dy = isLeapYear(Y) ? 366 : 365; if (e < dy) break; e -= dy; Y++; }
+  Mo = 1;
+  while (true) { uint8_t dm = daysInMonth(Mo, Y); if (e < dm) break; e -= dm; Mo++; }
+  D = (uint8_t)(e + 1);
+}
+
+// タイムスタンプ文字列を buf に書く
+//   時刻設定済み: "2026-07-01 14:30:00" (19 chars)
+//   未設定:       "00:01:37"            (8 chars, 起動からの経過時間)
+static void getTimestamp(char *buf, size_t len) {
+  if (s_rtcSet) {
+    uint32_t now = s_rtcBase + (millis() - s_rtcSetMs) / 1000;
+    uint16_t Y; uint8_t Mo, D, h, mi, s;
+    fromEpoch2000(now, Y, Mo, D, h, mi, s);
+    snprintf(buf, len, "%04u-%02u-%02u %02u:%02u:%02u", Y, Mo, D, h, mi, s);
+  } else {
+    uint32_t sec = millis() / 1000UL;
+    snprintf(buf, len, "%02lu:%02lu:%02lu", sec / 3600, (sec % 3600) / 60, sec % 60);
+  }
+}
+
+// ═══════════════════════════════════════
 // ▼ ユーティリティ
 // ═══════════════════════════════════════
 
 static void printTimestamp() {
-  uint32_t s = millis() / 1000UL;
-  char buf[10];
-  snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu",
-           s / 3600, (s % 3600) / 60, s % 60);
+  char buf[24];
+  getTimestamp(buf, sizeof(buf));
   Serial.print(buf);
 }
 
@@ -429,7 +482,25 @@ static void processCommand(const char *cmd) {
   }
   else if (cmd[0]=='r'||cmd[0]=='R') printCalibResult();
   else if (cmd[0]=='x'||cmd[0]=='X') { calibMode = false; Serial.println("[CALIB] exited"); }
-  else Serial.println("[CMD] d=dump  e=erase  c<N>=calib  r=result  x=exit");
+  else if (cmd[0]=='t'||cmd[0]=='T') {
+    if (strlen(cmd) == 15) {
+      char tmp[5];
+      strncpy(tmp, cmd+1,  4); tmp[4] = '\0'; uint16_t Y  = (uint16_t)atoi(tmp);
+      strncpy(tmp, cmd+5,  2); tmp[2] = '\0'; uint8_t  Mo = (uint8_t)atoi(tmp);
+      strncpy(tmp, cmd+7,  2); tmp[2] = '\0'; uint8_t  D  = (uint8_t)atoi(tmp);
+      strncpy(tmp, cmd+9,  2); tmp[2] = '\0'; uint8_t  h  = (uint8_t)atoi(tmp);
+      strncpy(tmp, cmd+11, 2); tmp[2] = '\0'; uint8_t  mi = (uint8_t)atoi(tmp);
+      strncpy(tmp, cmd+13, 2); tmp[2] = '\0'; uint8_t  s  = (uint8_t)atoi(tmp);
+      s_rtcBase  = toEpoch2000(Y, Mo, D, h, mi, s);
+      s_rtcSetMs = millis();
+      s_rtcSet   = true;
+      char ts[24]; getTimestamp(ts, sizeof(ts));
+      Serial.print("[TIME] "); Serial.println(ts);
+    } else {
+      Serial.println("[TIME] Usage: t<YYYYMMDDHHMMSS>  e.g. t20260701143000");
+    }
+  }
+  else Serial.println("[CMD] d=dump  e=erase  c<N>=calib  r=result  x=exit  t<YYYYMMDDHHMMSS>=settime");
 }
 
 static void handleSerial() {
@@ -452,7 +523,7 @@ void setup() {
   while (!Serial && millis() < 3000) yield();
 
   Serial.println("\n=== Toyono Park Monitor (Flex v3.04 / Phase-1: BLE+SD) ===");
-  Serial.println("    Commands: d=dump  e=erase  c<N>=calib  r=result  x=exit");
+  Serial.println("    Commands: d=dump  e=erase  c<N>=calib  r=result  x=exit  t<YYYYMMDDHHMMSS>=settime");
 
   // ソフト I2C 初期化 → TCA9534 (3V3_SW ON / SD CS=HIGH)
   i2cInit();
