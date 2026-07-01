@@ -2,31 +2,38 @@
  * Monita Gateway — テスト Step02: SD + LTE-M（SIM7080G / 1NCE）統合テスト
  *
  * MCU  : Seeed XIAO nRF52840
+ * RTC  : DS3231（D4=SDA、D5=SCL）— SD ファイルのタイムスタンプに使用
  * SD   : D3=CS、D8=SCK、D9=MISO、D10=MOSI（標準SDライブラリ）
  * LTE-M: M5Stamp SIM7080G（D6=TX→SIM RX、D7=RX←SIM TX、5V供給必須）
  * SIM  : 1NCE IoT SIM（APN: iot.1nce.net）
  *
  * テスト内容:
- *   Step1: SD 初期化
- *   Step2: SIM7080G AT 疎通確認
- *   Step3: LTE-M ネットワーク登録（1NCE）
- *   Step4: GAS へダミーデータを HTTP GET 送信
- *   Step5: 送信結果を SD へ CSV 保存
+ *   Step1: DS3231 初期化（失敗時はタイムスタンプを millis 基準に切り替え）
+ *   Step2: SD 初期化（DS3231 コールバック登録でファイル日時を正確に記録）
+ *   Step3: SIM7080G AT 疎通確認
+ *   Step4: LTE-M ネットワーク登録（1NCE）
+ *   Step5: GAS へダミーデータを HTTP GET 送信
+ *   Step6: 送信結果を SD へ CSV 保存・読み返し
  *
  * 配線:
- *   XIAO D6 (TX) → SIM7080G RX
- *   XIAO D7 (RX) ← SIM7080G TX
- *   XIAO 5V      → SIM7080G 5V    ← 必須（3.3V では起動しない）
- *   XIAO GND     → SIM7080G GND
- *   SD CS        → XIAO D3
- *   SD CLK       → XIAO D8 (SCK)
- *   SD DAT0      → XIAO D9 (MISO)
- *   SD CMD       → XIAO D10 (MOSI)
- *   SD VDD       → XIAO 3V3
+ *   XIAO D4 (SDA) → DS3231 SDA
+ *   XIAO D5 (SCL) → DS3231 SCL
+ *   XIAO 3V3      → DS3231 VCC
+ *   XIAO D6 (TX)  → SIM7080G RX
+ *   XIAO D7 (RX)  ← SIM7080G TX
+ *   XIAO 5V       → SIM7080G 5V    ← 必須（3.3V では起動しない）
+ *   XIAO GND      → SIM7080G GND / DS3231 GND
+ *   SD CS         → XIAO D3
+ *   SD CLK        → XIAO D8 (SCK)
+ *   SD DAT0       → XIAO D9 (MISO)
+ *   SD CMD        → XIAO D10 (MOSI)
+ *   SD VDD        → XIAO 3V3
  */
 
 #include <Arduino.h>
 #include <Adafruit_TinyUSB.h>
+#include <Wire.h>
+#include <RTClib.h>
 #include <SPI.h>
 #include <SD.h>
 
@@ -53,6 +60,30 @@ const char* SIM_NAME = "1NCE";
 // ══════════════════════════════════════════════
 static bool sdAvailable  = false;
 static bool netAvailable = false;
+static bool rtcAvailable = false;
+static RTC_DS3231 rtc;
+
+// ══════════════════════════════════════════════
+// ▼ RTC タイムスタンプ
+// ══════════════════════════════════════════════
+
+// SDライブラリがファイル作成・更新時に呼ぶコールバック
+// これを登録することでFATのファイル日時がRTCの実時刻になる
+void sdDateTimeCallback(uint16_t* date, uint16_t* time) {
+  DateTime now = rtcAvailable ? rtc.now() : DateTime(2000, 1, 1, 0, 0, 0);
+  *date = FAT_DATE(now.year(), now.month(), now.day());
+  *time = FAT_TIME(now.hour(), now.minute(), now.second());
+}
+
+String getTimestamp() {
+  if (!rtcAvailable) return String(millis() / 1000UL) + "s";
+  DateTime now = rtc.now();
+  char buf[20];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d",
+           now.year(), now.month(), now.day(),
+           now.hour(), now.minute(), now.second());
+  return String(buf);
+}
 
 // ══════════════════════════════════════════════
 // ▼ ユーティリティ
@@ -64,11 +95,11 @@ static void printSeparator(const char* title) {
   Serial.println(F(" ==="));
 }
 
-// SD へ1行追記（sdAvailable が false のときは何もしない）
+// SD へ1行追記（タイムスタンプ付き）
 static void sdAppend(const String& line) {
   if (!sdAvailable) return;
   File f = SD.open(LOG_FILE, FILE_WRITE);
-  if (f) { f.println(line); f.close(); }
+  if (f) { f.println(getTimestamp() + "," + line); f.close(); }
 }
 
 // ══════════════════════════════════════════════
@@ -89,10 +120,35 @@ static String sendAT(const String& cmd, int waitMs = 5000) {
 }
 
 // ══════════════════════════════════════════════
-// ▼ Step1: SD 初期化
+// ▼ Step1: DS3231 初期化
+// ══════════════════════════════════════════════
+static void stepRTCInit() {
+  printSeparator("Step1: DS3231 初期化");
+
+  if (!rtc.begin()) {
+    Serial.println(F("[WARN] DS3231 が見つかりません（D4=SDA / D5=SCL を確認）"));
+    Serial.println(F("  → タイムスタンプは millis 基準で続行"));
+    return;
+  }
+  rtcAvailable = true;
+
+  if (rtc.lostPower()) {
+    Serial.println(F("[WARN] RTC が電源喪失 → ビルド時刻でセット"));
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+
+  Serial.println(F("[OK] DS3231 初期化完了"));
+  Serial.print(F("  現在時刻: ")); Serial.println(getTimestamp());
+}
+
+// ══════════════════════════════════════════════
+// ▼ Step2: SD 初期化
 // ══════════════════════════════════════════════
 static bool stepSDInit() {
-  printSeparator("Step1: SD 初期化");
+  printSeparator("Step2: SD 初期化");
+
+  // RTCコールバックを登録（SD.begin より前に必須）
+  SdFile::dateTimeCallback(sdDateTimeCallback);
 
   if (!SD.begin(PIN_SD_CS)) {
     Serial.println(F("[FAIL] SD.begin() failed"));
@@ -105,17 +161,17 @@ static bool stepSDInit() {
   // ヘッダ行がなければ書く
   if (!SD.exists(LOG_FILE)) {
     File f = SD.open(LOG_FILE, FILE_WRITE);
-    if (f) { f.println(F("step,result,detail")); f.close(); }
+    if (f) { f.println(F("timestamp,step,result,detail")); f.close(); }
   }
-  sdAppend("step1,OK,SD init");
+  sdAppend("step2,OK,SD init");
   return true;
 }
 
 // ══════════════════════════════════════════════
-// ▼ Step2: SIM7080G 起動・AT 疎通
+// ▼ Step3: SIM7080G 起動・AT 疎通
 // ══════════════════════════════════════════════
 static bool stepModemInit() {
-  printSeparator("Step2: SIM7080G 起動・AT 疎通");
+  printSeparator("Step3: SIM7080G 起動・AT 疎通");
 
   Serial1.setPins(7, 6);   // RX=D7, TX=D6
   Serial1.begin(115200);
@@ -147,7 +203,7 @@ static bool stepModemInit() {
     Serial.println(F("[FAIL] AT 疎通失敗"));
     Serial.println(F("  → D6(TX)→SIM RX / D7(RX)←SIM TX の配線を確認"));
     Serial.println(F("  → SIM7080G に 5V が供給されているか確認"));
-    sdAppend("step2,FAIL,AT no response");
+    sdAppend("step3,FAIL,AT no response");
     return false;
   }
   Serial.println(F("[OK] AT 疎通確認"));
@@ -169,7 +225,7 @@ static bool stepModemInit() {
   }
   if (!atOk2) {
     Serial.println(F("[FAIL] リセット後の AT 疎通失敗"));
-    sdAppend("step2,FAIL,AT lost after reset");
+    sdAppend("step3,FAIL,AT lost after reset");
     return false;
   }
 
@@ -179,20 +235,20 @@ static bool stepModemInit() {
   if (cpin.indexOf("READY") < 0) {
     Serial.println(F("[FAIL] SIM カード未認識 (CPIN≠READY)"));
     Serial.println(F("  → SIM カードが正しく挿さっているか確認"));
-    sdAppend("step2,FAIL,SIM not ready");
+    sdAppend("step3,FAIL,SIM not ready");
     return false;
   }
 
   Serial.println(F("[OK] SIM 認識完了"));
-  sdAppend("step2,OK,modem+SIM ready");
+  sdAppend("step3,OK,modem+SIM ready");
   return true;
 }
 
 // ══════════════════════════════════════════════
-// ▼ Step3: LTE-M ネットワーク登録（1NCE）
+// ▼ Step4: LTE-M ネットワーク登録（1NCE）
 // ══════════════════════════════════════════════
 static bool stepNetwork() {
-  printSeparator("Step3: LTE-M ネットワーク登録 (1NCE)");
+  printSeparator("Step4: LTE-M ネットワーク登録 (1NCE)");
 
   // バンド全開放・LTE-M 設定・APN
   sendAT("AT+CREG=0", 2000); delay(200);
@@ -227,7 +283,7 @@ static bool stepNetwork() {
     Serial.println(F("[FAIL] ネットワーク登録失敗"));
     Serial.println(F("  → アンテナが接続されているか確認"));
     Serial.println(F("  → 1NCE ポータル(sim.1nce.net)で SIM が Active か確認"));
-    sdAppend("step3,FAIL,CREG timeout");
+    sdAppend("step4,FAIL,CREG timeout");
     return false;
   }
   Serial.println(F("[OK] ネットワーク登録完了"));
@@ -252,7 +308,7 @@ static bool stepNetwork() {
 
   if (!attachOk) {
     Serial.println(F("[FAIL] データ Attach 失敗（CGATT≠1）"));
-    sdAppend("step3,FAIL,CGATT timeout");
+    sdAppend("step4,FAIL,CGATT timeout");
     return false;
   }
   Serial.println(F("[OK] データ Attach 完了"));
@@ -262,24 +318,24 @@ static bool stepNetwork() {
   String cnact = sendAT("AT+CNACT?", 3000);
   if (cnact.indexOf("0,1") < 0) {
     Serial.println(F("[FAIL] IP アドレス取得失敗（CNACT）"));
-    sdAppend("step3,FAIL,CNACT no IP");
+    sdAppend("step4,FAIL,CNACT no IP");
     return false;
   }
   Serial.println(F("[OK] IP アドレス取得完了"));
-  sdAppend("step3,OK,network ready");
+  sdAppend("step4,OK,network ready");
   netAvailable = true;
   return true;
 }
 
 // ══════════════════════════════════════════════
-// ▼ Step4: GAS へダミーデータを HTTP GET 送信
+// ▼ Step5: GAS へダミーデータを HTTP GET 送信
 // ══════════════════════════════════════════════
 static bool stepSendDummy() {
-  printSeparator("Step4: GAS ダミーデータ送信");
+  printSeparator("Step5: GAS ダミーデータ送信");
 
   if (!netAvailable) {
     Serial.println(F("[SKIP] ネットワーク未接続のためスキップ"));
-    sdAppend("step4,SKIP,no network");
+    sdAppend("step5,SKIP,no network");
     return false;
   }
 
@@ -309,7 +365,7 @@ static bool stepSendDummy() {
   String conn = sendAT("AT+SHCONN", 15000);
   if (conn.indexOf("OK") < 0) {
     Serial.println(F("[FAIL] HTTPS 接続失敗"));
-    sdAppend("step4,FAIL,SHCONN failed");
+    sdAppend("step5,FAIL,SHCONN failed");
     return false;
   }
 
@@ -332,19 +388,19 @@ static bool stepSendDummy() {
   if (ok) {
     Serial.println(F("[OK] GAS 送信成功"));
     Serial.println(F("  → スプレッドシートに TEST 行が追加されているか確認してください"));
-    sdAppend("step4,OK,status=" + String(statusCode));
+    sdAppend("step5,OK,status=" + String(statusCode));
   } else {
     Serial.print(F("[FAIL] 予期しないレスポンス: ")); Serial.println(statusCode);
-    sdAppend("step4,FAIL,status=" + String(statusCode));
+    sdAppend("step5,FAIL,status=" + String(statusCode));
   }
   return ok;
 }
 
 // ══════════════════════════════════════════════
-// ▼ Step5: SD ログ確認（書き込んだ内容を読み返し）
+// ▼ Step6: SD ログ確認（書き込んだ内容を読み返し）
 // ══════════════════════════════════════════════
 static void stepReadLog() {
-  printSeparator("Step5: SD ログ読み返し");
+  printSeparator("Step6: SD ログ読み返し");
 
   if (!sdAvailable) {
     Serial.println(F("[SKIP] SD 未初期化"));
@@ -378,16 +434,17 @@ void setup() {
   Serial.print(F("  APN: ")); Serial.println(APN);
   Serial.println(F("============================================="));
 
+  stepRTCInit();    // 失敗しても後続は続ける（millis 基準で続行）
   stepSDInit();     // 失敗しても後続は続ける（SD なしで続行）
 
   if (!stepModemInit()) {
-    Serial.println(F("\n[ABORT] Step2 失敗 — モデム/SIM を確認してください"));
+    Serial.println(F("\n[ABORT] Step3 失敗 — モデム/SIM を確認してください"));
     stepReadLog();
     return;
   }
 
   if (!stepNetwork()) {
-    Serial.println(F("\n[ABORT] Step3 失敗 — ネットワーク接続できませんでした"));
+    Serial.println(F("\n[ABORT] Step4 失敗 — ネットワーク接続できませんでした"));
     stepReadLog();
     return;
   }
