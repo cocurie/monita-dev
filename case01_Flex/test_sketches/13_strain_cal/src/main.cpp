@@ -1,5 +1,5 @@
 /**
- * Monita Flex v3.02 — 検証 Step13: HX711 4ch ひずみ確認（初期版）
+ * Monita Flex v3.03 — 検証 Step13: HX711 4ch ひずみ確認 / ゲージファクター計測
  *
  * 目的:
  *   HX711 の raw 値をそのままシリアルに出して、
@@ -14,10 +14,11 @@
  *   === 計測 #1 ===
  *   [CH1] raw:   -5046342  strain:       0
  *
- * 配線（Flex v3.02 基板）:
+ * 配線（Flex v3.03 基板）:
  *   HX711 SCK: D6 / DOUT: D7（SN74LV4052 MUX 経由）
- *   TCA9534: I2C 0x20（MUX A/B 制御）
+ *   TCA9534: I2C 0x20（MUX A/B 制御、P0=B, P1=A）
  *   SW_POWER: D10（3V3_SW）
+ *   ※ v3.02 と同じピン配置
  */
 
 #include <Arduino.h>
@@ -128,7 +129,7 @@ void setup() {
 
   Wire.begin();
 
-  Serial.println(F("\n[STEP13] HX711 4ch ひずみ確認 (Monita Flex v3.02)"));
+  Serial.println(F("\n[STEP13] HX711 4ch ゲージファクター計測 (Monita Flex v3.03)"));
   Serial.print(F("STRAIN_SCALE = ")); Serial.println(STRAIN_SCALE);
   Serial.print(F("ZERO_RAW     = ")); Serial.println(ZERO_RAW);
   Serial.print(F("HX711_GAIN   = ")); Serial.println(HX711_GAIN);
