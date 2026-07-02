@@ -80,7 +80,7 @@
 // ── DS3231 初期時刻設定 ───────────────
 // 1 にしてフラッシュするとビルド時刻を DS3231 に書き込む。
 // 設定後は 0 に戻して再フラッシュすること（毎回上書きを防ぐため）。
-#define SET_RTC_ON_BOOT  0
+#define SET_RTC_ON_BOOT  1
 
 // ── SD カード SPI ピン (v3.04) ─────────
 #define PIN_SD_MISO       D2   // P0.28
@@ -324,6 +324,21 @@ void sdCsWrite(SdCsPin_t pin, bool lvl) { (void)pin; (void)lvl; }
  */
 static bool initSd() {
   delay(2000);  // 3V3_SW 安定待ち (500ms では不安定なため 2000ms に延長)
+
+  // ── SD カード SPI モード移行シーケンス ──────────────────────
+  // SD 仕様: 電源投入後、CS=HIGH のまま 74 クロック以上送ること。
+  // 本基板は TCA9534 P3 が CS を制御するため、SdFat の CS 操作は
+  // ダミーピン(D9)に逃がしており実 CS は常時 LOW のまま。
+  // そのため、ここで手動で CS=HIGH → 80 クロック → CS=LOW を実施する。
+  tca9534SetBit(3, 1);  // P3=HIGH (CS 一時デアサート)
+  delay(5);
+  SD_SPI.begin();
+  SD_SPI.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
+  for (int i = 0; i < 10; i++) SD_SPI.transfer(0xFF);  // 80 クロック
+  SD_SPI.endTransaction();
+  tca9534SetBit(3, 0);  // P3=LOW (CS アサート・以降固定)
+  delay(5);
+  // ────────────────────────────────────────────────────────────
 
   pinMode(PIN_SD_CS_DUMMY, OUTPUT);
   digitalWrite(PIN_SD_CS_DUMMY, HIGH);
