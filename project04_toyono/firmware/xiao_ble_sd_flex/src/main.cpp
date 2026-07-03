@@ -625,6 +625,9 @@ void setup() {
     Serial.println("[TCA9534] OK  P2=HIGH(3V3_SW ON)  P3=LOW(CS assert)");
   }
 
+  // SD カード初期化 (3V3_SW ON 後に呼ぶこと / DS3231 より先に実行)
+  s_sdReady = initSd();
+
   // DS3231 初期時刻設定 (SET_RTC_ON_BOOT=1 のときのみ)
 #if SET_RTC_ON_BOOT
   setRtcFromCompileTime();
@@ -639,9 +642,6 @@ void setup() {
       Serial.println("[DS3231] 未接続 — t<YYYYMMDDHHMMSS> または SET_RTC_ON_BOOT=1 で時刻設定");
     }
   }
-
-  // SD カード初期化 (3V3_SW ON 後に呼ぶこと)
-  s_sdReady = initSd();
 
   // LED
   pinMode(LED_BLUE, OUTPUT);
