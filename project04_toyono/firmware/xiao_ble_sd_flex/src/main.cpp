@@ -80,7 +80,7 @@
 // ── DS3231 初期時刻設定 ───────────────
 // 1 にしてフラッシュするとビルド時刻を DS3231 に書き込む。
 // 設定後は 0 に戻して再フラッシュすること（毎回上書きを防ぐため）。
-#define SET_RTC_ON_BOOT  0
+#define SET_RTC_ON_BOOT  1
 
 // ── SD カード SPI ピン (v3.04) ─────────
 #define PIN_SD_MISO       D2   // P0.28
@@ -118,7 +118,9 @@ static uint32_t const LED_BLINK_MS = 1000;
 // ═══════════════════════════════════════
 
 // SPI / SD
-static SPIClass SD_SPI(NRF_SPIM1, PIN_SD_MISO, PIN_SD_SCK, PIN_SD_MOSI);
+// SPIM2 を使用: BSP で ENABLED かつ デフォルト SPI1 (SPIM3 はデフォルト SPI が使用)
+// SPIM0/SPIM1 は NRFX_SPIM0/1_ENABLED=0 で無効 → 使用不可
+static SPIClass SD_SPI(NRF_SPIM2, PIN_SD_MISO, PIN_SD_SCK, PIN_SD_MOSI);
 static SdFat    sd;
 
 // BLE デバイス保持
@@ -323,13 +325,34 @@ void sdCsWrite(SdCsPin_t pin, bool lvl) { (void)pin; (void)lvl; }
  * そのまま TCA9534 P3 のアサート/デアサートとして機能する。
  */
 static bool initSd() {
-  delay(2000);  // 3V3_SW 安定待ち (500ms では不安定なため 2000ms に延長)
+  // setup() の tca9534Init() で電源投入済み（電源の追加リサイクルはしない
+  // — debug ファームで動作実績のある「cmd1(1回のみ電源投入)→cmd6(sd.begin)」
+  // と同一の最小シーケンスに合わせる）。
+  // MISO が HIGH になる（native 初期化完了 = DAT0 解放）まで最大 3 秒待つ。
+  pinMode(PIN_SD_MISO, INPUT_PULLUP);
+  {
+    uint32_t t0 = millis();
+    while (!digitalRead(PIN_SD_MISO) && millis() - t0 < 3000) delay(10);
+    uint32_t elapsed = millis() - t0;
+    Serial.print("[SD] MISO="); Serial.print(digitalRead(PIN_SD_MISO) ? "HIGH(OK)" : "LOW(still!)");
+    Serial.print("  after "); Serial.print(elapsed); Serial.println("ms");
+  }
+  // debug ファーム cmd6 と同じく、CS assert (tca9534Init 内で実施済み) から
+  // sd.begin() までに 500ms 置く。この待機がないと cold boot で init に失敗する。
+  delay(500);
 
   pinMode(PIN_SD_CS_DUMMY, OUTPUT);
   digitalWrite(PIN_SD_CS_DUMMY, HIGH);
 
   // 最大3回リトライ（電源安定待ち不足の場合に備える）
+  // cold boot 直後は setup() 側の tca9534Init() 一発目が ACK は返すものの
+  // レジスタが正しくラッチされないことがあるため、各リトライ前に必ず
+  // tca9534Init() をやり直して P2/P3 を再アサートしてから sd.begin() する。
+  // (debug ファームで実証済み: sd.begin() の単純リトライだけでは直らないが
+  //  tca9534Init() の再実行を挟むと直る)
   for (int attempt = 1; attempt <= 3; attempt++) {
+    tca9534Init();
+    delay(10);
     SdSpiConfig cfg(PIN_SD_CS_DUMMY, DEDICATED_SPI, SD_SCK_MHZ(SPI_SPEED_MHZ), &SD_SPI);
     if (sd.begin(cfg)) {
       Serial.print("[SD] init OK  capacity=");
@@ -624,6 +647,12 @@ void setup() {
   } else {
     Serial.println("[TCA9534] OK  P2=HIGH(3V3_SW ON)  P3=LOW(CS assert)");
   }
+
+  // SCK=LOW, MOSI=HIGH (CMD=HIGH) を確立してから SD に電源を入れる。
+  // D10(SCK) は BSP のデフォルト SPI MOSI ピンと共用のため、
+  // floating のままだと SD の CLK ラインにノイズが入り native 初期化が完了しない。
+  pinMode(PIN_SD_SCK,  OUTPUT); digitalWrite(PIN_SD_SCK,  LOW);
+  pinMode(PIN_SD_MOSI, OUTPUT); digitalWrite(PIN_SD_MOSI, HIGH);
 
   // SD カード初期化 (3V3_SW ON 後に呼ぶこと / DS3231 より先に実行)
   s_sdReady = initSd();
