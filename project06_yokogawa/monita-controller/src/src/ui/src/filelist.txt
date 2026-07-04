@@ -1,12 +1,7 @@
-ui_Screen1.c
-ui_Screen2.c
-ui_Screen3.c
-ui_Screen4.c
-ui_Screen5.c
-ui_Screen6.c
-ui_Screen8.c
+screens/ui_Initial.c
+screens/ui_DviceList.c
 ui.c
-ui_comp_hook.c
+components/ui_comp_hook.c
 ui_helpers.c
 ui_events.c
-ui_img_332829496.c
+images/ui_img_1409038844.c

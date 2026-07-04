@@ -24,6 +24,7 @@
  */
 
 #include <Arduino.h>
+#include <NimBLEDevice.h>
 
 // ============================================================
 // アプリ設定
@@ -50,6 +51,101 @@
 static int g_sleep_minutes = DEFAULT_SLEEP_MIN;
 
 // ============================================================
+// BLE (Nordic UART Service) — MonitaControllerからの設定変更受信
+// ============================================================
+// AVLファーム(AVL-controller)と同一のNUS UUIDを使用。
+// RX: コントローラー→本機（Write）, TX: 本機→コントローラー（Notify）
+static BLEUUID serviceUUID("6e400001-b5a3-f393-e0a9-e50e24dcca9e");
+static BLEUUID charUUID_RX("6e400002-b5a3-f393-e0a9-e50e24dcca9e");
+static BLEUUID charUUID_TX("6e400003-b5a3-f393-e0a9-e50e24dcca9e");
+
+static NimBLECharacteristic* pTxCharacteristic = nullptr;
+static bool g_ble_connected = false;
+
+static void notifyReply(const String& msg) {
+  if (pTxCharacteristic == nullptr || !g_ble_connected) return;
+  pTxCharacteristic->setValue((uint8_t*)msg.c_str(), msg.length());
+  pTxCharacteristic->notify();
+#if DEBUG_MODE
+  Serial.print("[BLE] notify: ");
+  Serial.println(msg);
+#endif
+}
+
+// "SLP:N" / "TARE" / "GET" を解釈して応答する
+static void handleCommand(const String& raw) {
+  String cmd = raw;
+  cmd.trim();
+#if DEBUG_MODE
+  Serial.print("[BLE] recv: ");
+  Serial.println(cmd);
+#endif
+
+  if (cmd.startsWith("SLP:")) {
+    int n = cmd.substring(4).toInt();
+    if (n > 0) {
+      g_sleep_minutes = n;
+      notifyReply("OK:SLP=" + String(g_sleep_minutes));
+    } else {
+      notifyReply("ERR:SLP");
+    }
+  } else if (cmd == "TARE") {
+    // TODO: 実HX711接続後、全CHのtare処理を実装
+    notifyReply("OK:TARE");
+  } else if (cmd == "GET") {
+    notifyReply("SLEEP=" + String(g_sleep_minutes));
+  } else {
+    notifyReply("ERR:UNKNOWN");
+  }
+}
+
+class MonitaServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* pServer) override {
+    g_ble_connected = true;
+    Serial.println("[BLE] Controller connected");
+  }
+  void onDisconnect(NimBLEServer* pServer) override {
+    g_ble_connected = false;
+    Serial.println("[BLE] Controller disconnected -> re-advertise");
+    NimBLEDevice::startAdvertising();
+  }
+};
+
+class MonitaRxCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* pCharacteristic) override {
+    std::string value = pCharacteristic->getValue();
+    if (value.empty()) return;
+    handleCommand(String(value.c_str()));
+  }
+};
+
+static void setupBLE() {
+  NimBLEDevice::init("MonitaFlex");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+
+  NimBLEServer* pServer = NimBLEDevice::createServer();
+  pServer->setCallbacks(new MonitaServerCallbacks());
+
+  NimBLEService* pService = pServer->createService(serviceUUID);
+
+  NimBLECharacteristic* pRxCharacteristic = pService->createCharacteristic(
+      charUUID_RX, NIMBLE_PROPERTY::WRITE);
+  pRxCharacteristic->setCallbacks(new MonitaRxCallbacks());
+
+  pTxCharacteristic = pService->createCharacteristic(
+      charUUID_TX, NIMBLE_PROPERTY::NOTIFY);
+
+  pService->start();
+
+  NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(serviceUUID);
+  pAdvertising->setScanResponse(true);
+  NimBLEDevice::startAdvertising();
+
+  Serial.println("[BLE] Advertising as \"MonitaFlex\"");
+}
+
+// ============================================================
 // setup / loop（今後ここに実装を追加していく）
 // ============================================================
 
@@ -60,7 +156,7 @@ void setup() {
   Serial.printf("Sleep interval: %d min\n", g_sleep_minutes);
 
   // TODO: NVSから設定値読み込み
-  // TODO: BLE NUSサーバー初期化
+  setupBLE();
   // TODO: HX711初期化
   // TODO: WiFi接続
 }
