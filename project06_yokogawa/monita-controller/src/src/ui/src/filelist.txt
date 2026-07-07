@@ -1,5 +1,6 @@
 screens/ui_Initial.c
 screens/ui_DviceList.c
+screens/ui_Measure.c
 ui.c
 components/ui_comp_hook.c
 ui_helpers.c

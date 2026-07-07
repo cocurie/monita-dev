@@ -11,6 +11,15 @@ void ble_scan_and_populate(void);
 // "Connect" ボタン: ui_Dropdown1 で選択中のデバイスへGATT接続
 void ble_connect_selected(void);
 
+// "Apply" ボタン: ui_Spinbox1 の値で "SLP:N" を送信
+void ble_apply_sleep(void);
+
+// "Tare" ボタン: "TARE" を送信
+void ble_tare(void);
+
+// "Disconnect" ボタン: BLE切断してInitial画面へ戻る
+void ble_disconnect(void);
+
 #ifdef __cplusplus
 } /*extern "C"*/
 #endif

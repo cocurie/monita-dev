@@ -18,6 +18,7 @@ extern "C" {
 ///////////////////// SCREENS ////////////////////
 #include "screens/ui_Initial.h"
 #include "screens/ui_DviceList.h"
+#include "screens/ui_Measure.h"
 
 ///////////////////// VARIABLES ////////////////////
 

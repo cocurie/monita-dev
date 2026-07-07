@@ -10,6 +10,14 @@
 
 #include <NimBLEDevice.h>
 #include <vector>
+#include <atomic>
+using std::atomic;
+
+// ===== 電源スイッチ (AVLファームと同一ハード: LTC2954プッシュボタン電源コントローラー) =====
+// PWボタン長押し(ハード側タイマー)で*INTがアサートされ、S_VP(IO36)がLOWになる。
+// 確認ダイアログ「はい」でSW_OFF(IO25)をLOW出力し*KILLをアサート、実電源を落とす。
+#define Sensor_VP 36
+#define sw_off    25
 
 // ===== 画面解像度 (AVLファーム踏襲: 320x240) =====
 static const uint16_t screenWidth  = 320;
@@ -296,14 +304,36 @@ class MonitaAdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     }
 };
 
+// LVGLはスレッドセーフではないため、NimBLEのコールバック(別タスク)から
+// ラベル更新する際は lv_async_call() でメインループ側に処理を委譲する。
+struct LabelUpdate { lv_obj_t* label; char* text; };
+
+static void apply_label_update(void* p) {
+    LabelUpdate* u = (LabelUpdate*)p;
+    if (u->label != nullptr && lv_obj_is_valid(u->label)) {
+        lv_label_set_text(u->label, u->text);
+    }
+    free(u->text);
+    delete u;
+}
+
+static void set_label_async(lv_obj_t* label, const String& text) {
+    LabelUpdate* u = new LabelUpdate();
+    u->label = label;
+    u->text = strdup(text.c_str());
+    lv_async_call(apply_label_update, u);
+}
+
 class MonitaClientCallbacks : public NimBLEClientCallbacks {
     void onConnect(NimBLEClient* pClient) override {
         bleConnected = true;
         Serial.println("[BLE] Connected to MonitaFlex");
+        set_label_async(ui_Label8, "BLE: Connected");
     }
     void onDisconnect(NimBLEClient* pClient) override {
         bleConnected = false;
         Serial.println("[BLE] Disconnected from MonitaFlex");
+        set_label_async(ui_Label8, "BLE: Disconnected");
     }
 };
 
@@ -311,6 +341,14 @@ static void bleNotifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData,
     String msg((char*)pData, length);
     Serial.print("[BLE] recv: ");
     Serial.println(msg);
+
+    set_label_async(ui_Label8, "Last: " + msg);
+
+    if (msg.startsWith("SLEEP=")) {
+        set_label_async(ui_Label4, "Sleep: " + msg.substring(6) + " min");
+    } else if (msg.startsWith("OK:SLP=")) {
+        set_label_async(ui_Label4, "Sleep: " + msg.substring(7) + " min");
+    }
 }
 
 extern "C" void ble_scan_and_populate(void) {
@@ -344,6 +382,14 @@ extern "C" void ble_scan_and_populate(void) {
 }
 
 extern "C" void ble_connect_selected(void) {
+    // すでに接続済みなら測定画面へ戻るだけ
+    if (pBleClient != nullptr && pBleClient->isConnected()) {
+        if (lv_scr_act() != ui_Measure) {
+            _ui_screen_change(&ui_Measure, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, &ui_Measure_screen_init);
+        }
+        return;
+    }
+
     char selected[64];
     lv_dropdown_get_selected_str(ui_Dropdown1, selected, sizeof(selected));
 
@@ -359,8 +405,6 @@ extern "C" void ble_connect_selected(void) {
     if (pBleClient == nullptr) {
         pBleClient = NimBLEDevice::createClient();
         pBleClient->setClientCallbacks(new MonitaClientCallbacks(), false);
-    } else if (pBleClient->isConnected()) {
-        pBleClient->disconnect();
     }
 
     Serial.printf("[BLE] Connecting to %s ...\n", selected);
@@ -383,6 +427,135 @@ extern "C" void ble_connect_selected(void) {
     }
 
     Serial.println("[BLE] Connected and subscribed");
+
+    _ui_screen_change(&ui_Measure, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, &ui_Measure_screen_init);
+
+    if (pRxCharacteristic != nullptr) {
+        pRxCharacteristic->writeValue("GET"); // 現在のスリープ間隔を取得
+    }
+}
+
+extern "C" void ble_apply_sleep(void) {
+    if (pBleClient == nullptr || !pBleClient->isConnected() || pRxCharacteristic == nullptr) {
+        Serial.println("[BLE] Not connected");
+        return;
+    }
+    int32_t n = lv_spinbox_get_value(ui_Spinbox1);
+    char cmd[16];
+    snprintf(cmd, sizeof(cmd), "SLP:%ld", (long)n);
+    Serial.printf("[BLE] send: %s\n", cmd);
+    pRxCharacteristic->writeValue(cmd);
+}
+
+extern "C" void ble_tare(void) {
+    if (pBleClient == nullptr || !pBleClient->isConnected() || pRxCharacteristic == nullptr) {
+        Serial.println("[BLE] Not connected");
+        return;
+    }
+    pRxCharacteristic->writeValue("TARE");
+}
+
+extern "C" void ble_disconnect(void) {
+    if (pBleClient != nullptr && pBleClient->isConnected()) {
+        pBleClient->disconnect();
+    }
+    if (lv_scr_act() != ui_Initial) {
+        _ui_screen_change(&ui_Initial, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, &ui_Initial_screen_init);
+    }
+}
+
+// ===== 電源OFF処理 (AVLファーム perform_safe_poweroff() を移植) =====
+static atomic<bool> g_poweroff_request{false};
+static atomic<bool> g_poweroff_in_progress{false};
+static bool g_sensor_vp_high = false;
+static lv_obj_t* g_poweroff_mbox = nullptr;
+
+// 電源OFFをブロックすべき状況があれば true を返す（今後、計測中フラグ等を追加）
+static inline bool monita_busy() {
+    return false;
+}
+
+static void show_measuring_block_dialog() {
+    static const char * btns[] = { "OK", "" };
+    lv_obj_t* mbox = lv_msgbox_create(NULL, "電源OFF不可", "動作中は電源を切れません。", btns, true);
+    lv_obj_center(mbox);
+    lv_obj_add_event_cb(mbox, [](lv_event_t * e){
+        lv_obj_t * m = lv_event_get_current_target(e);
+        lv_event_code_t code = lv_event_get_code(e);
+        if (code == LV_EVENT_VALUE_CHANGED || code == LV_EVENT_DELETE) {
+            lv_msgbox_close(m);
+        }
+    }, LV_EVENT_VALUE_CHANGED, NULL);
+}
+
+static void poweroff_mbox_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        lv_obj_t * mbox = lv_event_get_current_target(e);
+        const char * txt = lv_msgbox_get_active_btn_text(mbox);
+        if (txt != nullptr && strcmp(txt, "はい") == 0) {
+            if (monita_busy()) {
+                show_measuring_block_dialog();
+            } else {
+                g_poweroff_request = true;
+            }
+        }
+        lv_msgbox_close(mbox);
+    } else if (code == LV_EVENT_DELETE) {
+        g_poweroff_mbox = nullptr;
+        g_sensor_vp_high = false; // 次回また検出できるようにリセット
+    }
+}
+
+static void show_poweroff_dialog() {
+    if (g_poweroff_mbox != nullptr) return;
+
+    static const char * btns[] = { "はい", "いいえ", "" };
+    g_poweroff_mbox = lv_msgbox_create(NULL, "電源OFF", "電源を切りますか？", btns, true);
+    lv_obj_center(g_poweroff_mbox);
+    lv_obj_add_event_cb(g_poweroff_mbox, poweroff_mbox_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(g_poweroff_mbox, poweroff_mbox_event_cb, LV_EVENT_DELETE, NULL);
+}
+
+static void perform_safe_poweroff() {
+    if (g_poweroff_in_progress.exchange(true)) return;
+
+    Serial.println("[POW] start safe shutdown");
+
+    if (pBleClient && pBleClient->isConnected()) {
+        pBleClient->disconnect();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    Serial.println("[POW] power OFF");
+    pinMode(sw_off, OUTPUT);
+    digitalWrite(sw_off, LOW);
+}
+
+// ui_task相当（loop内）から毎回呼ぶ: 電源ボタン検出＋OFF要求の実行
+static void poweroff_poll() {
+    int raw = analogRead(Sensor_VP);
+    float voltage = (float)raw / 4095.0f * 3.1f;
+
+    if (voltage <= 1.4f) {
+        if (!g_sensor_vp_high) {
+            g_sensor_vp_high = true;
+            if (monita_busy()) {
+                show_measuring_block_dialog();
+            } else {
+                show_poweroff_dialog();
+            }
+        }
+    } else if (voltage >= 1.5f) {
+        g_sensor_vp_high = false;
+    }
+
+    if (g_poweroff_request.load() && !g_poweroff_in_progress.load()) {
+        g_poweroff_request = false;
+        perform_safe_poweroff();
+    }
 }
 
 void setup()
@@ -393,6 +566,10 @@ void setup()
     pinMode(XPT2046_CS, OUTPUT);
     digitalWrite(TFT_CS, HIGH);
     digitalWrite(XPT2046_CS, HIGH);
+
+    pinMode(Sensor_VP, INPUT);
+    analogReadResolution(12);
+    analogSetPinAttenuation(Sensor_VP, ADC_11db);
 
     SPI.begin(18, 19, 23);
 
@@ -439,5 +616,6 @@ void setup()
 void loop()
 {
     lv_timer_handler();
+    poweroff_poll();
     delay(5);
 }

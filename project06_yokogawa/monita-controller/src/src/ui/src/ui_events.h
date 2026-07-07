@@ -13,6 +13,9 @@ extern "C" {
 void on_scan_start_clicked(lv_event_t * e);
 void on_connect_clicked(lv_event_t * e);
 void on_rescan_clicked(lv_event_t * e);
+void on_apply_sleep_clicked(lv_event_t * e);
+void on_tare_clicked(lv_event_t * e);
+void on_disconnect_clicked(lv_event_t * e);
 
 #ifdef __cplusplus
 } /*extern "C"*/

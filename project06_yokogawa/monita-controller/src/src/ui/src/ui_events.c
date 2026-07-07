@@ -20,3 +20,18 @@ void on_rescan_clicked(lv_event_t * e)
 {
 	ble_scan_and_populate();
 }
+
+void on_apply_sleep_clicked(lv_event_t * e)
+{
+	ble_apply_sleep();
+}
+
+void on_tare_clicked(lv_event_t * e)
+{
+	ble_tare();
+}
+
+void on_disconnect_clicked(lv_event_t * e)
+{
+	ble_disconnect();
+}

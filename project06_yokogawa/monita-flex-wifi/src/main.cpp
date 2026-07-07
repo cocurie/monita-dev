@@ -44,11 +44,16 @@
 #define SW_POWER_PIN    10
 #define USER_BTN_PIN    0
 
+// XIAO ESP32-C3にはユーザー制御可能なオンボードLEDが無いため、
+// GATT疎通テスト用に外付けLED(+抵抗)を接続する想定のピン。
+#define TEST_LED_PIN    3   // D1
+
 // ============================================================
 // グローバル変数
 // ============================================================
 
 static int g_sleep_minutes = DEFAULT_SLEEP_MIN;
+static bool g_led_state = false;
 
 // ============================================================
 // BLE (Nordic UART Service) — MonitaControllerからの設定変更受信
@@ -94,6 +99,18 @@ static void handleCommand(const String& raw) {
     notifyReply("OK:TARE");
   } else if (cmd == "GET") {
     notifyReply("SLEEP=" + String(g_sleep_minutes));
+  } else if (cmd == "LED:ON") {
+    g_led_state = true;
+    digitalWrite(TEST_LED_PIN, HIGH);
+    notifyReply("OK:LED=ON");
+  } else if (cmd == "LED:OFF") {
+    g_led_state = false;
+    digitalWrite(TEST_LED_PIN, LOW);
+    notifyReply("OK:LED=OFF");
+  } else if (cmd == "LED:TOGGLE") {
+    g_led_state = !g_led_state;
+    digitalWrite(TEST_LED_PIN, g_led_state ? HIGH : LOW);
+    notifyReply(g_led_state ? "OK:LED=ON" : "OK:LED=OFF");
   } else {
     notifyReply("ERR:UNKNOWN");
   }
@@ -155,6 +172,9 @@ void setup() {
   Serial.println("=== Monita Flex WiFi — XIAO ESP32-C3 ===");
   Serial.printf("Sleep interval: %d min\n", g_sleep_minutes);
 
+  pinMode(TEST_LED_PIN, OUTPUT);
+  digitalWrite(TEST_LED_PIN, LOW);
+
   // TODO: NVSから設定値読み込み
   setupBLE();
   // TODO: HX711初期化
@@ -163,5 +183,13 @@ void setup() {
 
 void loop() {
   // TODO: 計測 → BLE/WiFi送信 → スリープ
-  delay(1000);
+
+  static uint32_t lastStatusMs = 0;
+  if (millis() - lastStatusMs > 5000) {
+    lastStatusMs = millis();
+    Serial.printf("[STATUS] connected=%s sleep=%dmin\n",
+                  g_ble_connected ? "yes" : "no", g_sleep_minutes);
+  }
+
+  delay(50);
 }
