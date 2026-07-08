@@ -52,6 +52,7 @@
 #include <nrf.h>
 #include <math.h>
 #include <string.h>
+#include <stdio.h>
 #include <Wire.h>
 // 重量センサ用 ADC ブリッジ
 #include <HX711.h>
@@ -82,7 +83,7 @@ using namespace Adafruit_LittleFS_Namespace;
 // BLE モード設定（COMM_MODE_BLE 時のみ有効）
 // ============================================================
 #ifdef COMM_MODE_BLE
-static const uint8_t  DEVICE_ID           = 0x01;  // 子機 ID（複数台時は変える: 0x01〜0xFF）
+static const uint8_t  DEVICE_ID           = 0x02;  // 子機 ID（複数台時は変える: 0x01〜0xFF）
 static const uint32_t MEASURE_INTERVAL_MIN = 20;   // 計測間隔（分）
 static const uint32_t ADV_DURATION_MIN     = 10;   // アドバタイズ継続時間（分）
 static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のときアドバタイズ
@@ -102,15 +103,12 @@ static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のとき
 #define BUTTON_LONG_PRESS_MS 5000UL  // D0 長押し閾値（ms）: 以上で tare、未満でリセット
 
 // ── DS3231 RTC 設定 ────────────────────────────────────────────
-// DS3231_SET_TIME=1 にすると起動時（setup）に以下の時刻を DS3231 に書き込む。
-// 書き込み後は必ず 0 に戻してビルドし直すこと（毎起動で時刻が上書きされるため）。
-#define DS3231_SET_TIME      0        // 1: 起動時に DS3231 へ時刻を書き込む。書き込み後は 0 に戻す
-#define DS3231_INIT_YEAR     2026     // 書き込む年（西暦 4 桁）
-#define DS3231_INIT_MONTH    6        // 書き込む月（1〜12）
-#define DS3231_INIT_DAY      16        // 書き込む日（1〜31）
-#define DS3231_INIT_HOUR     13       // 書き込む時（0〜23、24h 形式）
-#define DS3231_INIT_MIN      58        // 書き込む分（0〜59）
-#define DS3231_INIT_SEC      0        // 書き込む秒（0〜59）
+// 起動時に DS3231 の OSF（発振停止フラグ）を確認し、時刻が無効な場合
+// （バックアップ電池切れ・初回電源投入等）のみコンパイル時刻（__DATE__/__TIME__）
+// を自動書き込みする。時刻が有効な場合は上書きしない
+// （WDT リセット等で頻繁に再起動しても時刻が巻き戻らないようにするため）。
+// 手動で時刻を指定したい場合は DS3231_FORCE_SET_TIME を 1 にする（使用後は 0 に戻すこと）。
+#define DS3231_FORCE_SET_TIME 0
 
 // USE_DS3231_TIMESTAMP=1 にすると各サイクルで DS3231 の現在時刻を読み出し、
 // DEBUG_MODE=1 の場合はシリアルに出力する。
@@ -354,9 +352,34 @@ extern "C" void RTC2_IRQHandler(void) {
   }
 }
 
+// ============================================================
+// ウォッチドッグタイマー（nRF52840 内蔵 WDT）
+// 無人運用中にファーム（HX711/I2C 読み取り等）がハングした場合、
+// 自動リセットで復旧するための安全網。一度 START すると停止不可。
+//
+// スリープ中も WDT は動き続けるため、給餌は 2 箇所で行う:
+//   (1) loop() 先頭（起床直後）  → スリープ区間をカバー
+//   (2) deepSleep() 開始時       → 計測・アドバタイズ等の活動区間をカバー
+// これによりタイムアウトは「スリープ時間」「活動時間」の長い方だけを
+// 超える値であればよい（合計値をカバーする必要はない）。
+// ============================================================
+static uint32_t const WDT_TIMEOUT_MS = 25UL * 60UL * 1000UL;  // 25分（MEASURE_INTERVAL_MIN=20分, ADV_DURATION_MIN=10分に余裕を持たせた値）
+
+static void wdtInit(uint32_t timeoutMs) {
+  NRF_WDT->CONFIG  = (WDT_CONFIG_SLEEP_Run << WDT_CONFIG_SLEEP_Pos);  // スリープ中も継続動作
+  NRF_WDT->CRV     = (uint32_t)((uint64_t)timeoutMs * 32768ULL / 1000ULL);
+  NRF_WDT->RREN    = WDT_RREN_RR0_Msk;
+  NRF_WDT->TASKS_START = 1;
+}
+
+static inline void wdtFeed() {
+  NRF_WDT->RR[0] = WDT_RR_RR_Reload;
+}
+
 // 周辺（Sigfox・HX711 電源レール 3V3_SW）をオフにし、RTC2 で minutes 分待ってから復帰する。
 // 待機中は __WFI で CPU を止める（他割り込みで一時起床し得るが、フラグが立つまでループ継続）。
 static void deepSleep(uint32_t minutes) {
+  wdtFeed();  // これから始まる長時間スリープ区間の給餌
 
 #if DEBUG_MODE && DEBUG_NO_SLEEP
   Serial.println("[Sleep SKIPPED (DEBUG_NO_SLEEP)]");
@@ -817,10 +840,9 @@ struct Ds3231Time {
   uint16_t year;   // 西暦 4 桁（例: 2026）
 };
 
-// DS3231 に時刻を書き込む（DS3231_SET_TIME=1 のときのみ setup で呼ぶ）
+// DS3231 に時刻を書き込む
 // yr2: 西暦下 2 桁（2026 → 26）
-// __attribute__((unused)): DS3231_SET_TIME=0 のとき呼ばれないため警告抑制
-static bool __attribute__((unused)) ds3231SetTime(uint8_t yr2, uint8_t mo, uint8_t day,
+static bool ds3231SetTime(uint8_t yr2, uint8_t mo, uint8_t day,
                           uint8_t hr, uint8_t mn, uint8_t sc) {
   Wire.beginTransmission(DS3231_ADDR);
   Wire.write(0x00);            // レジスタ先頭（seconds）から書き始める
@@ -832,6 +854,48 @@ static bool __attribute__((unused)) ds3231SetTime(uint8_t yr2, uint8_t mo, uint8
   Wire.write(dec2bcd(mo));     // 0x05: month（century bit は 0）
   Wire.write(dec2bcd(yr2));    // 0x06: year（下 2 桁）
   return Wire.endTransmission() == 0;
+}
+
+// ステータスレジスタ 0x0F の OSF（発振停止フラグ, bit7）を読む。
+// 1 = 電源喪失等で時刻が無効（要再設定）、0 = 時刻は有効（連続動作中）
+static bool ds3231OscillatorStopped() {
+  Wire.beginTransmission(DS3231_ADDR);
+  Wire.write(0x0F);
+  if (Wire.endTransmission(false) != 0) return true;  // 読み取れない場合は安全側（無効扱い）
+  if (Wire.requestFrom(DS3231_ADDR, (uint8_t)1) < 1) return true;
+  uint8_t status = Wire.read();
+  return (status & 0x80) != 0;
+}
+
+// OSF をクリアする（時刻書き込み後に呼ぶ。0x0F の bit7 を 0 にする以外は保持）
+static void ds3231ClearOscillatorStopFlag() {
+  Wire.beginTransmission(DS3231_ADDR);
+  Wire.write(0x0F);
+  if (Wire.endTransmission(false) != 0) return;
+  if (Wire.requestFrom(DS3231_ADDR, (uint8_t)1) < 1) return;
+  uint8_t status = Wire.read();
+  Wire.beginTransmission(DS3231_ADDR);
+  Wire.write(0x0F);
+  Wire.write(status & (uint8_t)~0x80U);
+  Wire.endTransmission();
+}
+
+// __DATE__ ("Mmm dd yyyy") と __TIME__ ("hh:mm:ss") を解析してビルド時刻を得る。
+// コンパイル時に埋め込まれる定数文字列を実行時にパースするだけなので毎ビルドで自動更新される。
+static void getCompileTime(uint8_t &yr2, uint8_t &mo, uint8_t &day,
+                            uint8_t &hr, uint8_t &mn, uint8_t &sc) {
+  static const char monthNames[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  char monStr[4] = {0};
+  int  d, y, h, mi, s;
+  sscanf(__DATE__, "%3s %d %d", monStr, &d, &y);
+  sscanf(__TIME__, "%d:%d:%d", &h, &mi, &s);
+  int monthIdx = (strstr(monthNames, monStr) - monthNames) / 3;  // 0-11
+  yr2 = (uint8_t)(y % 100);
+  mo  = (uint8_t)(monthIdx + 1);
+  day = (uint8_t)d;
+  hr  = (uint8_t)h;
+  mn  = (uint8_t)mi;
+  sc  = (uint8_t)s;
 }
 
 // DS3231 から現在時刻を読み出す。成功時 true、I²C 失敗時 false
@@ -1095,6 +1159,7 @@ static String sendAT(String cmd, int waitMs = 2000) {
   String response = "";
 
   while (millis() - start < (unsigned long)waitMs) {
+    wdtFeed();  // 長時間の AT 応答待ちでもハング扱いされないよう給餌
     statusSigfoxBlinkTick();
     while (Serial1.available()) {
       char c = (char)Serial1.read();
@@ -1248,6 +1313,7 @@ static void bleAdvertise(uint8_t hour, uint8_t min_val) {
 // ============================================================
 
 void setup() {
+  wdtInit(WDT_TIMEOUT_MS);  // 無人運用の安全網。以降 25 分キックが無ければ自動リセット
 
   rgbHwBegin();
   rgbOff();
@@ -1295,29 +1361,25 @@ void setup() {
 
   s_errors = ERR_NONE;
 
-#if DS3231_SET_TIME
-  // ── DS3231 時刻書き込み ──────────────────────────────────────
-  // DS3231_SET_TIME=1 のときのみ実行。書き込み後は必ず 0 に戻してビルドし直すこと。
+  // ── DS3231 時刻自動設定 ──────────────────────────────────────
+  // OSF（発振停止フラグ）が立っている場合（バックアップ電池切れ・初回電源投入等で
+  // 時刻が無効な場合）のみ、コンパイル時刻を自動書き込みする。
+  // 時刻が有効な場合は上書きしない（WDT リセット等で頻繁に再起動しても
+  // 時刻が巻き戻らないようにするため）。
   {
-    uint8_t yr2 = (uint8_t)((DS3231_INIT_YEAR) % 100U);
-    bool ok = ds3231SetTime(yr2,
-                            (uint8_t)(DS3231_INIT_MONTH),
-                            (uint8_t)(DS3231_INIT_DAY),
-                            (uint8_t)(DS3231_INIT_HOUR),
-                            (uint8_t)(DS3231_INIT_MIN),
-                            (uint8_t)(DS3231_INIT_SEC));
+    bool needsSet = DS3231_FORCE_SET_TIME || ds3231OscillatorStopped();
+    if (needsSet) {
+      uint8_t yr2, mo, day, hr, mn, sc;
+      getCompileTime(yr2, mo, day, hr, mn, sc);
+      bool ok = ds3231SetTime(yr2, mo, day, hr, mn, sc);
+      if (ok) ds3231ClearOscillatorStopFlag();
 #if DEBUG_MODE
-    if (ok) {
-      Serial.println("[DS3231] time set OK");
-    } else {
-      Serial.println("[DS3231] time set FAILED");
-    }
+      Serial.print("[DS3231] 時刻が無効だったためビルド時刻を書き込み: ");
+      Serial.println(ok ? "OK" : "FAILED");
 #endif
-    if (!ok) {
-      s_errors |= ERR_DS3231_I2C;
+      if (!ok) s_errors |= ERR_DS3231_I2C;
     }
   }
-#endif  // DS3231_SET_TIME
 
   if (!tca9534Configure()) {
     s_errors |= ERR_TCA9534_I2C;
@@ -1359,6 +1421,7 @@ void setup() {
 }
 
 void loop() {
+  wdtFeed();  // 起床直後の給餌（スリープ区間ぶんをここでキック）
 
   statusIdleBlueDim();
   digitalWrite(SW_POWER_PIN, HIGH);  // 3V3_SW 再投入
@@ -1368,6 +1431,11 @@ void loop() {
   Serial1.setPins(SIGFOX_RX_PIN, SIGFOX_TX_PIN);
   Serial1.begin(SIGFOX_BAUD);
   delay(3000);  // BRKLSM100 再起動待ち
+#else
+  // BLE モードには Sigfox 起動待ちが無いため、電源投入直後の電圧安定化待ちが無かった。
+  // 4ch HX711 同時投入時の突入電流によるレール電圧降下が I2C(TCA9534) エラーの
+  // 原因になり得るため、Wire.begin() 前に安定化待ちを入れる。
+  delay(100);
 #endif
 
   Wire.begin();

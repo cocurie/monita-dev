@@ -32,7 +32,12 @@
  *   nRF52840 内蔵 RTC2 ＋ LFCLK。RTC1 は FreeRTOS 用のためアプリでは触らない。
  *
  * 【DS3231 時刻設定】
- *   DS3231_SET_TIME=1 にして書き込む → 起動時に下記定数を DS3231 へ書込 → 0 に戻して再ビルド。
+ *   OSF（発振停止フラグ）が立っている場合（電池切れ・初回投入等で時刻無効）のみ
+ *   起動時にビルド時刻を自動書込。有効なら上書きしない（WDT リセットで時刻が巻き戻らない）。
+ *   手動で強制設定したい場合のみ DS3231_FORCE_SET_TIME=1（使用後 0 に戻す）。
+ *
+ * 【ウォッチドッグ(WDT)】
+ *   無人運用中のハング自動復旧。25分キックが無ければ自動リセット（スリープ中も計時）。
  */
 
 /*
@@ -52,6 +57,7 @@
 #include <nrf.h>
 #include <math.h>
 #include <string.h>
+#include <stdio.h>   // getCompileTime() の sscanf 用
 // SD カード（SPIM2 使用。CS は TCA9534 P3 が能動駆動）
 #include <SPI.h>
 #include <SdFat.h>
@@ -100,15 +106,12 @@ static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のとき
 #define BUTTON_LONG_PRESS_MS 5000UL  // D0 長押し閾値（ms）: 以上で tare、未満でリセット
 
 // ── DS3231 RTC 設定 ────────────────────────────────────────────
-// DS3231_SET_TIME=1 にすると起動時（setup）に以下の時刻を DS3231 に書き込む。
-// 書き込み後は必ず 0 に戻してビルドし直すこと（毎起動で時刻が上書きされるため）。
-#define DS3231_SET_TIME      0        // 1: 起動時に DS3231 へ時刻を書き込む。書き込み後は 0 に戻す
-#define DS3231_INIT_YEAR     2026     // 書き込む年（西暦 4 桁）
-#define DS3231_INIT_MONTH    7        // 書き込む月（1〜12）
-#define DS3231_INIT_DAY      7        // 書き込む日（1〜31）
-#define DS3231_INIT_HOUR     14       // 書き込む時（0〜23、24h 形式）
-#define DS3231_INIT_MIN      0        // 書き込む分（0〜59）
-#define DS3231_INIT_SEC      0        // 書き込む秒（0〜59）
+// 起動時に DS3231 の OSF（発振停止フラグ）を確認し、時刻が無効な場合
+// （バックアップ電池切れ・初回電源投入等）のみコンパイル時刻（__DATE__/__TIME__）
+// を自動書き込みする。時刻が有効な場合は上書きしない
+// （WDT リセット等で頻繁に再起動しても時刻が巻き戻らないようにするため）。
+// 手動で時刻を指定したい場合は DS3231_FORCE_SET_TIME を 1 にする（使用後は 0 に戻すこと）。
+#define DS3231_FORCE_SET_TIME 0
 
 // USE_DS3231_TIMESTAMP=1 にすると各サイクルで DS3231 の現在時刻を読み出しログ出力する。
 #define USE_DS3231_TIMESTAMP 1        // 1: 各サイクルで時刻を読み出す
@@ -208,9 +211,11 @@ static void btnISR() {
   s_btnFlag = true;
 }
 
-// SD / DS3231 前方宣言
+// 前方宣言
 static bool tca9534Init();
 static void getTimestamp(char *buf, size_t len);
+static void wdtInit(uint32_t timeoutMs);
+static inline void wdtFeed();
 
 // ============================================================
 // ステータス LED（離散 RGB／または NeoPixel）
@@ -425,8 +430,8 @@ struct Ds3231Time {
   uint16_t year;   // 西暦 4 桁
 };
 
-// DS3231 に時刻を書き込む（DS3231_SET_TIME=1 のとき setup で呼ぶ）
-static bool __attribute__((unused)) ds3231SetTime(uint8_t yr2, uint8_t mo, uint8_t day,
+// DS3231 に時刻を書き込む。yr2: 西暦下 2 桁（2026 → 26）
+static bool ds3231SetTime(uint8_t yr2, uint8_t mo, uint8_t day,
                           uint8_t hr, uint8_t mn, uint8_t sc) {
   i2cStart();
   bool ok = i2cWriteByte((uint8_t)((DS3231_ADDR << 1) | 0x00));
@@ -440,6 +445,55 @@ static bool __attribute__((unused)) ds3231SetTime(uint8_t yr2, uint8_t mo, uint8
   ok &= i2cWriteByte(dec2bcd(yr2));   // 0x06
   i2cStop();
   return ok;
+}
+
+// ステータスレジスタ 0x0F の OSF（発振停止フラグ, bit7）を読む。
+// 1 = 電源喪失等で時刻が無効（要再設定）、0 = 時刻は有効（連続動作中）
+static bool ds3231OscillatorStopped() {
+  i2cStart();
+  if (!i2cWriteByte((uint8_t)((DS3231_ADDR << 1) | 0x00))) { i2cStop(); return true; }
+  if (!i2cWriteByte(0x0F))                                 { i2cStop(); return true; }
+  i2cStop();
+  i2cStart();
+  if (!i2cWriteByte((uint8_t)((DS3231_ADDR << 1) | 0x01))) { i2cStop(); return true; }
+  uint8_t status = i2cReadByte(false);
+  i2cStop();
+  return (status & 0x80) != 0;
+}
+
+// OSF をクリアする（時刻書き込み後に呼ぶ。0x0F の bit7 を 0 にする以外は保持）
+static void ds3231ClearOscillatorStopFlag() {
+  i2cStart();
+  if (!i2cWriteByte((uint8_t)((DS3231_ADDR << 1) | 0x00))) { i2cStop(); return; }
+  if (!i2cWriteByte(0x0F))                                 { i2cStop(); return; }
+  i2cStop();
+  i2cStart();
+  if (!i2cWriteByte((uint8_t)((DS3231_ADDR << 1) | 0x01))) { i2cStop(); return; }
+  uint8_t status = i2cReadByte(false);
+  i2cStop();
+  i2cStart();
+  i2cWriteByte((uint8_t)((DS3231_ADDR << 1) | 0x00));
+  i2cWriteByte(0x0F);
+  i2cWriteByte((uint8_t)(status & (uint8_t)~0x80U));
+  i2cStop();
+}
+
+// __DATE__ ("Mmm dd yyyy") と __TIME__ ("hh:mm:ss") を解析してビルド時刻を得る。
+// コンパイル時に埋め込まれる定数文字列を実行時にパースするだけなので毎ビルドで自動更新される。
+static void getCompileTime(uint8_t &yr2, uint8_t &mo, uint8_t &day,
+                            uint8_t &hr, uint8_t &mn, uint8_t &sc) {
+  static const char monthNames[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  char monStr[4] = {0};
+  int  d, y, h, mi, s;
+  sscanf(__DATE__, "%3s %d %d", monStr, &d, &y);
+  sscanf(__TIME__, "%d:%d:%d", &h, &mi, &s);
+  int monthIdx = (int)((strstr(monthNames, monStr) - monthNames) / 3);  // 0-11
+  yr2 = (uint8_t)(y % 100);
+  mo  = (uint8_t)(monthIdx + 1);
+  day = (uint8_t)d;
+  hr  = (uint8_t)h;
+  mn  = (uint8_t)mi;
+  sc  = (uint8_t)s;
 }
 
 // DS3231 から現在時刻を読み出す。成功時 true
@@ -846,6 +900,7 @@ static String sendAT(String cmd, int waitMs = 2000) {
   long start = millis();
   String response = "";
   while (millis() - start < (unsigned long)waitMs) {
+    wdtFeed();  // 長時間の AT 応答待ちでもハング扱いされないよう給餌
     statusSigfoxBlinkTick();
     while (Serial1.available()) response += (char)Serial1.read();
     yield();
@@ -983,8 +1038,36 @@ extern "C" void RTC2_IRQHandler(void) {
   }
 }
 
+// ============================================================
+// ウォッチドッグタイマー（nRF52840 内蔵 WDT）
+// 無人運用中にファーム（HX711/I2C/SD 読み書き等）がハングした場合、
+// 自動リセットで復旧するための安全網。一度 START すると停止不可。
+//
+// スリープ中も WDT は動き続けるため、給餌は各所で行う:
+//   (1) loop() 先頭（起床直後）    → スリープ区間をカバー
+//   (2) deepSleep() 開始時         → 計測・SD記録・送信等の活動区間をカバー
+//   (3) sendAT() 応答待ちループ    → 長時間の AT 待ちをカバー
+// これによりタイムアウトは「スリープ時間」「活動時間」の長い方だけを
+// 超える値であればよい（合計値をカバーする必要はない）。
+// ※ WDT_TIMEOUT_MS はスリープ間隔（SLEEP_MINUTES / MEASURE_INTERVAL_MIN）より
+//    必ず長くすること（短いとスリープ中に誤リセットする）。
+// ============================================================
+static uint32_t const WDT_TIMEOUT_MS = 25UL * 60UL * 1000UL;  // 25分（スリープ最大20分に余裕）
+
+static void wdtInit(uint32_t timeoutMs) {
+  NRF_WDT->CONFIG  = (WDT_CONFIG_SLEEP_Run << WDT_CONFIG_SLEEP_Pos);  // スリープ中も継続動作
+  NRF_WDT->CRV     = (uint32_t)((uint64_t)timeoutMs * 32768ULL / 1000ULL);
+  NRF_WDT->RREN    = WDT_RREN_RR0_Msk;
+  NRF_WDT->TASKS_START = 1;
+}
+
+static inline void wdtFeed() {
+  NRF_WDT->RR[0] = WDT_RR_RR_Reload;
+}
+
 // 周辺（3V3_SW）をオフにし、RTC2 で minutes 分待ってから復帰する。
 static void deepSleep(uint32_t minutes) {
+  wdtFeed();  // これから始まる長時間スリープ区間の給餌
 
 #if DEBUG_MODE && DEBUG_NO_SLEEP
   Serial.println("[Sleep SKIPPED (DEBUG_NO_SLEEP)]");
@@ -1122,6 +1205,7 @@ static void runCycle() {
 // ============================================================
 
 void setup() {
+  wdtInit(WDT_TIMEOUT_MS);  // 無人運用の安全網。以降 25 分キックが無ければ自動リセット
 
   rgbHwBegin();
   rgbOff();
@@ -1163,18 +1247,24 @@ void setup() {
 
   s_errors = ERR_NONE;
 
-#if DS3231_SET_TIME
+  // ── DS3231 時刻自動設定 ──────────────────────────────────────
+  // OSF（発振停止フラグ）が立っている場合（バックアップ電池切れ・初回電源投入等で
+  // 時刻が無効な場合）のみ、コンパイル時刻を自動書き込みする。時刻が有効な場合は
+  // 上書きしない（WDT リセット等で頻繁に再起動しても時刻が巻き戻らないようにするため）。
   {
-    uint8_t yr2 = (uint8_t)((DS3231_INIT_YEAR) % 100U);
-    bool ok = ds3231SetTime(yr2, (uint8_t)(DS3231_INIT_MONTH), (uint8_t)(DS3231_INIT_DAY),
-                            (uint8_t)(DS3231_INIT_HOUR), (uint8_t)(DS3231_INIT_MIN),
-                            (uint8_t)(DS3231_INIT_SEC));
+    bool needsSet = DS3231_FORCE_SET_TIME || ds3231OscillatorStopped();
+    if (needsSet) {
+      uint8_t yr2, mo, day, hr, mn, sc;
+      getCompileTime(yr2, mo, day, hr, mn, sc);
+      bool ok = ds3231SetTime(yr2, mo, day, hr, mn, sc);
+      if (ok) ds3231ClearOscillatorStopFlag();
 #if DEBUG_MODE
-    Serial.println(ok ? "[DS3231] time set OK" : "[DS3231] time set FAILED");
+      Serial.print("[DS3231] 時刻が無効だったためビルド時刻を書き込み: ");
+      Serial.println(ok ? "OK" : "FAILED");
 #endif
-    if (!ok) s_errors |= ERR_DS3231_I2C;
+      if (!ok) s_errors |= ERR_DS3231_I2C;
+    }
   }
-#endif
 
   if (!tca9534Init()) {
     s_errors |= ERR_TCA9534_I2C;
@@ -1183,6 +1273,8 @@ void setup() {
     Serial.println("[TCA9534] init failed");
 #endif
   }
+  // 3V3_SW ON 直後の電圧安定化待ち（突入電流によるレール降下対策。loop() と同じ）
+  delay(100);
 
   // ── SD カード初期化（3V3_SW ON 後 / SCK=LOW,MOSI=HIGH 確定後）──
   sdPrePinConfig();
@@ -1194,6 +1286,7 @@ void setup() {
 }
 
 void loop() {
+  wdtFeed();  // 起床直後の給餌（スリープ区間ぶんをここでキック）
 
   statusIdleBlueDim();
 
@@ -1210,6 +1303,9 @@ void loop() {
     Serial.println("[TCA9534] re-init failed");
 #endif
   }
+  // 3V3_SW ON 直後の電圧安定化待ち。4ch HX711 ＋ SD カード同時投入時の突入電流に
+  // よるレール降下が後続の I2C(TCA9534)/計測エラーの原因になり得るため置く。
+  delay(100);
 
   // SD はスリープ中に電源断されるため毎サイクル再初期化
   sdPrePinConfig();

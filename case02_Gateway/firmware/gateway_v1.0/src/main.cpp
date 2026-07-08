@@ -55,8 +55,15 @@
 // GAS スクリプトID（デプロイURLの "AKfycb..." 部分）
 const char* GAS_SCRIPT_ID = "AKfycbw2IIQ1GyxtGh2Uis_zmwXW3VhftDy9HWKw5tSsUbwNOhNo6p9PnNv3ftfs3MvcMDT5ww/exec";
 
-// テストモード — true にするとネットワーク接続直後にダミーデータを GAS へ送信する
-#define TEST_MODE false
+// 起動確認送信 — true にするとネットワーク接続直後に、機器の設定情報の行と、
+// それまでに BLE スキャンで受信できていた実際の子機データ（実 RSSI 含む）を
+// GAS へ送信する（通信経路とアンテナ状況を起動のたびに確認できる）
+#define BOOT_SCAN_SEND true
+
+// 再送キュー・即時リトライの動作確認用: 送信を N 回だけ強制的に失敗させる
+// （実際の通信は行わず即座に失敗を返すため、タイムアウト待ちなしで検証できる）
+// 0 = 無効（通常運用時は必ず 0 に戻すこと）
+#define TEST_FORCE_SEND_FAIL 0
 
 // SIM 切り替え — 使う方のブロックだけ有効にする
 // ── 1NCE SIM ──────────────────────────────────
@@ -79,9 +86,11 @@ const char* GAS_SCRIPT_ID = "AKfycbw2IIQ1GyxtGh2Uis_zmwXW3VhftDy9HWKw5tSsUbwNOhN
 #endif
 
 // BLE スキャン / 送信設定
-static uint16_t const SCAN_INTERVAL_MS   = 300;     // スキャンインターバル (ms)
-static uint16_t const SCAN_WINDOW_MS     = 30;      // スキャンウィンドウ (ms)
-static uint32_t const SEND_INTERVAL_MS   = 300000;  // GAS 送信インターバル (ms) ★ここを変える
+// Gateway は USB-C 常時給電のため省電力を気にせずデューティ比をほぼ100%にする
+// （interval と window をほぼ同値にすることでほぼ常時受信状態にし、取りこぼしを減らす）
+static uint16_t const SCAN_INTERVAL_MS   = 100;     // スキャンインターバル (ms)
+static uint16_t const SCAN_WINDOW_MS     = 100;      // スキャンウィンドウ (ms)
+static uint32_t const SEND_INTERVAL_MS   = 3600000;  // GAS 送信インターバル (ms) ★ここを変える
 static uint8_t  const MFR_COMPANY_ID_H   = 0xFF;    // Flex の Company ID (上位)
 static uint8_t  const MFR_COMPANY_ID_L   = 0xFF;    // Flex の Company ID (下位)
 
@@ -106,6 +115,10 @@ static FlexRecord records[MAX_DEVICES];
 static int        recordCount = 0;
 static SemaphoreHandle_t recordMutex;
 
+// 送信失敗時に保持する再送キュー（次回まとめてライブデータとマージして再送する）
+static FlexRecord pendingRecords[MAX_DEVICES];
+static int        pendingCount = 0;
+
 // ══════════════════════════════════════════════
 // RTC
 // ══════════════════════════════════════════════
@@ -123,6 +136,24 @@ String getTimestamp() {
 }
 
 // ══════════════════════════════════════════════
+// ウォッチドッグタイマー（nRF52840 内蔵 WDT）
+// 無人運用中にファームがハングした場合、自動リセットで復旧するための安全網。
+// 一度 START すると停止不可（電源再投入かリセットまで動作し続ける）。
+// ══════════════════════════════════════════════
+static uint32_t const WDT_TIMEOUT_MS = 120000UL;  // 120秒: この間キックが無ければリセット
+
+static void wdtInit(uint32_t timeoutMs) {
+  NRF_WDT->CONFIG  = (WDT_CONFIG_SLEEP_Run << WDT_CONFIG_SLEEP_Pos);  // スリープ中も継続動作
+  NRF_WDT->CRV     = (uint32_t)((uint64_t)timeoutMs * 32768ULL / 1000ULL);  // 32768Hz ティック換算
+  NRF_WDT->RREN    = WDT_RREN_RR0_Msk;  // チャンネル0のみ使用
+  NRF_WDT->TASKS_START = 1;
+}
+
+static inline void wdtFeed() {
+  NRF_WDT->RR[0] = WDT_RR_RR_Reload;  // キック（既定のリロードマジック値）
+}
+
+// ══════════════════════════════════════════════
 // AT コマンド送受信
 // ══════════════════════════════════════════════
 String sendAT(String cmd, int waitMs = 5000) {
@@ -132,6 +163,7 @@ String sendAT(String cmd, int waitMs = 5000) {
   long start = millis();
   String res = "";
   while (millis() - start < waitMs) {
+    wdtFeed();  // 長時間の AT 応答待ち（COPS スキャン等 最大3分）でもハング扱いされないよう給餌
     while (Serial1.available()) res += (char)Serial1.read();
     yield();
   }
@@ -337,6 +369,17 @@ bool initNetwork() {
 // 全 Flex レコードを1回の GET でまとめて GAS へ送信
 // クエリ形式: ts=...&sim=...&n=3&mac0=...&payload0=...&rssi0=...&mac1=...
 bool postToGAS(String queryParams) {
+#if TEST_FORCE_SEND_FAIL > 0
+  static int s_forceFailRemaining = TEST_FORCE_SEND_FAIL;
+  if (s_forceFailRemaining > 0) {
+    s_forceFailRemaining--;
+    Serial.print(F("[TEST] 強制送信失敗（実通信スキップ）残り "));
+    Serial.print(s_forceFailRemaining);
+    Serial.println(F(" 回"));
+    return false;
+  }
+#endif
+
   Serial.println(F("\n--- GAS 送信 ---"));
   String scriptPath = "/macros/s/";
   scriptPath += GAS_SCRIPT_ID;
@@ -411,7 +454,11 @@ void scanCallback(ble_gap_evt_adv_report_t* report) {
   }
 
   if (msd == nullptr) { Bluefruit.Scanner.resume(); return; }
-  DLOG2("[BLE] MSD パケット受信");
+  // MSD フォーマット: msd[0]=Pkt type, msd[1]=Device ID
+  uint8_t deviceId = (msdLen >= 2) ? msd[1] : 0xFF;
+  Serial.print(F("[BLE] MSD パケット受信 Device ID=0x"));
+  if (deviceId < 0x10) Serial.print('0');
+  Serial.println(deviceId, HEX);
 
   // レコード更新
   if (xSemaphoreTake(recordMutex, 0) == pdTRUE) {
@@ -433,60 +480,187 @@ void scanCallback(ble_gap_evt_adv_report_t* report) {
   Bluefruit.Scanner.resume();
 }
 
+// ネットワーク登録状態を簡易確認し、切れていれば再接続する
+// （長時間運用中に基地局都合で接続が切れるケースへの対策）
+bool ensureNetworkReady() {
+  String att = sendAT("AT+CGATT?", 3000);
+  if (att.indexOf("+CGATT: 1") >= 0) return true;
+
+  Serial.println(F("⚠ ネットワーク切断を検知。再接続を試みます..."));
+  return initNetwork();
+}
+
+// SIM7080G（LTE-M モデム）自身の受信電波強度を取得する
+// 戻り値: 0-31（値が大きいほど良好）、99=圏外/取得失敗
+int getSimCsq() {
+  String csq = sendAT("AT+CSQ", 3000);
+  int idx = csq.indexOf("+CSQ: ");
+  if (idx < 0) return 99;
+  return csq.substring(idx + 6, csq.indexOf(",", idx)).toInt();
+}
+
+// XIAO nRF52840 固有の Device ID（工場設定レジスタ FICR、64bit）を16進文字列で返す
+String getXiaoId() {
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%08lX%08lX",
+           (unsigned long)NRF_FICR->DEVICEID[1],
+           (unsigned long)NRF_FICR->DEVICEID[0]);
+  return String(buf);
+}
+
+// SIM7080G の IMEI（15桁の一意な番号）を取得する
+String getSimImei() {
+  String res = sendAT("AT+GSN", 3000);
+  for (int i = 0; i < (int)res.length(); i++) {
+    if (isDigit(res[i])) {
+      int j = i;
+      while (j < (int)res.length() && isDigit(res[j])) j++;
+      if (j - i >= 10) return res.substring(i, j);  // IMEI は15桁程度の連続した数字
+      i = j;
+    }
+  }
+  return "";
+}
+
+// 起動確認送信: 機器の設定情報を1行だけ GAS へ送る（子機データとは別行）
+void postBootInfoRow() {
+  Serial.println(F("--- 起動情報送信 ---"));
+  String xiaoId  = getXiaoId();
+  String simImei = getSimImei();
+  int    csq     = getSimCsq();
+
+  String params = "ts=";
+  params += getTimestamp();
+  params += "&sim=";
+  params += SIM_NAME;
+  params += "&csq=";
+  params += String(csq);
+  params += "&row_type=info";
+  params += "&xiao_id=";
+  params += xiaoId;
+  params += "&sim_imei=";
+  params += simImei;
+  params += "&sd=";
+  params += (sdAvailable ? "1" : "0");
+  params += "&interval_min=";
+  params += String(SEND_INTERVAL_MS / 60000UL);
+  params += "&devcount=";
+  params += String(recordCount);
+
+  postToGAS(params);
+}
+
 // ══════════════════════════════════════════════
 // バッファを GAS へ送信＆SD へ記録（全台を1回の POST にまとめる）
+//
+// 送信失敗時は再送キュー（pendingRecords）に保持し、次回サイクルで
+// ライブ受信データとマージして再送する（同一 MAC はライブ側を優先）。
+// これにより一時的な通信断でデータをロストしない。
 // ══════════════════════════════════════════════
 void flushRecords() {
   if (xSemaphoreTake(recordMutex, pdMS_TO_TICKS(200)) != pdTRUE) return;
 
-  int n = recordCount;
-  FlexRecord snap[MAX_DEVICES];
-  memcpy(snap, records, sizeof(FlexRecord) * n);
+  int liveN = recordCount;
+  FlexRecord liveSnap[MAX_DEVICES];
+  memcpy(liveSnap, records, sizeof(FlexRecord) * liveN);
   recordCount = 0;
 
   xSemaphoreGive(recordMutex);
 
+  // ライブデータ＋再送キューをマージ（同一 MAC はライブ側＝最新を優先）
+  FlexRecord merged[MAX_DEVICES];
+  int n = 0;
+  for (int i = 0; i < liveN && n < MAX_DEVICES; i++) merged[n++] = liveSnap[i];
+
+  int pendingSpaceDropped = 0;  // バッファ上限で本当に破棄された件数のみカウント
+  for (int i = 0; i < pendingCount; i++) {
+    bool dup = false;
+    for (int j = 0; j < liveN; j++) {
+      if (memcmp(pendingRecords[i].mac, liveSnap[j].mac, 6) == 0) { dup = true; break; }
+    }
+    if (dup) continue;  // ライブ側に同一 MAC の新しいデータがあるので再送キュー側は不要（正常な重複排除）
+    if (n < MAX_DEVICES) merged[n++] = pendingRecords[i];
+    else pendingSpaceDropped++;
+  }
+  pendingCount = 0;
+
   if (n == 0) { Serial.println(F("送信対象レコードなし")); return; }
+  if (pendingSpaceDropped > 0) {
+    Serial.print(F("  → 再送キュー ")); Serial.print(pendingSpaceDropped);
+    Serial.println(F(" 件はバッファ上限のため破棄"));
+  }
 
   String ts = getTimestamp();
   Serial.print(F("フラッシュ: ")); Serial.print(n); Serial.println(F(" 件"));
 
+  // ネットワーク状態確認・必要なら再接続
+  if (!ensureNetworkReady()) {
+    Serial.println(F("✗ ネットワーク再接続失敗。今回分は再送キューへ保留"));
+    pendingCount = n;
+    memcpy(pendingRecords, merged, sizeof(FlexRecord) * n);
+    return;
+  }
+
+  // SIM7080G 自身のセルラー受信電波強度（BLE RSSI とは別物）
+  int csq = getSimCsq();
+
   // クエリ文字列を1本に組み立てる
-  // 形式: ts=...&sim=...&n=3&mac0=...&payload0=...&rssi0=...&mac1=...
+  // 形式: ts=...&sim=...&csq=...&n=3&mac0=...&payload0=...&rssi0=...&mac1=...
   String params = "ts=";
   params += ts;
   params += "&sim=";
   params += SIM_NAME;
+  params += "&csq=";
+  params += String(csq);
   params += "&n=";
   params += String(n);
 
   for (int i = 0; i < n; i++) {
     char mac[18];
     snprintf(mac, sizeof(mac), "%02X-%02X-%02X-%02X-%02X-%02X",
-             snap[i].mac[5], snap[i].mac[4], snap[i].mac[3],
-             snap[i].mac[2], snap[i].mac[1], snap[i].mac[0]);
+             merged[i].mac[5], merged[i].mac[4], merged[i].mac[3],
+             merged[i].mac[2], merged[i].mac[1], merged[i].mac[0]);
 
     String hex = "";
-    for (int j = 0; j < snap[i].payloadLen; j++) {
-      if (snap[i].payload[j] < 0x10) hex += '0';
-      hex += String(snap[i].payload[j], HEX);
+    for (int j = 0; j < merged[i].payloadLen; j++) {
+      if (merged[i].payload[j] < 0x10) hex += '0';
+      hex += String(merged[i].payload[j], HEX);
     }
 
     params += "&m"; params += i; params += "="; params += mac;
     params += "&p"; params += i; params += "="; params += hex;
-    params += "&r"; params += i; params += "="; params += String(snap[i].rssi);
+    params += "&r"; params += i; params += "="; params += String(merged[i].rssi);
 
-    // SD ログ（デバイスごとに1行）
-    sdLog(ts + "," + String(mac) + "," + hex + "," + String(snap[i].rssi));
+    // SD ログ（デバイスごとに1行。送信成否に関わらずローカルには残す）
+    sdLog(ts + "," + String(mac) + "," + hex + "," + String(merged[i].rssi));
   }
 
-  postToGAS(params);
+  bool ok = postToGAS(params);
+
+  if (!ok) {
+    // 一時的な通信不良を想定し、30秒待って1回だけ即時リトライ
+    Serial.println(F("✗ 送信失敗。30秒後に再試行..."));
+    delay(30000);
+    ok = postToGAS(params);
+  }
+
+  if (ok) {
+    Serial.println(F("✓ 送信成功（再送キュー クリア）"));
+  } else {
+    Serial.println(F("✗ 再試行も失敗。次回送信サイクルで再送キューとしてリトライします"));
+    pendingCount = n;
+    memcpy(pendingRecords, merged, sizeof(FlexRecord) * n);
+  }
 }
+
+static uint32_t lastSend = 0;
 
 // ══════════════════════════════════════════════
 // setup
 // ══════════════════════════════════════════════
 void setup() {
+  wdtInit(WDT_TIMEOUT_MS);  // 無人運用の安全網。以降 120 秒キックが無ければ自動リセット
+
   Serial.begin(115200);
   while (!Serial && millis() < 3000) yield();
 
@@ -532,8 +706,7 @@ void setup() {
     (uint16_t)(SCAN_INTERVAL_MS * 1000 / 625),
     (uint16_t)(SCAN_WINDOW_MS   * 1000 / 625)
   );
-  Bluefruit.Scanner.start(0);
-  Serial.println(F("✓ BLE スキャン開始"));
+  Serial.println(F("✓ BLE 初期化完了"));
 
   // ── SIM7080G 初期化シーケンス ──────────────────
   Serial.println(F("\n========== SIM7080G 初期化 =========="));
@@ -550,6 +723,13 @@ void setup() {
     while (Serial1.available()) Serial.write(Serial1.read());
   }
   Serial.println(F(" 完了"));
+
+  // SIM7080G 起動待ちが終わった時点で BLE スキャンを開始する。
+  // UART（Serial1, SIM7080G通信）と BLE 無線はハードウェア的に独立しているため、
+  // STAGE3〜6（AT疎通確認〜ネットワーク接続）の間もスキャンを継続してよい。
+  // これにより起動確認送信までに子機データがより多く貯まる。
+  Bluefruit.Scanner.start(0);
+  Serial.println(F("✓ BLE スキャン開始"));
 
   // [STAGE 3] AT 疎通確認
   bool atOk = false;
@@ -612,19 +792,12 @@ void setup() {
 
   Serial.println(F("=====================================\n"));
 
-#if TEST_MODE
+#if BOOT_SCAN_SEND
   if (netOk) {
-    Serial.println(F("===== テストモード: ダミーデータ送信（2台分バッチ） ====="));
-    String ts = getTimestamp();
-    // バッチ形式のダミーデータ（2台分）
-    String params = "ts="; params += ts;
-    params += "&sim="; params += SIM_NAME;
-    params += "&n=2";
-    params += "&m0=FF-FF-FF-FF-FF-01&p0=DEADBEEF&r0=-70";
-    params += "&m1=FF-FF-FF-FF-FF-02&p1=CAFEBABE&r1=-65";
-    bool testOk = postToGAS(params);
-    simStage("TEST: GAS ダミー送信", testOk);
-    if (testOk) Serial.println(F("  → スプレッドシートに2行追加されているか確認してください"));
+    Serial.println(F("===== 起動確認: 設定情報＋受信済み子機データを送信 ====="));
+    postBootInfoRow();
+    flushRecords();
+    lastSend = millis();  // 次の定期送信サイクルはここから起算する
     Serial.println(F("=======================================================\n"));
   }
 #endif
@@ -633,17 +806,31 @@ void setup() {
 // ══════════════════════════════════════════════
 // loop
 // ══════════════════════════════════════════════
-static uint32_t lastSend = 0;
+static uint32_t lastHeartbeat = 0;
 
 void loop() {
+  wdtFeed();  // BLE スキャンのみで sendAT が呼ばれない期間もハング扱いされないよう給餌
   uint32_t now = millis();
+
+  // デバッグ心拍: 10秒ごとに次回送信までの残り時間を表示
+  if (now - lastHeartbeat >= 10000) {
+    lastHeartbeat = now;
+    Serial.print(F("[HB] now=")); Serial.print(now);
+    Serial.print(F(" lastSend=")); Serial.print(lastSend);
+    Serial.print(F(" 残り=")); Serial.print((long)(SEND_INTERVAL_MS - (now - lastSend)));
+    Serial.print(F("ms 受信台数=")); Serial.println(recordCount);
+  }
 
   if (now - lastSend >= SEND_INTERVAL_MS) {
     lastSend = now;
     Serial.println(F("\n=== 定期送信 ==="));
     Serial.print(F("時刻: ")); Serial.println(getTimestamp());
     Serial.print(F("受信済み Flex 台数: ")); Serial.println(recordCount);
+
+    // 送信中は BLE スキャンを停止（LTE-M 通信中の割り込み負荷を減らす）
+    Bluefruit.Scanner.stop();
     flushRecords();
+    Bluefruit.Scanner.start(0);
   }
 
   // 手動 AT コマンドモード（シリアルから入力）
