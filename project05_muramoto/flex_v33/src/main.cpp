@@ -81,9 +81,9 @@ using namespace Adafruit_LittleFS_Namespace;
 // アプリ設定（ここを主に編集する）
 // ============================================================
 
-#define DEBUG_MODE           1        // 1: USB Serial デバッグログ有効。本番は 0
+#define DEBUG_MODE           0        // 1: USB Serial デバッグログ有効。本番は 0
 #define DEBUG_NO_SLEEP       0        // 1: deepSleep をスキップして即 loop() に戻る（DEBUG_MODE 1 時のみ有効）
-#define DEBUG_NO_SIGFOX      1        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
+#define DEBUG_NO_SIGFOX      0        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
 #define SLEEP_MINUTES        15       // 1サイクル後のスリープ時間（分）
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 #define BUTTON_LONG_PRESS_MS 5000UL  // D0 長押し閾値（ms）: 以上で tare、未満でリセット
@@ -974,8 +974,8 @@ static void measureXIAO() {
     az_sum += s_xiao_imu.readFloatAccelZ();
     delay(2);
   }
-  float theta = atan2f(-ay_sum / (float)XIAO_IMU_N_AVG,
-                        az_sum / (float)XIAO_IMU_N_AVG) * 180.0f / (float)PI;
+  float theta = atan2f(ay_sum / (float)XIAO_IMU_N_AVG,
+                       az_sum / (float)XIAO_IMU_N_AVG) * 180.0f / (float)PI;
   float t_ic  = s_xiao_imu.readTempC();
   tempV = (int)(theta * 100.0f);   // 0.01° 単位（int16 範囲: ±327.67°）
   battV = (int)(t_ic  * 10.0f);
