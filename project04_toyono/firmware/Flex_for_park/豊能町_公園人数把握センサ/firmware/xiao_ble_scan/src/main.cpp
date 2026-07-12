@@ -44,9 +44,20 @@
  * ═══════════════════════════════════════════════════
  * ENABLE_LOGGING = true にすると、スキャンサイクルごとの計測結果を
  * 内部フラッシュ（LittleFS）の /log.csv に追記する。
- * フォーマット: timestamp,people,devices
+ * フォーマット: timestamp,people,devices,rms_dbfs,L,ML,MH,H
  * 電源を切ってもデータは保持され、次回起動時は追記される。
  * 容量目安: 約9日分（1分1件ペース）
+ * ※ 音声列追加前の古い log.csv（3列）が残っている場合は e コマンドで削除してから使うこと。
+ *
+ * ═══════════════════════════════════════════════════
+ * 音声（賑わい）解析
+ * ═══════════════════════════════════════════════════
+ * オンボード PDM マイク（Sense 版のみ搭載）で環境音を16kHzサンプリングし、
+ * 1秒ごとに全体音圧（RMS dBFS）と4帯域のエネルギー（dBFS）を算出してシリアル出力する。
+ *   帯域: L=125-500Hz  ML=500-2kHz  MH=2k-4kHz  H=4k-8kHz
+ * 生の音声波形は保存・送信しない。集計値（dBFS）のみを記録する。
+ * BLE のスキャン/スリープに関わらず常時サンプリングし、スキャン窓（30秒）の平均値を
+ * スキャンサマリ・CSV ログに記録する。
  *
  * ═══════════════════════════════════════════════════
  * ログをCSVファイルとしてMacに保存する方法
@@ -71,14 +82,16 @@
 #include <string.h>
 #include <Adafruit_LittleFS.h>
 #include <InternalFileSystem.h>
+#include <PDM.h>
+#include <arduinoFFT.h>
 using namespace Adafruit_LittleFS_Namespace;
 
 // ── 出力 ─────────────────────────
-static bool const OUTPUT_RAW_LOG = true;
+static bool const OUTPUT_RAW_LOG = false;
 static bool const OUTPUT_PEOPLE  = true;
 
 // ── ログ設定 ──────────────────────
-static bool const ENABLE_LOGGING = true;    // false にするとフラッシュ書き込みなし
+static bool const ENABLE_LOGGING = false;    // false にするとフラッシュ書き込みなし
 static char const* LOG_FILE      = "/log.csv";
 
 // ── スキャン/スリープ設定 ──────────
@@ -98,6 +111,20 @@ static float const CALIBRATION    = 1.0;
 // ── BLEスキャン ─────────────────
 static uint16_t const SCAN_INTERVAL_MS = 150;
 static uint16_t const SCAN_WINDOW_MS   = 100;
+
+// ── PDM / 音声 ───────────────────
+static uint8_t  const PDM_GAIN         = 30;      // 0〜80（クリップなら下げる）
+static uint32_t const SENSOR_REPORT_MS = 1000;    // 音声値のシリアル出力間隔
+
+static uint16_t const FFT_SIZE      = 256;        // FFT 点数（2 のべき乗）
+static float    const SAMPLE_RATE   = 16000.0f;
+// dBFS 基準: Hann 窓後フルスケール振幅 ≈ A * FFT_SIZE/4
+static double   const FFT_FULL_SCALE = (FFT_SIZE / 4.0) * 32768.0;
+
+static int   const NUM_BANDS      = 4;
+static float const BAND_LOW_HZ [] = { 125.0f,  500.0f, 2000.0f, 4000.0f };
+static float const BAND_HIGH_HZ[] = { 500.0f, 2000.0f, 4000.0f, 8000.0f };
+static char const* BAND_NAME[]    = { "L", "ML", "MH", "H" };
 
 // ── デバイス保持 ────────────────
 #define MAX_DEVICES 64
@@ -126,6 +153,34 @@ static int   calibMinHitsSum = 0;
 static char cmdBuf[16];
 static int  cmdLen = 0;
 
+// ── PDM / 音声 ───────────────────
+static int16_t const PDM_BUF_SAMPLES = 512;
+static int16_t      pdmBuf[PDM_BUF_SAMPLES];
+static volatile int pdmReady = 0;
+
+static uint16_t const RING_SIZE = FFT_SIZE * 4;   // 1024（2 のべき乗）
+static uint16_t const RING_MASK = RING_SIZE - 1;
+static int16_t      ringBuf[RING_SIZE];
+static uint16_t     ringHead = 0;
+static uint16_t     ringTail = 0;
+
+static float vReal[FFT_SIZE];
+static float vImag[FFT_SIZE];
+static ArduinoFFT<float> FFT(vReal, vImag, FFT_SIZE, SAMPLE_RATE);
+
+// 1 秒ウィンドウ集計
+static double   rmsAccumSq = 0.0;
+static uint32_t rmsAccumN  = 0;
+static double   bandAccum[NUM_BANDS] = {};
+static uint32_t bandWindows = 0;
+
+// スキャン窓（30秒）集計
+static double scanRmsSum             = 0.0;
+static double scanBandSum[NUM_BANDS] = {};
+static int    scanSnapCount          = 0;
+
+static uint32_t lastSensorMs = 0;
+
 // ───────────────────────────────
 // ユーティリティ
 // ───────────────────────────────
@@ -142,7 +197,7 @@ void printTimestamp() {
 }
 
 /** 現在の経過時間を CSV 1行としてフラッシュに追記 */
-void logRecord(int people, int devCount) {
+void logRecord(int people, int devCount, double rmsDb, double bandDb[]) {
   if (!ENABLE_LOGGING) return;
 
   logFile.open(LOG_FILE, FILE_O_WRITE);
@@ -158,7 +213,14 @@ void logRecord(int people, int devCount) {
   logFile.print(",");
   logFile.print(people);
   logFile.print(",");
-  logFile.println(devCount);
+  logFile.print(devCount);
+  logFile.print(",");
+  logFile.print(rmsDb, 1);
+  for (int b = 0; b < NUM_BANDS; b++) {
+    logFile.print(",");
+    logFile.print(bandDb[b], 1);
+  }
+  logFile.println();
   logFile.close();
 }
 
@@ -376,6 +438,96 @@ int estimatePeople() {
 }
 
 // ───────────────────────────────
+// PDM コールバック（割り込みコンテキスト）
+// ───────────────────────────────
+
+static void onPDMdata() {
+  int bytes = PDM.available();
+  if (bytes > (int)(PDM_BUF_SAMPLES * sizeof(int16_t)))
+    bytes = PDM_BUF_SAMPLES * sizeof(int16_t);
+  PDM.read(pdmBuf, bytes);
+  pdmReady = bytes / (int)sizeof(int16_t);
+}
+
+// ───────────────────────────────
+// PDM 処理（main loop から毎フレーム呼ぶ）
+// ───────────────────────────────
+
+static void calcBandMag(float outMag[]) {
+  const float freqRes = SAMPLE_RATE / (float)FFT_SIZE;
+  for (int b = 0; b < NUM_BANDS; b++) {
+    int binLo = max(1,                (int)(BAND_LOW_HZ[b]  / freqRes + 0.5f));
+    int binHi = min((int)(FFT_SIZE/2), (int)(BAND_HIGH_HZ[b] / freqRes + 0.5f));
+    double sumSq = 0.0; int cnt = 0;
+    for (int i = binLo; i < binHi; i++) { sumSq += (double)vReal[i]*(double)vReal[i]; cnt++; }
+    outMag[b] = (cnt > 0) ? (float)sqrt(sumSq / cnt) : 0.0f;
+  }
+}
+
+static void processPDM() {
+  // --- PDM コールバックのサンプルをリングバッファへ転記 ---
+  if (pdmReady > 0) {
+    int n = pdmReady; pdmReady = 0;
+    for (int i = 0; i < n; i++) {
+      int16_t s = pdmBuf[i];
+      ringBuf[ringHead & RING_MASK] = s;
+      ringHead++;
+      rmsAccumSq += (double)s * (double)s;
+    }
+    rmsAccumN += (uint32_t)n;
+  }
+  // --- FFT_SIZE サンプル溜まったら FFT 処理 ---
+  while ((uint16_t)(ringHead - ringTail) >= FFT_SIZE) {
+    for (int i = 0; i < FFT_SIZE; i++) {
+      vReal[i] = (float)ringBuf[(ringTail + i) & RING_MASK];
+      vImag[i] = 0.0f;
+    }
+    ringTail += FFT_SIZE;
+    FFT.windowing(FFTWindow::Hann, FFTDirection::Forward);
+    FFT.compute(FFTDirection::Forward);
+    FFT.complexToMagnitude();
+    float mag[NUM_BANDS]; calcBandMag(mag);
+    for (int b = 0; b < NUM_BANDS; b++) bandAccum[b] += (double)mag[b];
+    bandWindows++;
+  }
+}
+
+// ───────────────────────────────
+// 1 秒センサティック — 計算・出力・スキャン窓累積・リセット
+// ───────────────────────────────
+
+static void sensorTick(bool isScan) {
+  double rms  = (rmsAccumN > 0) ? sqrt(rmsAccumSq / (double)rmsAccumN) : 0.0;
+  double dbfs = (rms > 0.0)     ? 20.0 * log10(rms / 32768.0)          : -120.0;
+
+  double bDb[NUM_BANDS];
+  for (int b = 0; b < NUM_BANDS; b++) {
+    double avg = (bandWindows > 0) ? bandAccum[b] / (double)bandWindows : 0.0;
+    bDb[b] = (avg > 0.0) ? 20.0 * log10(avg / FFT_FULL_SCALE) : -120.0;
+  }
+
+  Serial.print("[");
+  printTimestamp();
+  Serial.print(isScan ? "|SCAN ] " : "|SLEEP] ");
+  Serial.print("rms="); Serial.print(dbfs, 1); Serial.print(" dBFS");
+  for (int b = 0; b < NUM_BANDS; b++) {
+    Serial.print("  "); Serial.print(BAND_NAME[b]);
+    Serial.print("="); Serial.print(bDb[b], 1);
+  }
+  Serial.println();
+
+  if (isScan) {
+    scanRmsSum += dbfs;
+    for (int b = 0; b < NUM_BANDS; b++) scanBandSum[b] += bDb[b];
+    scanSnapCount++;
+  }
+
+  rmsAccumSq = 0.0; rmsAccumN = 0;
+  for (int b = 0; b < NUM_BANDS; b++) bandAccum[b] = 0.0;
+  bandWindows = 0;
+}
+
+// ───────────────────────────────
 // スキャンコールバック
 // ───────────────────────────────
 
@@ -418,7 +570,7 @@ void setup() {
     InternalFS.begin();
     if (!InternalFS.exists(LOG_FILE)) {
       logFile.open(LOG_FILE, FILE_O_WRITE);
-      logFile.println("timestamp,people,devices");
+      logFile.println("timestamp,people,devices,rms_dbfs,L,ML,MH,H");
       logFile.close();
       Serial.println("[LOG] Created new log file.");
     } else {
@@ -430,6 +582,16 @@ void setup() {
   // ── LED 初期化 ───────────────────
   pinMode(LED_BLUE, OUTPUT);
   digitalWrite(LED_BLUE, HIGH);  // 消灯
+
+  // ── PDM 初期化 ───────────────────
+  PDM.onReceive(onPDMdata);
+  PDM.setGain(PDM_GAIN);
+  if (!PDM.begin(1, (int)SAMPLE_RATE)) {
+    Serial.println("[ERR] PDM.begin() failed — Sense ボードか確認");
+    while (1) delay(500);
+  }
+  Serial.print("[PDM] mono 16kHz  gain="); Serial.println(PDM_GAIN);
+  lastSensorMs = millis();
 
   Bluefruit.begin(1, 0);
   Bluefruit.setName("PeopleCounter");
@@ -449,8 +611,12 @@ void setup() {
 
 void loop() {
 
-  // ① デバイスリストをリセットしてスキャン開始
-  deviceCount = 0;
+  // ① デバイスリスト・音声スキャン窓集計をリセットしてスキャン開始
+  deviceCount   = 0;
+  scanRmsSum    = 0.0;
+  scanSnapCount = 0;
+  for (int b = 0; b < NUM_BANDS; b++) scanBandSum[b] = 0.0;
+
   Bluefruit.Scanner.start(0);
   Serial.print("[SCAN] ");
   Serial.print(SCAN_DURATION_MS / 1000);
@@ -463,6 +629,11 @@ void loop() {
 
   while (millis() < scanEnd) {
     handleSerial();
+    processPDM();
+    if (millis() - lastSensorMs >= SENSOR_REPORT_MS) {
+      sensorTick(true);
+      lastSensorMs += SENSOR_REPORT_MS;
+    }
 
     // 青LED点滅
     if (millis() - lastBlink >= LED_BLINK_MS) {
@@ -471,14 +642,19 @@ void loop() {
       lastBlink = millis();
     }
 
-    delay(10);
+    delay(5);
   }
 
   // ③ スキャン停止・LED消灯
   Bluefruit.Scanner.stop();
   digitalWrite(LED_BLUE, HIGH);  // 消灯（スリープ中は消す）
 
-  // ④ 人数推定・出力
+  // ④ 人数推定・音声集計・出力
+  double avgRms = (scanSnapCount > 0) ? scanRmsSum / (double)scanSnapCount : -120.0;
+  double avgBand[NUM_BANDS];
+  for (int b = 0; b < NUM_BANDS; b++)
+    avgBand[b] = (scanSnapCount > 0) ? scanBandSum[b] / (double)scanSnapCount : -120.0;
+
   if (OUTPUT_PEOPLE) {
     int people = estimatePeople();
 
@@ -489,9 +665,14 @@ void loop() {
     Serial.print(people);
     Serial.print(" (devices=");
     Serial.print(deviceCount);
-    Serial.println(")");
+    Serial.print(")");
+    Serial.print("  rms="); Serial.print(avgRms, 1);
+    for (int b = 0; b < NUM_BANDS; b++) {
+      Serial.print("  "); Serial.print(BAND_NAME[b]); Serial.print("="); Serial.print(avgBand[b], 1);
+    }
+    Serial.println();
 
-    logRecord(people, deviceCount);
+    logRecord(people, deviceCount, avgRms, avgBand);
   }
 
   // ⑤ キャリブレーション処理
@@ -523,6 +704,11 @@ void loop() {
   uint32_t sleepEnd = millis() + SLEEP_DURATION_MS;
   while (millis() < sleepEnd) {
     handleSerial();
-    delay(10);
+    processPDM();
+    if (millis() - lastSensorMs >= SENSOR_REPORT_MS) {
+      sensorTick(false);
+      lastSensorMs += SENSOR_REPORT_MS;
+    }
+    delay(5);
   }
 }
