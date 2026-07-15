@@ -1,23 +1,30 @@
 /**
- * Monita Gateway v1 — BLE スキャナ + LTE-M → GAS 送信
+ * Monita Gateway v1.1 — BLE スキャナ + LTE-M → GAS 送信（バッテリー駆動対応）
  *
  * MCU    : Seeed XIAO nRF52840
  * 通信   : M5Stamp CAT-M（SIM7080G）
  * RTC    : DS3231（I2C: D4=SDA, D5=SCL）
- * SD     : microSD SPI（D3=CS, D8=SCK, D9=MISO, D10=MOSI）
+ * SD     : microSD SPI（D1=CS, D8=SCK, D9=MISO, D10=MOSI）
+ * 電源   : LiPo → AO3401(P-MOSFET, D0) → TPS61232(昇圧5V) → TPS22965(ロードスイッチ, D3) → SIM7080G
  *
- * 配線:
+ * 配線（v1.1 基板 ver1.1.sch）:
  *   XIAO D6 (TX) → SIM7080G RX
  *   XIAO D7 (RX) ← SIM7080G TX
- *   XIAO 5V      → SIM7080G 5V
- *   XIAO GND     → SIM7080G GND
- *   XIAO D4(SDA) → DS3231 SDA
- *   XIAO D5(SCL) → DS3231 SCL
- *   XIAO 3V3     → DS3231 VCC / SD VDD
- *   XIAO D3      → SD CS
+ *   XIAO D4(SDA) → DS3231 SDA（4.7kΩ プルアップ）
+ *   XIAO D5(SCL) → DS3231 SCL（4.7kΩ プルアップ）
+ *   XIAO 3V3     → DS3231 VCC / SD VDD、DS3231 VBAT → 生LiPo
+ *   XIAO D1      → SD CS      ★v1.0 の D3 から変更
  *   XIAO D8(SCK) → SD CLK
  *   XIAO D9(MISO)→ SD DAT0
  *   XIAO D10(MOSI)→ SD CMD
+ *   XIAO D0      → P-MOSFET(AO3401) 制御（SIM電源ライン全体のON/OFF）  ★v1.1 新規
+ *   XIAO D3      → ロードスイッチ(TPS22965) ON（SIM 5V給電）           ★v1.1 新規
+ *   XIAO D2      → ユーザーボタン（任意）
+ *
+ * v1.1 の主な変更点:
+ *   - SIM 電源の2段制御（P-MOSFET + ロードスイッチ）を追加
+ *   - SD CS を D3 → D1 に変更
+ *   - （TODO）間欠動作＝ディープスリープによるバッテリー長期駆動は実機で実装・検証する
  */
 
 #include <Arduino.h>
@@ -25,7 +32,7 @@
 
 // ── デバッグレベル ─────────────────────────────
 // 0: 無効  1: ステージ結果のみ  2: AT コマンド生ログも表示
-#define DEBUG_LEVEL 2
+#define DEBUG_LEVEL 0
 
 #if DEBUG_LEVEL >= 1
   #define DLOG(msg)       Serial.println(F(msg))
@@ -90,7 +97,7 @@ const char* GAS_SCRIPT_ID = "AKfycbw2IIQ1GyxtGh2Uis_zmwXW3VhftDy9HWKw5tSsUbwNOhN
 // （interval と window をほぼ同値にすることでほぼ常時受信状態にし、取りこぼしを減らす）
 static uint16_t const SCAN_INTERVAL_MS   = 100;     // スキャンインターバル (ms)
 static uint16_t const SCAN_WINDOW_MS     = 100;      // スキャンウィンドウ (ms)
-static uint32_t const SEND_INTERVAL_MS   = 3600000;  // GAS 送信インターバル (ms) ★ここを変える
+static uint32_t const SEND_INTERVAL_MS   = 300000;  // GAS 送信インターバル (ms) ★ここを変える
 static uint8_t  const MFR_COMPANY_ID_H   = 0xFF;    // Flex の Company ID (上位)
 static uint8_t  const MFR_COMPANY_ID_L   = 0xFF;    // Flex の Company ID (下位)
 
@@ -102,6 +109,10 @@ static uint8_t  const EXPECTED_PKT_TYPE  = 0x03;             // Flex v3.03 の P
 static uint8_t  const ALLOWED_DEVICE_IDS[] = {0x01, 0x02};   // ★子機を増やしたらここに追加する
 static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / sizeof(ALLOWED_DEVICE_IDS[0]);
 
+// Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
+// info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
+static uint8_t  const GATEWAY_FW_VERSION = 1;
+
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
   if (pktType != EXPECTED_PKT_TYPE) return false;
@@ -111,14 +122,23 @@ bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
   return false;
 }
 
-// SD カード
-static int const SD_CS_PIN = 3;  // D3
+// ── ピン割当（v1.1 基板 ver1.1.sch で確定）─────────────────
+// ★ v1.0 から変更あり。回路図と一致させること。
+static int const SD_CS_PIN       = 1;  // D1（★v1.0 の D3 から変更）
+static int const PMOSFET_CTRL_PIN = 0;  // D0（新規）LiPo→SIM電源ライン全体のマスターON/OFF（AO3401）
+static int const LOADSW_CTRL_PIN  = 3;  // D3（新規）SIM7080G への 5V 給電ロードスイッチ ON/OFF（TPS22965）
+
+// 電源投入シーケンスのタイミング
+static uint32_t const PMOS_TO_BOOST_STABLE_MS = 50;  // P-MOSFET ON 後、昇圧5V安定待ち
 
 // ══════════════════════════════════════════════
 // BLE 受信バッファ
 // ══════════════════════════════════════════════
 #define MAX_DEVICES 20
-#define MAX_PAYLOAD 16
+// v3.03 の MSD は Company ID(2B) を除くと 19 バイト
+// （PktType+DeviceID+FW_VERSION+CH1-4+BATT+Hour+Min+CH1-4Range）。
+// 将来の拡張余地を見て 24 バイトを確保する。
+#define MAX_PAYLOAD 24
 
 struct FlexRecord {
   uint8_t  mac[6];
@@ -168,6 +188,36 @@ static void wdtInit(uint32_t timeoutMs) {
 
 static inline void wdtFeed() {
   NRF_WDT->RR[0] = WDT_RR_RR_Reload;  // キック（既定のリロードマジック値）
+}
+
+// ══════════════════════════════════════════════
+// SIM7080G 電源制御（v1.1 新規）
+//
+// 電源経路: LiPo → AO3401(P-MOSFET, D0) → TPS61232(昇圧5V) → TPS22965(ロードスイッチ, D3) → SIM7080G
+// 2段構成。ON時は上流(P-MOSFET)から順に、OFF時は下流(ロードスイッチ)から順に切る。
+// ══════════════════════════════════════════════
+static void simPowerCtrlInit() {
+  pinMode(PMOSFET_CTRL_PIN, OUTPUT);
+  pinMode(LOADSW_CTRL_PIN,  OUTPUT);
+  digitalWrite(PMOSFET_CTRL_PIN, LOW);  // 起動時は SIM 電源 OFF
+  digitalWrite(LOADSW_CTRL_PIN,  LOW);
+}
+
+// SIM7080G へ給電開始（P-MOSFET → 昇圧安定待ち → ロードスイッチ の順）
+static void simPowerOn() {
+  Serial.println(F("[PWR] SIM電源 ON（P-MOSFET → 昇圧 → ロードスイッチ）"));
+  digitalWrite(PMOSFET_CTRL_PIN, HIGH);   // 1. P-MOSFET ON → 昇圧コンバータへ給電
+  delay(PMOS_TO_BOOST_STABLE_MS);         // 2. 昇圧5Vの安定待ち
+  digitalWrite(LOADSW_CTRL_PIN,  HIGH);   // 3. ロードスイッチ ON（ソフトスタートで SIM へ給電）
+  delay(100);                              // ロードスイッチ ソフトスタート完了待ち
+}
+
+// SIM7080G を完全遮断（ロードスイッチ → P-MOSFET の順）
+static void simPowerOff() {
+  Serial.println(F("[PWR] SIM電源 OFF"));
+  digitalWrite(LOADSW_CTRL_PIN,  LOW);    // 1. ロードスイッチ OFF
+  delay(10);
+  digitalWrite(PMOSFET_CTRL_PIN, LOW);    // 2. P-MOSFET OFF（昇圧コンバータごと遮断、待機電流ゼロ）
 }
 
 // ══════════════════════════════════════════════
@@ -573,6 +623,8 @@ void postBootInfoRow() {
   params += String(SEND_INTERVAL_MS / 60000UL);
   params += "&devcount=";
   params += String(recordCount);
+  params += "&gw_fw=";
+  params += String(GATEWAY_FW_VERSION);
 
   postToGAS(params);
 }
@@ -687,6 +739,7 @@ static uint32_t lastSend = 0;
 // ══════════════════════════════════════════════
 void setup() {
   wdtInit(WDT_TIMEOUT_MS);  // 無人運用の安全網。以降 120 秒キックが無ければ自動リセット
+  simPowerCtrlInit();        // SIM 電源制御ピンを OUTPUT・LOW（OFF）で初期化
 
   Serial.begin(115200);
   while (!Serial && millis() < 3000) yield();
@@ -737,6 +790,10 @@ void setup() {
 
   // ── SIM7080G 初期化シーケンス ──────────────────
   Serial.println(F("\n========== SIM7080G 初期化 =========="));
+
+  // [STAGE 0] SIM 電源投入（v1.1: P-MOSFET → 昇圧 → ロードスイッチ）
+  // v1.0 では常時給電だったが、v1.1 はバッテリー駆動のため能動的に給電開始する
+  simPowerOn();
 
   // [STAGE 1] UART 設定
   Serial1.setPins(7, 6);  // RX=D7, TX=D6
@@ -832,6 +889,18 @@ void setup() {
 
 // ══════════════════════════════════════════════
 // loop
+//
+// 【現状】v1.0 踏襲: BLE 常時スキャン ＋ SEND_INTERVAL_MS ごとに定期送信。
+//        USB 給電でのボード立ち上げ（bring-up）・機能検証にはこのまま使える。
+//
+// 【TODO: バッテリー長期駆動用の間欠動作（実機で実装・検証）】
+//   要件: gateway_requirements_v1.10.md「電源設計」「スナップショット方式」参照
+//   1. 送信タイミング（12時間ごと）まで RTC2+WFI でディープスリープ（Flex の deepSleep 方式を移植）
+//      ※ Bluefruit ソフトデバイスと RTC2 スリープの干渉に注意。実機で消費電流を実測しながら詰める
+//   2. 起床 → simPowerOn() → BLE スキャン窓（12〜15分、子機のアドバタイズ :00〜:10 を捕捉）
+//   3. initNetwork() → flushRecords() → simPowerOff()（P-MOSFET・ロードスイッチOFFで待機電流ゼロ）
+//   4. 次の送信時刻まで再びディープスリープ
+//   ※ 現状の simPowerOn() は setup() で1回呼ぶのみ。間欠動作では毎サイクル ON/OFF する
 // ══════════════════════════════════════════════
 static uint32_t lastHeartbeat = 0;
 

@@ -5,16 +5,17 @@
  *   10分間隔・30秒アドバタイズ → 約570秒スリープ → 繰り返し
  *   （検証用: スリープは delay() ベース。本番は RTC2 deepSleep に差し替え）
  *
- * Manufacturer Data フォーマット（16バイト）:
+ * Manufacturer Data フォーマット（17バイト）:
  *   [0-1]  Company ID  0xFF 0xFF
  *   [2]    Pkt type    0x01（Monita Flex BLE）
  *   [3]    Device ID   0x01 = "test01"
- *   [4-5]  CH1 ひずみ  int16_t LE（生値 / 100）
- *   [6-7]  CH2 ひずみ  int16_t LE
- *   [8-9]  CH3 ひずみ  int16_t LE
- *   [10-11] CH4 ひずみ int16_t LE
- *   [12-13] バッテリー uint16_t LE（mV）
- *   [14-15] 次回計測まで uint16_t LE（秒）
+ *   [4]    FW Version  子機ファームのバージョン（コミットごとに+1。git logと突き合わせて特定する）
+ *   [5-6]  CH1 ひずみ  int16_t LE（生値 / 100）
+ *   [7-8]  CH2 ひずみ  int16_t LE
+ *   [9-10] CH3 ひずみ  int16_t LE
+ *   [11-12] CH4 ひずみ int16_t LE
+ *   [13-14] バッテリー uint16_t LE（mV）
+ *   [15-16] 次回計測まで uint16_t LE（秒）
  *
  * LED:
  *   Green 点灯   : アドバタイズ中
@@ -39,6 +40,7 @@
 // ▼ 設定（ここを変更する）
 // ══════════════════════════════════════════════
 static const uint8_t  DEVICE_ID       = 0x01;   // "test01"
+static const uint8_t  FW_VERSION      = 1;       // 子機ファームのバージョン。コミットのたびに+1すること
 static const uint16_t ADV_SECONDS     = 30;      // アドバタイズ時間（秒）
 static const uint16_t SLEEP_SECONDS   = 150;     // スリープ時間（秒）。ADV + SLEEP ≈ 3分
 static const uint16_t NEXT_WAKE_SEC   = 120;     // 親機へ通知する「最後パケットからスキャン開始までの秒数」
@@ -154,18 +156,19 @@ static void bleInit() {
 
 static void advertise(int16_t ch1, int16_t ch2, int16_t ch3, int16_t ch4,
                       uint16_t battMv, uint16_t nextWakeSec) {
-  uint8_t buf[16];
+  uint8_t buf[17];
   buf[0]  = MFR_COMPANY_ID[0];
   buf[1]  = MFR_COMPANY_ID[1];
   buf[2]  = PKT_TYPE;
   buf[3]  = DEVICE_ID;
+  buf[4]  = FW_VERSION;
   // int16_t LE
-  buf[4]  = (uint8_t)(ch1 & 0xFF);       buf[5]  = (uint8_t)((ch1 >> 8) & 0xFF);
-  buf[6]  = (uint8_t)(ch2 & 0xFF);       buf[7]  = (uint8_t)((ch2 >> 8) & 0xFF);
-  buf[8]  = (uint8_t)(ch3 & 0xFF);       buf[9]  = (uint8_t)((ch3 >> 8) & 0xFF);
-  buf[10] = (uint8_t)(ch4 & 0xFF);       buf[11] = (uint8_t)((ch4 >> 8) & 0xFF);
-  buf[12] = (uint8_t)(battMv & 0xFF);    buf[13] = (uint8_t)((battMv >> 8) & 0xFF);
-  buf[14] = (uint8_t)(nextWakeSec & 0xFF); buf[15] = (uint8_t)((nextWakeSec >> 8) & 0xFF);
+  buf[5]  = (uint8_t)(ch1 & 0xFF);       buf[6]  = (uint8_t)((ch1 >> 8) & 0xFF);
+  buf[7]  = (uint8_t)(ch2 & 0xFF);       buf[8]  = (uint8_t)((ch2 >> 8) & 0xFF);
+  buf[9]  = (uint8_t)(ch3 & 0xFF);       buf[10] = (uint8_t)((ch3 >> 8) & 0xFF);
+  buf[11] = (uint8_t)(ch4 & 0xFF);       buf[12] = (uint8_t)((ch4 >> 8) & 0xFF);
+  buf[13] = (uint8_t)(battMv & 0xFF);    buf[14] = (uint8_t)((battMv >> 8) & 0xFF);
+  buf[15] = (uint8_t)(nextWakeSec & 0xFF); buf[16] = (uint8_t)((nextWakeSec >> 8) & 0xFF);
 
   Bluefruit.Advertising.stop();
   Bluefruit.Advertising.clearData();

@@ -83,21 +83,24 @@ using namespace Adafruit_LittleFS_Namespace;
 // BLE モード設定（COMM_MODE_BLE 時のみ有効）
 // ============================================================
 #ifdef COMM_MODE_BLE
-static const uint8_t  DEVICE_ID           = 0x02;  // 子機 ID（複数台時は変える: 0x01〜0xFF）
+static const uint8_t  DEVICE_ID           = 0x01;  // 子機 ID（複数台時は変える: 0x01〜0xFF）
+static const uint8_t  FW_VERSION          = 1;     // 子機ファームのバージョン。コミットのたびに+1すること
 static const uint32_t MEASURE_INTERVAL_MIN = 20;   // 計測間隔（分）
 static const uint32_t ADV_DURATION_MIN     = 10;   // アドバタイズ継続時間（分）
 static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のときアドバタイズ
-// 1: 時刻条件・スリープをスキップして常時アドバタイズ（Gateway テスト用）。本番は 0。
-#define TEST_ADV_MODE  1
+// 1: 時刻条件・スリープをスキップして常時アドバタイズ。
+//    Gatewayとの結線テストのほか、AC電源が確保できる現場での本番運用にも使用する
+//    （電池駆動の現場は 0 にしてスリープ運用する）。
+#define ADV_CONTINUOUS_MODE  1
 #endif
 
 // ============================================================
 // アプリ設定（ここを主に編集する）
 // ============================================================
 
-#define DEBUG_MODE           1        // 1: USB Serial デバッグログ有効。本番は 0
-#define DEBUG_NO_SLEEP       1        // 1: deepSleep をスキップして即 loop() に戻る（DEBUG_MODE 1 時のみ有効）
-#define DEBUG_NO_SIGFOX      1        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
+#define DEBUG_MODE           1        // 1: USB Serial デバッグログ有効。本番は 0 ★ボタン誤作動調査のため一時的に1にしている
+#define DEBUG_NO_SLEEP       0        // 1: deepSleep をスキップして即 loop() に戻る（DEBUG_MODE 1 時のみ有効）
+#define DEBUG_NO_SIGFOX      0        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
 #define SLEEP_MINUTES        15       // 1サイクル後のスリープ時間（分）
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 #define BUTTON_LONG_PRESS_MS 5000UL  // D0 長押し閾値（ms）: 以上で tare、未満でリセット
@@ -115,6 +118,12 @@ static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のとき
 // ※ Sigfox ペイロードは現状 12B 上限に達しているため、タイムスタンプのペイロード
 //    組み込みは送信フォーマット再設計後に対応（現バージョンではログ出力のみ）。
 #define USE_DS3231_TIMESTAMP 1        // 1: 各サイクルで時刻を読み出す
+
+// ── ボタンイベント履歴の手動クリア ──────────────────────────────
+// EVENTLOG_FORCE_CLEAR を 1 にして書き込むと、起動時にフラッシュ上の
+// ボタンイベント履歴（tare.bin とは別ファイル）を空にする。
+// クリア後は必ず 0 に戻してビルドし直すこと（毎起動で消去されてしまうため）。
+#define EVENTLOG_FORCE_CLEAR 0
 
 // ── Sigfox 設定 ────────────────────────────────────────────
 #define SIGFOX_TX_PIN 8    // D8: XIAO TX → BRKLSM100 RX
@@ -224,6 +233,9 @@ static void btnISR() {
   s_btnFlag = true;
 }
 
+// ボタンイベント（タレ成功・短押しリセット等）をフラッシュへ記録する。定義は後方（DS3231関連の後）。
+static void logEvent(const char *type, int32_t extra);
+
 // ============================================================
 // ステータス LED（離散 RGB／または NeoPixel）
 // ============================================================
@@ -300,6 +312,29 @@ static void statusMeasureGreen() {
 
 static void statusErrorRed() {
   rgbHwShow(255, 0, 0, RGB_BRIGHT_FULL);
+}
+
+// タレ（ゼロ点補正）成功時: シアン（緑+青）を約4秒間点滅させる。
+// 他のどの状態表示（測定=緑・エラー=赤・スリープ=青ディム・Sigfox送信=緑点滅）とも
+// 色の組み合わせが重ならないよう選定。現場でボタン操作の結果が目視で分かるようにする。
+// 4秒間かけて点滅させることで、ボタンを離す際のチャタリングが収まるまでの
+// 猶予時間としても機能する（呼び出し側で s_btnFlag を再クリアする前提）。
+static void statusTareSuccessBlink() {
+  const unsigned long totalMs     = 4000UL;
+  const unsigned long halfPeriodMs = 200UL;
+  unsigned long elapsed = 0;
+  bool on = false;
+  while (elapsed < totalMs) {
+    on = !on;
+    if (on) {
+      rgbHwShow(0, 255, 255, RGB_BRIGHT_FULL);
+    } else {
+      rgbOff();
+    }
+    delay(halfPeriodMs);
+    elapsed += halfPeriodMs;
+  }
+  rgbOff();
 }
 
 // Sigfox 送信中の緑点滅（ノンブロッキング）
@@ -490,17 +525,21 @@ static void deepSleep(uint32_t minutes) {
           return;
         } else {
           // 短押し: ソフトウェアリセット
+          logEvent("RESET_SHORT", 0);
 #if DEBUG_MODE
           Serial.println("[BTN] short press -> reset");
           Serial.flush();
+          delay(150);  // USB送信完了待ち（flush()だけではリセットで送信が打ち切られることがある）
 #endif
           NVIC_SystemReset();
         }
       } else {
         // ボタンはすでに離されている → 短押しとみなしてリセット
+        logEvent("RESET_SHORT", 0);
 #if DEBUG_MODE
         Serial.println("[BTN] short press (released) -> reset");
         Serial.flush();
+        delay(150);  // USB送信完了待ち
 #endif
         NVIC_SystemReset();
       }
@@ -723,6 +762,7 @@ static void performTare() {
 #endif
     return;
   }
+  uint8_t successCount = 0;
   for (uint8_t i = 0; i < 4; i++) {
     if (CH_ASSIGN[i] != 1) continue;
     muxSelect((uint8_t)(i + 1));
@@ -735,6 +775,7 @@ static void performTare() {
     if (hx.is_ready()) {
       hx.tare();
       s_hx_tare_offset[i] = hx.get_offset();  // チャンネルごとに保存
+      successCount++;
 #if DEBUG_MODE
       Serial.print("[TARE] CH");
       Serial.print(i + 1);
@@ -752,10 +793,25 @@ static void performTare() {
   }
   // タレ完了後にオフセットをフラッシュへ保存（リセット後も保持するため）
   saveTareOffsets();
+
+  // 現場でボタン操作の結果が目視で分かるよう、成功時はLEDをシアンで約4秒点滅
+  if (successCount > 0) {
+    statusTareSuccessBlink();
+  }
+
+  // 長押し中〜点滅中にボタンを離した際のチャタリングでFALLING割り込みが
+  // 再発生し、s_btnFlag が立ってしまうことがある（離す動作は制御できないため）。
+  // これを次サイクルまで持ち越すと「タレ成功直後に勝手にリセットがかかる」
+  // 誤動作になるため、ここで確実に破棄する。
+  s_btnFlag = false;
+
+  logEvent("TARE_OK", (int32_t)successCount);
 }
 
-// 小さな配列のバブルソートで中央値（外れ値に強い簡易ロバスト化）
-static float median(float *a, int n) {
+// 小さな配列のバブルソートで中央値（外れ値に強い簡易ロバスト化）を求める。
+// outRange が非NULLの場合、ソート済み配列の最大-最小（そのサイクル内のブレ幅）も返す。
+// ※ レンジは BLEアドバタイズモードのみペイロードに使用する（Sigfoxモードでは未使用）。
+static float medianWithRange(float *a, int n, float *outRange) {
   float t[5];
   memcpy(t, a, sizeof(float) * (size_t)n);
   for (int i = 0; i < n - 1; i++)
@@ -765,6 +821,9 @@ static float median(float *a, int n) {
         t[j] = t[j + 1];
         t[j + 1] = x;
       }
+  if (outRange != nullptr) {
+    *outRange = t[n - 1] - t[0];
+  }
   return t[n / 2];
 }
 
@@ -791,7 +850,8 @@ static void hxBegin(uint8_t ch) {
 }
 
 // true=正常、false=タイムアウト（ERR_HX711_TIMEOUT をセット）
-static bool hxRead(int *out) {
+// outRange が非NULLの場合、DATA_NUM回サンプリング中の最大-最小（生値ベース）を返す。
+static bool hxRead(int *out, float *outRange = nullptr) {
 
   unsigned long start = millis();
 
@@ -803,6 +863,9 @@ static bool hxRead(int *out) {
       s_errors |= ERR_HX711_TIMEOUT;
       statusErrorRed();
       *out = 0;
+      if (outRange != nullptr) {
+        *outRange = 0;
+      }
       return false;
     }
   }
@@ -814,7 +877,11 @@ static bool hxRead(int *out) {
     b[i] = hx.get_value();
   }
 
-  *out = (int)median(b, DATA_NUM);
+  float range = 0;
+  *out = (int)medianWithRange(b, DATA_NUM, &range);
+  if (outRange != nullptr) {
+    *outRange = range;
+  }
   return true;
 }
 
@@ -912,6 +979,111 @@ static bool ds3231GetTime(Ds3231Time &t) {
   t.month = bcd2dec(Wire.read() & 0x1FU);   // bit7 = century bit（除く）
   t.year  = 2000U + bcd2dec(Wire.read());
   return true;
+}
+
+// ============================================================
+// ボタンイベント履歴（フラッシュ保存）
+//
+// タレ実行・短押しリセット等の発生時刻をフラッシュに記録する。
+// 現場でUSB接続できない状況でも、次回接続時に履歴を確認できるようにするため。
+// 循環バッファ形式（古いものから上書き）。
+// ============================================================
+
+#define EVENT_LOG_CAPACITY 20
+
+struct EventLogEntry {
+  char    timestamp[20];  // "YYYY-MM-DD HH:MM:SS"
+  char    type[16];       // "TARE_OK" / "RESET_SHORT" 等
+  int32_t extra;          // TARE_OK: 成功CH数 / RESET_SHORT: 実測押下ms
+};
+
+static const char EVENT_LOG_FILE[] = "/event_log.bin";
+static EventLogEntry s_eventLog[EVENT_LOG_CAPACITY];
+static uint16_t s_eventLogCount = 0;  // 有効エントリ数（最大 EVENT_LOG_CAPACITY）
+static uint16_t s_eventLogNext  = 0;  // 次に書き込むスロット（循環）
+
+// 起動時に呼ぶ。フラッシュから過去のイベントログを読み出す。
+static void loadEventLog() {
+  if (!InternalFS.begin()) return;
+  File f(InternalFS);
+  if (f.open(EVENT_LOG_FILE, FILE_O_READ)) {
+    uint16_t hdr[2];
+    if (f.read((uint8_t *)hdr, sizeof(hdr)) == (int)sizeof(hdr)) {
+      s_eventLogCount = hdr[0];
+      s_eventLogNext  = hdr[1];
+      if (s_eventLogCount > EVENT_LOG_CAPACITY) s_eventLogCount = EVENT_LOG_CAPACITY;
+      if (s_eventLogNext  >= EVENT_LOG_CAPACITY) s_eventLogNext = 0;
+      f.read((uint8_t *)s_eventLog, sizeof(s_eventLog));
+    }
+    f.close();
+  }
+}
+
+// 現在の s_eventLog をフラッシュへ書き込む
+static void saveEventLog() {
+  if (!InternalFS.begin()) return;
+  InternalFS.remove(EVENT_LOG_FILE);
+  File f(InternalFS);
+  if (f.open(EVENT_LOG_FILE, FILE_O_WRITE)) {
+    uint16_t hdr[2] = {s_eventLogCount, s_eventLogNext};
+    f.write((const uint8_t *)hdr, sizeof(hdr));
+    f.write((const uint8_t *)s_eventLog, sizeof(s_eventLog));
+    f.close();
+  }
+}
+
+// イベントを1件追加してフラッシュに保存する（DEBUG_MODEの有無に関わらず常時記録）。
+// type は15文字以内。DS3231の時刻取得に失敗した場合は "????-..." で記録する。
+static void logEvent(const char *type, int32_t extra) {
+  EventLogEntry &e = s_eventLog[s_eventLogNext];
+
+  Ds3231Time t = {};
+  if (ds3231GetTime(t)) {
+    snprintf(e.timestamp, sizeof(e.timestamp), "%04u-%02u-%02u %02u:%02u:%02u",
+             (unsigned)t.year, (unsigned)t.month, (unsigned)t.day,
+             (unsigned)t.hour, (unsigned)t.min, (unsigned)t.sec);
+  } else {
+    snprintf(e.timestamp, sizeof(e.timestamp), "????-??-?? ??:??:??");
+  }
+  strncpy(e.type, type, sizeof(e.type) - 1);
+  e.type[sizeof(e.type) - 1] = '\0';
+  e.extra = extra;
+
+  s_eventLogNext = (uint16_t)((s_eventLogNext + 1) % EVENT_LOG_CAPACITY);
+  if (s_eventLogCount < EVENT_LOG_CAPACITY) s_eventLogCount++;
+
+  saveEventLog();
+
+#if DEBUG_MODE
+  Serial.print("[EVENTLOG] 記録: ");
+  Serial.print(e.timestamp);
+  Serial.print(" ");
+  Serial.print(e.type);
+  Serial.print(" extra=");
+  Serial.println(e.extra);
+#endif
+}
+
+// 起動時（DEBUG_MODE時のみ）に過去のイベント履歴をシリアルへ出力する
+static void printEventLog() {
+#if DEBUG_MODE
+  if (s_eventLogCount == 0) {
+    Serial.println("[EVENTLOG] 記録なし");
+    return;
+  }
+  Serial.println("[EVENTLOG] ボタンイベント履歴（古い順）:");
+  uint16_t start = (s_eventLogCount < EVENT_LOG_CAPACITY) ? 0 : s_eventLogNext;
+  for (uint16_t i = 0; i < s_eventLogCount; i++) {
+    uint16_t idx = (uint16_t)((start + i) % EVENT_LOG_CAPACITY);
+    EventLogEntry &e = s_eventLog[idx];
+    Serial.print("  ");
+    Serial.print(e.timestamp);
+    Serial.print("  ");
+    Serial.print(e.type);
+    Serial.print("  extra=");
+    Serial.println(e.extra);
+  }
+#endif
 }
 
 // ============================================================
@@ -1030,6 +1202,12 @@ static int measureMPU() {
 // ch[0..3]: 各スロットの生値（CH_ASSIGN に応じて HX711 または MPU）
 int ch[4], tempV, battV;
 
+#ifdef COMM_MODE_BLE
+// chRange[0..3]: HX711チャネルのDATA_NUM回サンプリング中の最大-最小（ブレ幅）。
+// BLEアドバタイズのペイロードにのみ使用（Sigfoxモードでは送信しない）。
+int chRange[4];
+#endif
+
 // CH_ASSIGN に従い 4 スロット分を順に計測し、温度・電池を末尾に追加
 static void measureAll() {
 
@@ -1062,10 +1240,22 @@ static void measureAll() {
     if (CH_ASSIGN[i] == 1) {
       if ((s_errors & ERR_TCA9534_I2C) != 0U) {
         ch[i] = 0;
+#ifdef COMM_MODE_BLE
+        chRange[i] = 0;
+#endif
       } else {
         // 物理 CH は 1 origin（MUX と正本 JP の対応）
         hxBegin((uint8_t)(i + 1));
+#ifdef COMM_MODE_BLE
+        {
+          float range = 0;
+          hxRead(&ch[i], &range);
+          // レンジも生値→ひずみ値（με）変換で単位を揃える
+          chRange[i] = (int)(range / STRAIN_SCALE);
+        }
+#else
         hxRead(&ch[i]);
+#endif
         // 生値 → ひずみ値（με）変換
         ch[i] = (int)((float)ch[i] / STRAIN_SCALE);
       }
@@ -1257,35 +1447,47 @@ static void sendSigfox() {
 // ============================================================
 // BLE アドバタイズ（COMM_MODE_BLE 時のみ）
 //
-// MSD フォーマット（16 バイト）:
+// MSD フォーマット（21 バイト）:
 //   [0-1]  Company ID : 0xFF 0xFF
 //   [2]    Pkt type   : 0x03（Monita Flex v3.03）
 //   [3]    Device ID  : DEVICE_ID
-//   [4-5]  CH1        : int16_t LE
-//   [6-7]  CH2        : int16_t LE
-//   [8-9]  CH3        : int16_t LE
-//   [10-11] CH4       : int16_t LE
-//   [12-13] BATT      : uint16_t LE（mV）
-//   [14]   Hour       : uint8_t
-//   [15]   Minute     : uint8_t
+//   [4]    FW Version : 子機ファームのバージョン（コミットごとに+1。git logと突き合わせて特定する）
+//   [5-6]  CH1        : int16_t LE
+//   [7-8]  CH2        : int16_t LE
+//   [9-10] CH3        : int16_t LE
+//   [11-12] CH4       : int16_t LE
+//   [13-14] BATT      : uint16_t LE（mV）
+//   [15]   Hour       : uint8_t
+//   [16]   Minute     : uint8_t
+//   [17]   CH1 Range  : uint8_t（DATA_NUM回サンプリング中の最大-最小。0〜255にクランプ）
+//   [18]   CH2 Range  : uint8_t
+//   [19]   CH3 Range  : uint8_t
+//   [20]   CH4 Range  : uint8_t
 // ============================================================
 #ifdef COMM_MODE_BLE
 static void bleAdvertise(uint8_t hour, uint8_t min_val) {
-  uint8_t buf[16];
+  uint8_t buf[21];
   buf[0]  = 0xFF;
   buf[1]  = 0xFF;
   buf[2]  = 0x03;          // Pkt type: Monita Flex v3.03
   buf[3]  = DEVICE_ID;
+  buf[4]  = FW_VERSION;
   for (int i = 0; i < 4; i++) {
     int16_t v = (int16_t)ch[i];
-    buf[4 + i * 2]     = (uint8_t)(v & 0xFF);
-    buf[4 + i * 2 + 1] = (uint8_t)((v >> 8) & 0xFF);
+    buf[5 + i * 2]     = (uint8_t)(v & 0xFF);
+    buf[5 + i * 2 + 1] = (uint8_t)((v >> 8) & 0xFF);
   }
   uint16_t batt = (uint16_t)battV;
-  buf[12] = (uint8_t)(batt & 0xFF);
-  buf[13] = (uint8_t)((batt >> 8) & 0xFF);
-  buf[14] = hour;
-  buf[15] = min_val;
+  buf[13] = (uint8_t)(batt & 0xFF);
+  buf[14] = (uint8_t)((batt >> 8) & 0xFF);
+  buf[15] = hour;
+  buf[16] = min_val;
+  for (int i = 0; i < 4; i++) {
+    int r = chRange[i];
+    if (r < 0)   r = 0;
+    if (r > 255) r = 255;
+    buf[17 + i] = (uint8_t)r;
+  }
 
   Bluefruit.Advertising.stop();
   Bluefruit.Advertising.clearData();
@@ -1300,8 +1502,12 @@ static void bleAdvertise(uint8_t hour, uint8_t min_val) {
 #if DEBUG_MODE
   Serial.print("[BLE] アドバタイズ開始 ID=0x");
   Serial.print(DEVICE_ID, HEX);
+  Serial.print(" FW=");
+  Serial.print(FW_VERSION);
   Serial.print(" CH=");
   for (int i = 0; i < 4; i++) { Serial.print(ch[i]); Serial.print(" "); }
+  Serial.print("RANGE=");
+  for (int i = 0; i < 4; i++) { Serial.print(chRange[i]); Serial.print(" "); }
   Serial.print("BATT="); Serial.print(battV);
   Serial.print(" TIME="); Serial.print(hour); Serial.print(":"); Serial.println(min_val);
 #endif
@@ -1313,6 +1519,45 @@ static void bleAdvertise(uint8_t hour, uint8_t min_val) {
 // ============================================================
 
 void setup() {
+
+#if DEBUG_MODE
+  // ── デバッグ用: 起動理由の確認（RESETREAS） ─────────────────────
+  // ボタン誤作動・ウォッチドッグ・ブラウンアウト等、リセットの原因切り分けのため
+  // 他の初期化より先に読み取る（他コードがRESETREASに触れる前に読むこと）。
+  // USB再列挙・モニタ再接続のタイミングによっては起動直後の出力を1回で
+  // 取りこぼすことがあるため、値は先に読み切ってから複数回リピート出力する。
+  {
+    uint32_t reason = NRF_POWER->RESETREAS;
+    NRF_POWER->RESETREAS = 0xFFFFFFFFUL;  // 読み取り後すぐクリア（次回リセット時に前回分と混ざらないように）
+
+    Serial.begin(115200);
+    // monitor_dtr=0 では !Serial が解除されないため while(!Serial) は使わない。
+    for (int rep = 0; rep < 5; rep++) {
+      delay(1000);  // USB CDC 安定待ち・モニタ再接続待ち（1秒間隔で5回リピート）
+      Serial.println("=== DEBUG START ===");
+#ifdef COMM_MODE_BLE
+      Serial.print("[FW] Version=");
+      Serial.println(FW_VERSION);
+#endif
+      Serial.print("[RESETREAS] 0x");
+      Serial.println(reason, HEX);
+      if (reason == 0) {
+        Serial.println("  - (フラグなし。パワーオン起動、または前回リセット時に未クリア)");
+      }
+      if (reason & POWER_RESETREAS_RESETPIN_Msk) Serial.println("  - RESETPIN: 外部リセットピン");
+      if (reason & POWER_RESETREAS_DOG_Msk)      Serial.println("  - DOG: ウォッチドッグタイマー満了");
+      if (reason & POWER_RESETREAS_SREQ_Msk)     Serial.println("  - SREQ: ソフトウェアリセット（NVIC_SystemReset。ボタン短押し等）");
+      if (reason & POWER_RESETREAS_LOCKUP_Msk)   Serial.println("  - LOCKUP: CPUロックアップ");
+      if (reason & POWER_RESETREAS_OFF_Msk)      Serial.println("  - OFF: GPIOによるOFF状態からの復帰");
+      if (reason & POWER_RESETREAS_LPCOMP_Msk)   Serial.println("  - LPCOMP");
+      if (reason & POWER_RESETREAS_DIF_Msk)      Serial.println("  - DIF: デバッグ割り込み");
+      if (reason & POWER_RESETREAS_NFC_Msk)      Serial.println("  - NFC");
+      if (reason & POWER_RESETREAS_VBUS_Msk)     Serial.println("  - VBUS: USB接続によるリセット");
+      Serial.flush();
+    }
+  }
+#endif
+
   wdtInit(WDT_TIMEOUT_MS);  // 無人運用の安全網。以降 25 分キックが無ければ自動リセット
 
   rgbHwBegin();
@@ -1328,15 +1573,6 @@ void setup() {
   statusBootBlueStrong();
   delay((unsigned long)BOOT_BLUE_MS);
   statusIdleBlueDim();
-
-#if DEBUG_MODE
-  Serial.begin(115200);
-  // monitor_dtr=0 では !Serial が解除されないため while(!Serial) は使わない。
-  // USB 列挙後、1秒ごとに起動メッセージを送り続け、モニタが繋がれば確実に受信できるようにする。
-  delay(2000);  // USB CDC 安定待ち（モニタが開くまでの猶予）
-  Serial.println("=== DEBUG START ===");
-  Serial.flush();
-#endif
 
 #ifdef COMM_MODE_SIGFOX
   // nRF UART ピン割当（setPins の引数順: RX, TX）
@@ -1392,6 +1628,19 @@ void setup() {
   // フラッシュから前回のタレオフセットを復元（リセット後も継続して有効にするため）
   loadTareOffsets();
 
+  // フラッシュからボタンイベント履歴を復元し、USB接続時に確認できるよう表示
+#if EVENTLOG_FORCE_CLEAR
+  s_eventLogCount = 0;
+  s_eventLogNext  = 0;
+  saveEventLog();
+#if DEBUG_MODE
+  Serial.println("[EVENTLOG] EVENTLOG_FORCE_CLEAR=1 のため履歴を消去しました");
+#endif
+#else
+  loadEventLog();
+#endif
+  printEventLog();
+
   measureAll();
 
 #ifdef COMM_MODE_SIGFOX
@@ -1403,7 +1652,7 @@ void setup() {
   {
     Ds3231Time rtcT = {};
     bool rtcOk = ds3231GetTime(rtcT);
-#if TEST_ADV_MODE
+#if ADV_CONTINUOUS_MODE
     bleAdvertise(rtcOk ? rtcT.hour : 0, rtcOk ? rtcT.min : 0);
     delay(10000);
 #else
@@ -1413,6 +1662,17 @@ void setup() {
       uint32_t t0 = millis();
       while (millis() - t0 < advMs) { delay(1000); yield(); }
       Bluefruit.Advertising.stop();
+    } else {
+#if DEBUG_MODE
+      // アドバタイズ時間窓（毎時 :00〜:02）外のサイクル。
+      // 計測ログはこの上ですでに出ているが、このサイクルではBLE送信をスキップしたことを明示する。
+      Serial.print("[BLE] アドバタイズ時間窓外のためスキップ TIME=");
+      Serial.print(rtcOk ? rtcT.hour : 0);
+      Serial.print(":");
+      Serial.print(rtcOk ? rtcT.min : 0);
+      Serial.print(rtcOk ? "" : "（DS3231読み取り失敗）");
+      Serial.println();
+#endif
     }
     deepSleep(MEASURE_INTERVAL_MIN);
 #endif
@@ -1455,6 +1715,11 @@ void loop() {
   // ── ボタン処理（DEBUG_NO_SLEEP時 or スリープ中に押されてloop()到達時に処理）──
   if (s_btnFlag) {
     s_btnFlag = false;
+#if DEBUG_MODE
+    Serial.print("[BTN] ISRフラグ検出 t=");
+    Serial.print(millis());
+    Serial.println(" ms");
+#endif
     delay(20);  // チャタリング除去
     if (digitalRead(USER_BUTTON_PIN) == LOW) {
       // ボタンがまだ押されている → 長押し判定
@@ -1466,21 +1731,32 @@ void loop() {
           break;
         }
       }
+      unsigned long heldMs = millis() - pressStart;
       if (longPress) {
         s_pendingTare = true;
 #if DEBUG_MODE
-        Serial.println("[BTN] long press -> tare pending");
+        Serial.print("[BTN] long press -> tare pending (held=");
+        Serial.print(heldMs);
+        Serial.println(" ms)");
 #endif
       } else {
+        logEvent("RESET_SHORT", (int32_t)heldMs);
 #if DEBUG_MODE
-        Serial.println("[BTN] short press -> reset");
+        Serial.print("[BTN] short press -> reset (held=");
+        Serial.print(heldMs);
+        Serial.println(" ms, ボタンが早期に離された可能性)");
+        Serial.flush();
+        delay(150);  // USB送信完了待ち（flush()だけではリセットで送信が打ち切られることがある）
 #endif
         NVIC_SystemReset();
       }
     } else {
       // ボタンはすでに離されている（計測中等に押されてloop()到達時に検知）→ 短押しとみなしてリセット
+      logEvent("RESET_SHORT", 0);
 #if DEBUG_MODE
-      Serial.println("[BTN] short press (released) -> reset");
+      Serial.println("[BTN] short press (released) -> reset（チャタリング除去20ms待機時点で既にHIGH）");
+      Serial.flush();
+      delay(150);  // USB送信完了待ち
 #endif
       NVIC_SystemReset();
     }
@@ -1501,7 +1777,7 @@ void loop() {
   {
     Ds3231Time rtcT = {};
     bool rtcOk = ds3231GetTime(rtcT);
-#if TEST_ADV_MODE
+#if ADV_CONTINUOUS_MODE
     bleAdvertise(rtcOk ? rtcT.hour : 0, rtcOk ? rtcT.min : 0);
     delay(10000);
 #else
@@ -1511,6 +1787,17 @@ void loop() {
       uint32_t t0 = millis();
       while (millis() - t0 < advMs) { delay(1000); yield(); }
       Bluefruit.Advertising.stop();
+    } else {
+#if DEBUG_MODE
+      // アドバタイズ時間窓（毎時 :00〜:02）外のサイクル。
+      // 計測ログはこの上ですでに出ているが、このサイクルではBLE送信をスキップしたことを明示する。
+      Serial.print("[BLE] アドバタイズ時間窓外のためスキップ TIME=");
+      Serial.print(rtcOk ? rtcT.hour : 0);
+      Serial.print(":");
+      Serial.print(rtcOk ? rtcT.min : 0);
+      Serial.print(rtcOk ? "" : "（DS3231読み取り失敗）");
+      Serial.println();
+#endif
     }
     deepSleep(MEASURE_INTERVAL_MIN);
 #endif

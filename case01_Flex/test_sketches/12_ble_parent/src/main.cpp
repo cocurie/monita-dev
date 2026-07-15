@@ -13,21 +13,24 @@
  * フィルタ条件:
  *   Manufacturer Data の Company ID = 0xFFFF、Pkt type = 0x01、Device ID = 0x01
  *
- * Manufacturer Data フォーマット（子機と共通、16バイト）:
+ * Manufacturer Data フォーマット（子機と共通、17バイト）:
  *   [0-1]  Company ID  0xFF 0xFF
  *   [2]    Pkt type    0x01
  *   [3]    Device ID   0x01 = "test01"
- *   [4-5]  CH1 ひずみ  int16_t LE（生値 / 100）
- *   [6-7]  CH2 ひずみ  int16_t LE
- *   [8-9]  CH3 ひずみ  int16_t LE
- *   [10-11] CH4 ひずみ int16_t LE
- *   [12-13] バッテリー uint16_t LE（mV）
- *   [14-15] 次回計測まで uint16_t LE（秒）
+ *   [4]    FW Version  子機ファームのバージョン（コミットごとに+1。git logと突き合わせて特定する）
+ *   [5-6]  CH1 ひずみ  int16_t LE（生値 / 100）
+ *   [7-8]  CH2 ひずみ  int16_t LE
+ *   [9-10] CH3 ひずみ  int16_t LE
+ *   [11-12] CH4 ひずみ int16_t LE
+ *   [13-14] バッテリー uint16_t LE（mV）
+ *   [15-16] 次回計測まで uint16_t LE（秒）
  *
  * SD カード CSV フォーマット（log.csv）:
- *   session,elapsed_sec,pkt_count,ch1_avg,ch2_avg,ch3_avg,ch4_avg,batt_mv,next_wake_sec
+ *   session,elapsed_sec,pkt_count,fw_version,parent_fw_version,ch1_avg,ch2_avg,ch3_avg,ch4_avg,batt_mv,next_wake_sec
  *   ※ elapsed_sec は起動からの経過秒（RTC 未実装のため）
  *   ※ ch*_avg は ×100 の整数値（子機パケットそのまま）
+ *   ※ fw_version は子機ファームのバージョン。スキャンウィンドウ内で最後に受信したパケットの値（子機は基本一定）
+ *   ※ parent_fw_version は本スケッチ（親機）自身のバージョン。PARENT_FW_VERSION 定数（コミットごとに+1）
  *
  * LED:
  *   Blue 点灯    : スキャン中
@@ -57,6 +60,7 @@ static const uint8_t  TARGET_DEVICE_ID  = 0x01;   // 受信対象の子機 ID
 static const uint8_t  MFR_COMPANY_LO    = 0xFF;   // Company ID（子機と一致させる）
 static const uint8_t  MFR_COMPANY_HI    = 0xFF;
 static const uint8_t  PKT_TYPE          = 0x01;
+static const uint8_t  PARENT_FW_VERSION = 1;      // 親機（本スケッチ）自身のバージョン。コミットのたびに+1すること
 
 // スキャン時間設定
 static const uint32_t FIRST_SCAN_SEC    = 120;    // 初回スキャン時間（秒）
@@ -103,6 +107,7 @@ static int32_t  s_sum[4]      = {0};
 static int32_t  s_battSum     = 0;
 static uint16_t s_nextWakeSec = 600;
 static int      s_pktCount    = 0;
+static uint8_t  s_lastFwVersion = 0;  // スキャンウィンドウ内で最後に受信した子機ファームバージョン
 
 // ══════════════════════════════════════════════
 // LED ヘルパー（アクティブ LOW）
@@ -138,7 +143,7 @@ static void sdInit() {
   if (!sd.exists(LOG_FILE)) {
     FsFile f = sd.open(LOG_FILE, O_WRITE | O_CREAT);
     if (f) {
-      f.println(F("session,elapsed_sec,pkt_count,ch1_avg,ch2_avg,ch3_avg,ch4_avg,batt_mv,next_wake_sec"));
+      f.println(F("session,elapsed_sec,pkt_count,fw_version,parent_fw_version,ch1_avg,ch2_avg,ch3_avg,ch4_avg,batt_mv,next_wake_sec"));
       f.close();
       Serial.println(F("[SD] " LOG_FILE " を新規作成しました"));
     }
@@ -152,7 +157,7 @@ static void sdInit() {
 // SD 書き込み（1行 CSV 追記）
 // ══════════════════════════════════════════════
 #if ENABLE_SD_LOG
-static void sdLog(uint32_t sessionNo, int pktCount,
+static void sdLog(uint32_t sessionNo, int pktCount, uint8_t fwVersion,
                   int32_t ch1, int32_t ch2, int32_t ch3, int32_t ch4,
                   uint32_t battMv, uint16_t nextWakeSec) {
   if (!s_sdReady) return;
@@ -168,6 +173,8 @@ static void sdLog(uint32_t sessionNo, int pktCount,
   f.print(sessionNo);     f.print(',');
   f.print(elapsedSec);    f.print(',');
   f.print(pktCount);      f.print(',');
+  f.print(fwVersion);     f.print(',');
+  f.print(PARENT_FW_VERSION); f.print(',');
   f.print(ch1);           f.print(',');
   f.print(ch2);           f.print(',');
   f.print(ch3);           f.print(',');
@@ -228,10 +235,12 @@ static void stopScan() {
     }
     Serial.print(F("  バッテリー: ")); Serial.print(avgBatt); Serial.println(F(" mV"));
     Serial.print(F("  次回計測まで: ")); Serial.print(s_nextWakeSec); Serial.println(F(" sec"));
+    Serial.print(F("  子機FWバージョン: ")); Serial.println(s_lastFwVersion);
+    Serial.print(F("  親機FWバージョン: ")); Serial.println(PARENT_FW_VERSION);
     Serial.println(F("  ──────────────────────────────────"));
 
 #if ENABLE_SD_LOG
-    sdLog(s_sessionNo, s_pktCount,
+    sdLog(s_sessionNo, s_pktCount, s_lastFwVersion,
           avgCh[0], avgCh[1], avgCh[2], avgCh[3],
           avgBatt, s_nextWakeSec);
 #endif
@@ -257,23 +266,25 @@ static void scanCallback(ble_gap_evt_adv_report_t* report) {
   uint8_t len = Bluefruit.Scanner.parseReportByType(
       report, BLE_GAP_AD_TYPE_MANUFACTURER_SPECIFIC_DATA, buf, sizeof(buf));
 
-  if (len >= 16
+  if (len >= 17
       && buf[0] == MFR_COMPANY_LO
       && buf[1] == MFR_COMPANY_HI
       && buf[2] == PKT_TYPE
       && buf[3] == TARGET_DEVICE_ID) {
 
+    uint8_t  fwVersion = buf[4];
     int16_t  ch[4];
     uint16_t battMv, nextWake;
     for (int i = 0; i < 4; i++) {
-      ch[i] = (int16_t)(buf[4 + i * 2] | ((uint16_t)buf[5 + i * 2] << 8));
+      ch[i] = (int16_t)(buf[5 + i * 2] | ((uint16_t)buf[6 + i * 2] << 8));
     }
-    battMv   = (uint16_t)(buf[12] | ((uint16_t)buf[13] << 8));
-    nextWake = (uint16_t)(buf[14] | ((uint16_t)buf[15] << 8));
+    battMv   = (uint16_t)(buf[13] | ((uint16_t)buf[14] << 8));
+    nextWake = (uint16_t)(buf[15] | ((uint16_t)buf[16] << 8));
 
     for (int i = 0; i < 4; i++) s_sum[i] += ch[i];
-    s_battSum    += battMv;
-    s_nextWakeSec = nextWake;
+    s_battSum      += battMv;
+    s_nextWakeSec   = nextWake;
+    s_lastFwVersion = fwVersion;
     s_pktCount++;
     s_lastPktMs = millis();
 
@@ -286,6 +297,7 @@ static void scanCallback(ble_gap_evt_adv_report_t* report) {
                report->peer_addr.addr[1], report->peer_addr.addr[0]);
       Serial.print(F("  MAC: ")); Serial.println(mac);
       Serial.print(F("  RSSI: ")); Serial.print(report->rssi); Serial.println(F(" dBm"));
+      Serial.print(F("  FW Version: ")); Serial.println(fwVersion);
       Serial.print(F("  CH1-4: "));
       for (int i = 0; i < 4; i++) { Serial.print(ch[i]); Serial.print(' '); }
       Serial.println();
