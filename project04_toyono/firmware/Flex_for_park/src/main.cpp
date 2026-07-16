@@ -1,6 +1,6 @@
 /**
  * 豊能町公園人流測定 — Monita Flex v3.04
- * Phase-1: BLE スキャン + SD カード記録
+ * BLE スキャン + SD カード記録 + PIR + 音声(PDM)解析
  *
  * ハード: Monita Flex v3.04 + Seeed XIAO nRF52840 Sense
  *
@@ -54,9 +54,17 @@
  *   DS3231 は電源オフ後も時刻を保持する (CR2032 バックアップ電源が必要)
  *   DS3231 未接続時は millis() 起点の経過時間をタイムスタンプとして記録する
  *
- * フェーズ別有効化
- *   Phase-2: PIR (D8) → 本ファイル末尾の PIR ブロックを参照
- *   Phase-3: 音声 (PDM) → 本ファイル末尾の AUDIO ブロックを参照
+ * PIR / 音声解析の ON・OFF
+ *   下記 ENABLE_PIR / ENABLE_AUDIO を false にすると、該当センサの初期化・
+ *   計測処理を丸ごとスキップする（未配線・省電力優先時などに false にする）。
+ *   PIR配線: D8=PIR OUT（Sigfoxコネクタライン、D9はダミーCSと共用）、常時 INPUT で監視
+ *   音声  : オンボード PDM マイク（Sense版のみ搭載）、生波形は保存しない
+ *           マイクは BLE スキャン中（30秒）のみ ON にし、スリープ中（90秒）は
+ *           PDM.end() で完全停止する（消費電力優先。PIR は常時稼働のまま）
+ *
+ * CSV ログ (SD /log.csv)
+ *   datetime,people,devices,pir,rms_dbfs,L,ML,MH,H
+ *   （ENABLE_PIR/ENABLE_AUDIO=false の列は 0 / -120.0 のプレースホルダになる）
  */
 
 #include <Arduino.h>
@@ -66,6 +74,8 @@
 #include <bluefruit.h>
 #include <math.h>
 #include <string.h>
+#include <PDM.h>
+#include <arduinoFFT.h>
 
 // ═══════════════════════════════════════
 // ▼ 設定パラメータ
@@ -95,10 +105,10 @@ static char const*      LOG_FILE       = "/log.csv";
 
 // ── スキャン / スリープ ────────────────
 static uint32_t const SCAN_DURATION_MS  = 30000;  // スキャン時間 (ms)
-static uint32_t const SLEEP_DURATION_MS = 90000;  // スリープ時間 (ms)
+static uint32_t const SLEEP_DURATION_MS = 300000;  // スリープ時間 (ms)
 
 // ── BLE クラスタリングパラメータ ─────────
-static int   const MIN_HITS       = 12;   // 有効デバイスのヒット最小回数
+static int   const MIN_HITS       = 10;   // 有効デバイスのヒット最小回数
 static int   const RSSI_THRESHOLD = -65;  // 採用 RSSI 下限 (dBm)
 static int   const RSSI_MERGE_GAP = 3;   // 同一人物とみなす RSSI 差 (dBm)
 static float const CALIBRATION    = 1.0f; // 人数補正係数
@@ -112,6 +122,26 @@ static uint32_t const LED_BLINK_MS = 1000;
 
 // ── キャリブレーション ──────────────────
 #define CALIB_MIN_SAMPLES 5
+
+// ── PIR ──────────────────────────────
+static bool     const ENABLE_PIR      = true;    // false で PIR 機能を完全無効化
+#define PIR_PIN D8                               // PIR OUT（Sigfoxコネクタライン）
+static uint32_t const PIR_DEBOUNCE_MS = 2000;    // 再検出抑止時間 (ms)
+
+// ── PDM / 音声 ───────────────────────
+static bool     const ENABLE_AUDIO     = true;   // false で音声解析を完全無効化
+static uint8_t  const PDM_GAIN         = 30;      // 0〜80（クリップなら下げる）
+static uint32_t const SENSOR_REPORT_MS = 1000;    // 音声値のシリアル出力間隔
+
+static uint16_t const FFT_SIZE       = 256;       // FFT 点数（2 のべき乗）
+static float    const SAMPLE_RATE    = 16000.0f;
+// dBFS 基準: Hann 窓後フルスケール振幅 ≈ A * FFT_SIZE/4
+static double   const FFT_FULL_SCALE = (FFT_SIZE / 4.0) * 32768.0;
+
+static int   const NUM_BANDS      = 4;
+static float const BAND_LOW_HZ [] = { 125.0f,  500.0f, 2000.0f, 4000.0f };
+static float const BAND_HIGH_HZ[] = { 500.0f, 2000.0f, 4000.0f, 8000.0f };
+static char const* BAND_NAME[]    = { "L", "ML", "MH", "H" };
 
 // ═══════════════════════════════════════
 // ▼ グローバル
@@ -157,6 +187,39 @@ static bool     s_rtcSet   = false;
 
 // 前方宣言 (実装は eraseLog 以降の「時刻ユーティリティ」セクション)
 static void getTimestamp(char *buf, size_t len);
+
+// PIR
+static uint32_t pirScanCount  = 0;    // スキャン窓の検出数（ログ・出力用）
+static uint32_t pirLastDetect = 0;
+static bool     pirPrevState  = false;
+
+// PDM / 音声
+static int16_t const PDM_BUF_SAMPLES = 512;
+static int16_t      pdmBuf[PDM_BUF_SAMPLES];
+static volatile int pdmReady = 0;
+
+static uint16_t const RING_SIZE = FFT_SIZE * 4;   // 1024（2 のべき乗）
+static uint16_t const RING_MASK = RING_SIZE - 1;
+static int16_t      ringBuf[RING_SIZE];
+static uint16_t     ringHead = 0;
+static uint16_t     ringTail = 0;
+
+static float vReal[FFT_SIZE];
+static float vImag[FFT_SIZE];
+static ArduinoFFT<float> FFT(vReal, vImag, FFT_SIZE, SAMPLE_RATE);
+
+// 1 秒ウィンドウ集計
+static double   rmsAccumSq = 0.0;
+static uint32_t rmsAccumN  = 0;
+static double   bandAccum[NUM_BANDS] = {};
+static uint32_t bandWindows = 0;
+
+// スキャン窓（30秒）集計
+static double scanRmsSum             = 0.0;
+static double scanBandSum[NUM_BANDS] = {};
+static int    scanSnapCount          = 0;
+
+static uint32_t lastSensorMs = 0;
 
 // ═══════════════════════════════════════
 // ▼ TCA9534 ソフト I2C (Wire/TWIM 不使用)
@@ -376,7 +439,7 @@ static bool initSd() {
   if (ENABLE_LOGGING && !sd.exists(LOG_FILE)) {
     FsFile f = sd.open(LOG_FILE, O_WRITE | O_CREAT);
     if (f) {
-      f.println("datetime,people,devices");
+      f.println("datetime,people,devices,pir,rms_dbfs,L,ML,MH,H");
       f.close();
       Serial.println("[SD] /log.csv created");
     }
@@ -384,8 +447,12 @@ static bool initSd() {
   return true;
 }
 
-/** 1 サイクル分のデータを /log.csv に追記する */
-static void logRecord(int people, int devCount) {
+/**
+ * 1 サイクル分のデータを /log.csv に追記する
+ * ENABLE_PIR/ENABLE_AUDIO=false の場合、該当引数は 0 / -120.0 のプレースホルダを渡す
+ */
+static void logRecord(int people, int devCount, uint32_t pirCount,
+                       double rmsDb, double bandDb[]) {
   if (!ENABLE_LOGGING || !s_sdReady) return;
 
   FsFile f = sd.open(LOG_FILE, O_WRITE | O_APPEND);
@@ -394,7 +461,11 @@ static void logRecord(int people, int devCount) {
   char ts[24];
   getTimestamp(ts, sizeof(ts));
 
-  f.print(ts); f.print(","); f.print(people); f.print(","); f.println(devCount);
+  f.print(ts); f.print(","); f.print(people); f.print(","); f.print(devCount);
+  f.print(","); f.print(pirCount);
+  f.print(","); f.print(rmsDb, 1);
+  for (int b = 0; b < NUM_BANDS; b++) { f.print(","); f.print(bandDb[b], 1); }
+  f.println();
   f.close();
 }
 
@@ -485,6 +556,104 @@ static void printTimestamp() {
   char buf[24];
   getTimestamp(buf, sizeof(buf));
   Serial.print(buf);
+}
+
+// ═══════════════════════════════════════
+// ▼ PIR
+// ═══════════════════════════════════════
+
+static void checkPIR() {
+  bool cur = (bool)digitalRead(PIR_PIN);
+  uint32_t now = millis();
+  if (cur && !pirPrevState) {                        // 立ち上がりエッジ
+    if (now - pirLastDetect >= PIR_DEBOUNCE_MS) {
+      pirScanCount++;
+      pirLastDetect = now;
+    }
+  }
+  pirPrevState = cur;
+}
+
+// ═══════════════════════════════════════
+// ▼ 音声 (PDM + FFT 帯域解析)
+// ═══════════════════════════════════════
+
+static void onPDMdata() {
+  int bytes = PDM.available();
+  if (bytes > (int)(PDM_BUF_SAMPLES * sizeof(int16_t)))
+    bytes = PDM_BUF_SAMPLES * sizeof(int16_t);
+  PDM.read(pdmBuf, bytes);
+  pdmReady = bytes / (int)sizeof(int16_t);
+}
+
+static void calcBandMag(float outMag[]) {
+  const float freqRes = SAMPLE_RATE / (float)FFT_SIZE;
+  for (int b = 0; b < NUM_BANDS; b++) {
+    int binLo = max(1,                (int)(BAND_LOW_HZ[b]  / freqRes + 0.5f));
+    int binHi = min((int)(FFT_SIZE/2), (int)(BAND_HIGH_HZ[b] / freqRes + 0.5f));
+    double sumSq = 0.0; int cnt = 0;
+    for (int i = binLo; i < binHi; i++) { sumSq += (double)vReal[i]*(double)vReal[i]; cnt++; }
+    outMag[b] = (cnt > 0) ? (float)sqrt(sumSq / cnt) : 0.0f;
+  }
+}
+
+/** リングバッファへの転記と FFT_SIZE 分溜まった際の FFT 処理。main loop から毎フレーム呼ぶ */
+static void processPDM() {
+  if (pdmReady > 0) {
+    int n = pdmReady; pdmReady = 0;
+    for (int i = 0; i < n; i++) {
+      int16_t s = pdmBuf[i];
+      ringBuf[ringHead & RING_MASK] = s;
+      ringHead++;
+      rmsAccumSq += (double)s * (double)s;
+    }
+    rmsAccumN += (uint32_t)n;
+  }
+  while ((uint16_t)(ringHead - ringTail) >= FFT_SIZE) {
+    for (int i = 0; i < FFT_SIZE; i++) {
+      vReal[i] = (float)ringBuf[(ringTail + i) & RING_MASK];
+      vImag[i] = 0.0f;
+    }
+    ringTail += FFT_SIZE;
+    FFT.windowing(FFTWindow::Hann, FFTDirection::Forward);
+    FFT.compute(FFTDirection::Forward);
+    FFT.complexToMagnitude();
+    float mag[NUM_BANDS]; calcBandMag(mag);
+    for (int b = 0; b < NUM_BANDS; b++) bandAccum[b] += (double)mag[b];
+    bandWindows++;
+  }
+}
+
+/** 1 秒ごとの音声値算出・シリアル出力・スキャン窓集計・リセット */
+static void sensorTick(bool isScan) {
+  double rms  = (rmsAccumN > 0) ? sqrt(rmsAccumSq / (double)rmsAccumN) : 0.0;
+  double dbfs = (rms > 0.0)     ? 20.0 * log10(rms / 32768.0)          : -120.0;
+
+  double bDb[NUM_BANDS];
+  for (int b = 0; b < NUM_BANDS; b++) {
+    double avg = (bandWindows > 0) ? bandAccum[b] / (double)bandWindows : 0.0;
+    bDb[b] = (avg > 0.0) ? 20.0 * log10(avg / FFT_FULL_SCALE) : -120.0;
+  }
+
+  Serial.print("[");
+  printTimestamp();
+  Serial.print(isScan ? "|SCAN ] " : "|SLEEP] ");
+  Serial.print("rms="); Serial.print(dbfs, 1); Serial.print(" dBFS");
+  for (int b = 0; b < NUM_BANDS; b++) {
+    Serial.print("  "); Serial.print(BAND_NAME[b]);
+    Serial.print("="); Serial.print(bDb[b], 1);
+  }
+  Serial.println();
+
+  if (isScan) {
+    scanRmsSum += dbfs;
+    for (int b = 0; b < NUM_BANDS; b++) scanBandSum[b] += bDb[b];
+    scanSnapCount++;
+  }
+
+  rmsAccumSq = 0.0; rmsAccumN = 0;
+  for (int b = 0; b < NUM_BANDS; b++) bandAccum[b] = 0.0;
+  bandWindows = 0;
 }
 
 // ═══════════════════════════════════════
@@ -637,7 +806,7 @@ void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000) yield();
 
-  Serial.println("\n=== Toyono Park Monitor (Flex v3.04 / Phase-1: BLE+SD) ===");
+  Serial.println("\n=== Toyono Park Monitor (Flex v3.04 / BLE+SD+PIR+Audio) ===");
   Serial.println("    Commands: d=dump  e=erase  c<N>=calib  r=result  x=exit  t<YYYYMMDDHHMMSS>=settime");
 
   // ソフト I2C 初期化 → TCA9534 (3V3_SW ON / SD CS=HIGH)
@@ -676,6 +845,24 @@ void setup() {
   pinMode(LED_BLUE, OUTPUT);
   digitalWrite(LED_BLUE, HIGH);  // 消灯 (アクティブ LOW)
 
+  // PIR
+  if (ENABLE_PIR) {
+    pinMode(PIR_PIN, INPUT_PULLDOWN);  // センサ未接続時のフローティング誤検出を防止
+    Serial.print("[PIR] pin=D"); Serial.print(PIR_PIN);
+    Serial.print("  debounce="); Serial.print(PIR_DEBOUNCE_MS); Serial.println("ms");
+  } else {
+    Serial.println("[PIR] disabled (ENABLE_PIR=false)");
+  }
+
+  // 音声 (PDM) — コールバック登録のみ。マイク自体の起動/停止はスキャン開始/終了時に行う
+  if (ENABLE_AUDIO) {
+    PDM.onReceive(onPDMdata);
+    Serial.print("[PDM] enabled  mono 16kHz  gain="); Serial.print(PDM_GAIN);
+    Serial.println("  (scan中のみマイクON)");
+  } else {
+    Serial.println("[PDM] disabled (ENABLE_AUDIO=false)");
+  }
+
   // BLE
   Bluefruit.begin(1, 0);
   Bluefruit.setName("ParkMonitor_Flex");
@@ -695,8 +882,27 @@ void setup() {
 
 void loop() {
 
-  // ① スキャン開始
-  deviceCount = 0;
+  // ① スキャン開始（PIR・音声のスキャン窓集計もリセット）
+  deviceCount   = 0;
+  pirScanCount  = 0;
+  scanRmsSum    = 0.0;
+  scanSnapCount = 0;
+  for (int b = 0; b < NUM_BANDS; b++) scanBandSum[b] = 0.0;
+
+  // 音声: マイクはスキャン中だけ ON にする（BLEと同じデューティで省電力化）
+  if (ENABLE_AUDIO) {
+    ringHead = ringTail = 0;
+    rmsAccumSq = 0.0; rmsAccumN = 0;
+    for (int b = 0; b < NUM_BANDS; b++) bandAccum[b] = 0.0;
+    bandWindows = 0;
+    if (!PDM.begin(1, (int)SAMPLE_RATE)) {
+      Serial.println("[ERR] PDM.begin() failed — Sense ボードか確認");
+    } else {
+      PDM.setGain(PDM_GAIN);   // begin() 内部で gain がデフォルト値に戻るため再設定
+    }
+    lastSensorMs = millis();
+  }
+
   Bluefruit.Scanner.start(0);
   Serial.print("[SCAN] "); Serial.print(SCAN_DURATION_MS / 1000); Serial.println("s start");
 
@@ -706,25 +912,48 @@ void loop() {
 
   while (millis() < scanEnd) {
     handleSerial();
+    if (ENABLE_PIR) checkPIR();
+    if (ENABLE_AUDIO) {
+      processPDM();
+      if (millis() - lastSensorMs >= SENSOR_REPORT_MS) {
+        sensorTick(true);
+        lastSensorMs += SENSOR_REPORT_MS;
+      }
+    }
     if (millis() - lastBlink >= LED_BLINK_MS) {
       ledOn = !ledOn;
       digitalWrite(LED_BLUE, ledOn ? LOW : HIGH);
       lastBlink = millis();
     }
-    delay(10);
+    delay(5);
   }
 
-  // ② スキャン停止 / LED 消灯
+  // ② スキャン停止 / LED 消灯 / マイク OFF
   Bluefruit.Scanner.stop();
   digitalWrite(LED_BLUE, HIGH);
+  if (ENABLE_AUDIO) PDM.end();
 
-  // ③ 人数推定 + 出力 + ログ
+  // ③ 人数推定 + PIR/音声集計 + 出力 + ログ
   int people = estimatePeople();
+  double avgRms = (scanSnapCount > 0) ? scanRmsSum / (double)scanSnapCount : -120.0;
+  double avgBand[NUM_BANDS];
+  for (int b = 0; b < NUM_BANDS; b++)
+    avgBand[b] = (scanSnapCount > 0) ? scanBandSum[b] / (double)scanSnapCount : -120.0;
+
   Serial.println("------------------------------");
   Serial.print("["); printTimestamp(); Serial.print("]");
   Serial.print("  People="); Serial.print(people);
-  Serial.print("  devices="); Serial.println(deviceCount);
-  logRecord(people, deviceCount);
+  Serial.print("  devices="); Serial.print(deviceCount);
+  if (ENABLE_PIR) { Serial.print("  PIR="); Serial.print(pirScanCount); }
+  if (ENABLE_AUDIO) {
+    Serial.print("  rms="); Serial.print(avgRms, 1);
+    for (int b = 0; b < NUM_BANDS; b++) {
+      Serial.print("  "); Serial.print(BAND_NAME[b]); Serial.print("="); Serial.print(avgBand[b], 1);
+    }
+  }
+  Serial.println();
+
+  logRecord(people, deviceCount, pirScanCount, avgRms, avgBand);
 
   // ④ キャリブレーション
   if (calibMode) {
@@ -741,58 +970,14 @@ void loop() {
     if (calibSamples >= CALIB_MIN_SAMPLES) { printCalibResult(); calibMode = false; }
   }
 
-  // ⑤ スリープ (nRF52 delay は低消費電力スリープ)
+  // ⑤ スリープ (nRF52 delay は低消費電力スリープ。マイクは PDM.end() 済みで停止中)
   Serial.print("[SLEEP] "); Serial.print(SLEEP_DURATION_MS / 1000); Serial.println("s");
   Serial.flush();
 
   uint32_t sleepEnd = millis() + SLEEP_DURATION_MS;
-  while (millis() < sleepEnd) { handleSerial(); delay(10); }
+  while (millis() < sleepEnd) {
+    handleSerial();
+    if (ENABLE_PIR) checkPIR();
+    delay(10);
+  }
 }
-
-
-// ╔══════════════════════════════════════════════════════════╗
-// ║  Phase-2: PIR センサ (有効化手順)                        ║
-// ║  配線: Sigfox コネクタライン                              ║
-// ║    D8 = PIR OUT, D9 = (未使用), VCC/GND も同列           ║
-// ║  → D9 は SD CS ダミー用途から PIR 用 GND に変更可         ║
-// ╚══════════════════════════════════════════════════════════╝
-//
-// Step 1: 以下のコメントを外す
-//
-// #define PIR_PIN D8
-// static int s_pirHits = 0;
-//
-// Step 2: setup() 末尾に追加
-//   pinMode(PIR_PIN, INPUT);
-//
-// Step 3: loop() の while (millis() < scanEnd) ブロック内に追加
-//   if (digitalRead(PIR_PIN) == HIGH) s_pirHits++;
-//
-// Step 4: ③ 人数推定 + 出力 の行を変更
-//   Serial.print("  PIR="); Serial.println(s_pirHits);
-//   logRecord(people, deviceCount, s_pirHits);  // ← 引数追加
-//   s_pirHits = 0;
-//
-// Step 5: logRecord() のシグネチャと CSV ヘッダを更新
-//   "timestamp,people,devices,pir"
-//
-// ─────────────────────────────────────────────────────────────
-//
-// ╔══════════════════════════════════════════════════════════╗
-// ║  Phase-3: 音声 (PDM) センサ (有効化手順)                 ║
-// ║  必要ハード: XIAO nRF52840 Sense (PDM マイク内蔵)        ║
-// ╚══════════════════════════════════════════════════════════╝
-//
-// Step 1: platformio.ini の kosme/arduinoFFT のコメントを外す
-//
-// Step 2: 以下のインクルードを追加
-//   #include <PDM.h>
-//   #include <arduinoFFT.h>
-//
-// Step 3: 音声取得 + FFT の実装は以下を参照:
-//   case00_common/nrf52Sense_pdm_sound_monitor/src/main.cpp
-//   主要パラメータ: PDM_GAIN=30, FFT_SIZE=256, SAMPLE_RATE=16000
-//   4バンド: L(125-500Hz), ML(500-2kHz), MH(2-4kHz), H(4-8kHz)
-//
-// Step 4: logRecord() に音声値を追加し CSV ヘッダを更新
-//   "timestamp,people,devices,pir,rms_dbfs,L,ML,MH,H"
