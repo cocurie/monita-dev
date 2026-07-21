@@ -188,6 +188,15 @@ static inline void wdtFeed() {
 static uint32_t const APP_WDT_NO_SEND_RESET_MS = 1800000UL;  // 30分: この間GAS送信成功が無ければ再起動
 static uint32_t lastGasSuccessMs = 0;  // 最後にGAS送信が成功した millis()（setup先頭で初期化）
 
+// 段階的復旧（★2026-07-21 追加、有野川障害の教訓）:
+// アプリWDTの「30分無送信で全再起動」の前に、より軽く速い一段目として
+// 「送信が規定回数連続で失敗したら、モデムだけソフトリセット(CFUN=0/1)して再接続」を挟む。
+// 有野川で疑われたモデムのSSL/HTTPスタック固着（CGATT正常＝アタッチ維持のまま送信だけ失敗）は
+// setup()でしか実行されないモデムリセットに降りていけず永続化した。送信失敗時にもモデムリセットへ
+// 降りられるようにする。これでも復旧しなければ30分の全再起動が最終backstop。
+static int const MODEM_RESET_FAIL_THRESHOLD = 3;  // 連続失敗した送信サイクル数（5分間隔なら約15分）
+static int consecutiveSendFailures = 0;
+
 static void appWatchdogCheck() {
   if (millis() - lastGasSuccessMs >= APP_WDT_NO_SEND_RESET_MS) {
     Serial.println(F("\n‼ アプリWDT: 規定時間 GAS 送信成功なし → NVIC_SystemReset で強制再起動"));
@@ -545,6 +554,21 @@ bool ensureNetworkReady() {
   return initNetwork();
 }
 
+// モデムのソフトリセット（★2026-07-21）:
+// 送信が連続で全滅した際、CGATTがOKでも上位(SSL/HTTP/PDP)が固着している可能性があるため、
+// 無線を一旦落として(CFUN=0/1)から再登録・再接続する。全再起動より軽く速い一段目の復旧手段。
+bool modemSoftReset() {
+  Serial.println(F("\n⚠ 送信が連続失敗 → モデムをソフトリセット(CFUN=0/1)して再接続します"));
+  sendAT("AT+CFUN=0", 5000); delay(2000);
+  sendAT("AT+CFUN=1", 5000); delay(5000);
+  sendAT("AT+CNMP=38", 2000); delay(500);  // LTE only
+  sendAT("AT+CMNB=1",  2000); delay(500);  // Cat-M1
+  bool ok = initNetwork();                 // CREG/CGATT/CNACT を張り直す
+  Serial.println(ok ? F("✓ モデムソフトリセット後 再接続成功")
+                    : F("✗ ソフトリセット後も再接続失敗（30分の全再起動backstopに委ねる）"));
+  return ok;
+}
+
 // SIM7080G（LTE-M モデム）自身の受信電波強度を取得する
 // 戻り値: 0-31（値が大きいほど良好）、99=圏外/取得失敗
 int getSimCsq() {
@@ -701,10 +725,20 @@ void flushRecords() {
 
   if (ok) {
     Serial.println(F("✓ 送信成功（再送キュー クリア）"));
+    consecutiveSendFailures = 0;
   } else {
     Serial.println(F("✗ 再試行も失敗。次回送信サイクルで再送キューとしてリトライします"));
     pendingCount = n;
     memcpy(pendingRecords, merged, sizeof(FlexRecord) * n);
+
+    // 段階的復旧: 連続失敗をカウントし、閾値でモデムをソフトリセット
+    consecutiveSendFailures++;
+    Serial.print(F("連続送信失敗: ")); Serial.print(consecutiveSendFailures);
+    Serial.print(F("/")); Serial.println(MODEM_RESET_FAIL_THRESHOLD);
+    if (consecutiveSendFailures >= MODEM_RESET_FAIL_THRESHOLD) {
+      modemSoftReset();
+      consecutiveSendFailures = 0;  // リセットを試みたので一旦クリア
+    }
   }
 }
 

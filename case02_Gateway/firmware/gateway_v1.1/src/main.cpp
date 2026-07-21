@@ -155,7 +155,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 5;
+static uint8_t  const GATEWAY_FW_VERSION = 6;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -282,6 +282,15 @@ static inline void wdtFeed() {
 // ══════════════════════════════════════════════
 static uint32_t const APP_WDT_NO_SEND_RESET_MS = 1800000UL;  // 30分: この間GAS送信成功が無ければ再起動
 static uint32_t lastGasSuccessMs = 0;  // 最後にGAS送信が成功した millis()（setup先頭で初期化）
+
+// 段階的復旧（★2026-07-21 追加、有野川障害の教訓）:
+// アプリWDTの「30分無送信で全再起動(NVIC_SystemReset)」の前に、より軽く速い一段目として
+// 「送信サイクルが規定回数連続で全滅したら、モデムだけソフトリセット(CFUN=0/1)して再接続」を挟む。
+// 有野川で疑われたモデムのSSL/HTTPスタック固着（CGATTは正常＝アタッチ維持のまま送信だけ失敗）は、
+// setup()でしか実行されないモデムリセットに降りていけず永続化した。この一段目で送信失敗時にも
+// モデムリセットへ降りられるようにする。これでも復旧しなければ30分の全再起動が最終backstop。
+static int const MODEM_RESET_FAIL_THRESHOLD = 3;  // 連続で全滅した送信サイクル数（5分間隔なら約15分）
+static int consecutiveSendFailures = 0;
 
 static void appWatchdogCheck() {
   if (millis() - lastGasSuccessMs >= APP_WDT_NO_SEND_RESET_MS) {
@@ -864,6 +873,21 @@ bool ensureNetworkReady() {
   return initNetwork();
 }
 
+// モデムのソフトリセット（★2026-07-21）:
+// 送信が連続で全滅した際、CGATTがOKでも上位(SSL/HTTP/PDP)が固着している可能性があるため、
+// 無線を一旦落として(CFUN=0/1)から再登録・再接続する。全再起動より軽く速い一段目の復旧手段。
+bool modemSoftReset() {
+  Serial.println(F("\n⚠ 送信が連続失敗 → モデムをソフトリセット(CFUN=0/1)して再接続します"));
+  sendAT("AT+CFUN=0", 5000); delay(2000);
+  sendAT("AT+CFUN=1", 5000); delay(5000);
+  sendAT("AT+CNMP=38", 2000); delay(500);  // LTE only
+  sendAT("AT+CMNB=1",  2000); delay(500);  // Cat-M1
+  bool ok = initNetwork();                 // CREG/CGATT/CNACT を張り直す
+  Serial.println(ok ? F("✓ モデムソフトリセット後 再接続成功")
+                    : F("✗ ソフトリセット後も再接続失敗（30分の全再起動backstopに委ねる）"));
+  return ok;
+}
+
 // SIM7080G（LTE-M モデム）自身の受信電波強度を取得する
 // 戻り値: 0-31（値が大きいほど良好）、99=圏外/取得失敗
 int getSimCsq() {
@@ -1030,12 +1054,14 @@ void flushRecords() {
   // クエリ長がAT+SHREQの実用上限に達しないよう、MAX_DEVICES_PER_REQUEST台ずつに分割して送信する
   FlexRecord failedMerged[MAX_DEVICES];
   int failedN = 0;
+  bool cycleHadSuccess = false;  // このサイクルで1バッチでも送信成功したか
   for (int start = 0; start < n; start += MAX_DEVICES_PER_REQUEST) {
     int count = n - start;
     if (count > MAX_DEVICES_PER_REQUEST) count = MAX_DEVICES_PER_REQUEST;
 
     bool ok = postBatch(merged, start, count, ts, csq);
     if (ok) {
+      cycleHadSuccess = true;
       Serial.print(F("✓ 送信成功（")); Serial.print(count); Serial.println(F(" 件、再送キュー クリア）"));
     } else {
       Serial.print(F("✗ 再試行も失敗。")); Serial.print(count);
@@ -1046,6 +1072,19 @@ void flushRecords() {
 
   pendingCount = failedN;
   if (failedN > 0) memcpy(pendingRecords, failedMerged, sizeof(FlexRecord) * failedN);
+
+  // 段階的復旧: 送信サイクルが全滅したら連続失敗をカウント。閾値でモデムをソフトリセット。
+  if (cycleHadSuccess) {
+    consecutiveSendFailures = 0;
+  } else {
+    consecutiveSendFailures++;
+    Serial.print(F("連続送信失敗: ")); Serial.print(consecutiveSendFailures);
+    Serial.print(F("/")); Serial.println(MODEM_RESET_FAIL_THRESHOLD);
+    if (consecutiveSendFailures >= MODEM_RESET_FAIL_THRESHOLD) {
+      modemSoftReset();
+      consecutiveSendFailures = 0;  // リセットを試みたので一旦クリア（それでも失敗が続けば再度カウント→再試行）
+    }
+  }
 }
 
 static uint32_t lastSend = 0;
