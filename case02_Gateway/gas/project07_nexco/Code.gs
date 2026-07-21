@@ -20,13 +20,20 @@
 // ================================
 // バージョン対応表（ファームとGASの紐付け）
 // ================================
-//   GASスクリプトバージョン: 2
+//   GASスクリプトバージョン: 3
 //     - v1: 汎用可変長デコードのみ（CH数はバイト数から自動算出、FW_VERSION/レンジ非対応）
-//     - v2: PktType=0x03（Monita Flex v3.03）専用パーサーを追加。FW_VERSION・CH1-4レンジに対応
+//     - v2: PktType=0x03（Monita Flex v3.03, BLE）専用パーサーを追加。FW_VERSION・CH1-4レンジに対応
+//     - v3: PktType=0x04（Monita Flex v3.10, LoRa）も同じ専用パーサーへ振り分け（2026-07-18）。
+//       LoRaのMSDペイロードはBLEのv3.03と同一19バイトレイアウトのため、parsePayloadV303()を
+//       そのまま流用できる。★LoRaはBLEのMACアドレスに相当するものが無く、Gatewayファームが
+//       {0,0,0,0,0,DeviceID}の疑似MAC（例: DeviceID=0x01 → "01-00-00-00-00-00"）を使うため、
+//       「シート名編集」シートにこの疑似MAC形式で事前登録しておく必要がある（登録が無いと
+//       "未登録デバイス" としてスキップされる）。
 //
-//   対応する子機ファーム（Monita Flex v3.03, COMM_MODE_BLE）:
-//     - case01_Flex/v3.03_sigfox/src/main.cpp の FW_VERSION >= 1
+//   対応する子機ファーム:
+//     - Monita Flex v3.03（BLE）: case01_Flex/v3.03_sigfox/src/main.cpp の FW_VERSION >= 1
 //       （FW_VERSION未満のバージョンは旧16バイト形式のため本パーサーでは正しく解析できない）
+//     - Monita Flex v3.10（LoRa）: case01_Flex/v3.10_lora/src/main.cpp（COMM_MODE_LORA）
 //
 //   対応するGatewayファーム:
 //     - case02_Gateway/firmware/gateway_v1.1 の GATEWAY_FW_VERSION >= 1
@@ -85,6 +92,8 @@ const FORMULA_COL_COUNT = 6;  // CH7〜CH12
 
 // Monita Flex v3.03（BLEモード）の Pkt type
 const PKT_TYPE_V303 = 0x03;
+// Monita Flex v3.10（LoRaモード）の Pkt type。MSDレイアウトはv3.03と同一のため同じパーサーを使う
+const PKT_TYPE_V310_LORA = 0x04;
 
 // アラートのクールダウン時間
 // 【検証用】0 にすると毎回送信される（動作確認時のみ一時的に使う）
@@ -150,9 +159,9 @@ function parsePayload(hex) {
 
 
 // ================================
-// Monita Flex v3.03（PktType=0x03）専用パーサー
+// Monita Flex v3.03/v3.10（PktType=0x03 BLE / 0x04 LoRa）共通パーサー
 // ================================
-// MSD レイアウト（Company ID を除いた本体、19バイト固定）:
+// MSD レイアウト（Company ID を除いた本体、19バイト固定。BLE/LoRaで同一）:
 //   [0]    PktType     0x03
 //   [1]    DeviceID
 //   [2]    FW Version  子機ファームのバージョン（コミットごとに+1）
@@ -251,9 +260,11 @@ function doGet(e) {
       var rssi = p['r' + i] || '';
       if (!hex) continue;
 
-      // 先頭バイト（PktType）だけ見て、v3.03専用パーサーに振り分けるか判定
+      // 先頭バイト（PktType）だけ見て、専用パーサーに振り分けるか判定
+      // v3.03(BLE)とv3.10(LoRa)はMSDレイアウトが同一のため同じパーサーを使う
       var firstByte = parseInt(hex.substr(0, 2), 16);
-      var d = (firstByte === PKT_TYPE_V303) ? parsePayloadV303(hex) : parsePayload(hex);
+      var d = (firstByte === PKT_TYPE_V303 || firstByte === PKT_TYPE_V310_LORA)
+        ? parsePayloadV303(hex) : parsePayload(hex);
 
       var sheetName = getDeviceSheetNameByMac(ss, mac);
       if (!sheetName) {
