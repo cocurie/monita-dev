@@ -1,41 +1,53 @@
 ---
 title: Monita Gateway v1.1 ファームウェア
 domain: iot_device
-tags: [gateway, nRF52840, SIM7080G, BLE, LTE-M, DS3231, SD, GAS, SMD]
-updated: 2026-07-09
+tags: [gateway, nRF52840, SIM7080G, BLE, LoRa, E220-900T22S, LTE-M, DS3231, SD, GAS, DIP]
+updated: 2026-07-18
 ---
 
 # gateway_v1.1
 
-Monita Flex（子機）から BLE アドバタイジングで受信したセンサデータを LTE-M 経由で GAS（Google Apps Script）に送信する Gateway ファームウェア。
-**v1.0（DIP試作）をベースに、基板の SMD化・小型化に対応する版。** ファームウェアの機能自体は v1.0 で確立した内容を踏襲している。
+Monita Flex（子機）から **BLE アドバタイジング、または LoRa（E220-900T22S(JP)）** で受信したセンサデータを LTE-M 経由で GAS（Google Apps Script）に送信する Gateway ファームウェア。
+**電源は XIAO nRF52840 の Type-C 給電（AC電源）、全部品 DIP 対応。** BLE / LoRa は `platformio.ini` の `build_flags` でビルド時選択（`COMM_MODE_BLE` / `COMM_MODE_LORA`、Flex側の切替と同じ考え方）。
 
-要件定義: `【7】Monita/開発/Gatway基板/gateway_requirements_v1.10.md`
+**★2026-07-17: 電源方式をLiPoバッテリー駆動からAC電源（Type-C給電）に変更。** それに伴いTCA9534・AO3401・MMBT3904・TPS61232・TPS22965・RC遅延回路一式を削除し、SIM7080Gの電源はXIAOの5Vに直結（v1.0と同じ方式）に戻した。旧バッテリー駆動設計は `gateway_v1.10_ARCHIVE_battery_TCA9534_design.md` にアーカイブ済み（将来復活の可能性あり）。
+
+要件定義: `【7】Monita/開発/Gatway基板/gateway_requirements_v1.10.md`（「LoRa受信対応」章に詳細）
 v1.0からの差分: `【7】Monita/開発/Gatway基板/gateway_v1.00_to_v1.10_diff.md`
+対応するFlex側: `【7】Monita/開発/Flex基板/Monita_Flex_構成_v3.10.md`
+バッテリー駆動設計アーカイブ: `【7】Monita/開発/Gatway基板/gateway_v1.10_ARCHIVE_battery_TCA9534_design.md`
 
 ## ハードウェア構成
 
 | 役割 | 部品 |
 |------|------|
 | MCU | Seeed XIAO nRF52840 |
-| 通信 | M5Stamp CAT-M（SIM7080G） |
+| 通信 | M5Stamp CAT-M（SIM7080G）、（LoRaビルドのみ）E220-900T22S(JP)-EV2 |
 | RTC | DS3231 |
 | ストレージ | microSD（SPI） |
+| 電源 | XIAO nRF52840 Type-C給電（AC/USBアダプタ）。全部品DIP |
 
-## 配線（v1.0から変更なし。SMD化時に再確認要）
+## 配線（v1.1、AC電源版）
 
 | 信号 | XIAO ピン | 接続先 |
 |------|-----------|--------|
 | UART TX | D6 | SIM7080G RX |
 | UART RX | D7 | SIM7080G TX |
-| 5V | 5V（VBUS） | SIM7080G 5V |
 | I2C SDA | D4 | DS3231 SDA |
 | I2C SCL | D5 | DS3231 SCL |
-| SD CS | D3 | SD CD/DAT3 |
 | SPI SCK | D8 | SD CLK |
 | SPI MISO | D9 | SD DAT0 |
 | SPI MOSI | D10 | SD CMD |
-| 3V3 | 3V3 | DS3231 VCC / SD VDD |
+| SD CS | D3 | SD CS（直結、net N$6） |
+| LoRa RX（LoRaビルドのみ） | D0 | E220 TXD（net UART_RX_2） |
+| LoRa TX（LoRaビルドのみ） | D1 | E220 RXD（net UART_TX_2） |
+| LoRa M0/M1（LoRaビルドのみ） | D2 | E220 M0・M1（基板側で両ピンを短絡し1本のGPIOで共通駆動、net LORA_SETTING） |
+| 5V | 5V | SIM7080G 5V（Type-C給電時のみ通電、v1.0と同じ直結） |
+| 3V3 | 3V3 | DS3231 VCC / SD VDD / E220 VCC |
+
+**★2026-07-19**: 回路図 `ver1.10.sch`（netlist_gateway_1）に合わせてピン割当を確定。E220のM0/M1は基板上で短絡済み（LORA_SETTINGネット）。
+
+**⚠️ 実機未検証**: UARTE1経由のLoRa受信は基板完成前のため実機での動作確認が済んでいない。
 
 ## SIM 切り替え
 
@@ -78,6 +90,8 @@ payload は GAS 側で PktType・DeviceID・CH1〜CH6・FlexHour/Min に汎用�
 
 ## ビルド
 
+`platformio.ini` 末尾の `build_flags` で `COMM_MODE_BLE` / `COMM_MODE_LORA` のいずれか1つのコメントを外して選択する（既定はBLE）。
+
 ```bash
 cd firmware/gateway_v1.1
 pio run
@@ -98,8 +112,13 @@ pio run --target upload
 
 詳細は `gateway_v1.00_to_v1.10_diff.md` を参照。要点：
 
-- 基板の SMD化・小型化（回路設計は別途進行）
-- ファームウェアは v1.0 で確立した通信安定化策一式（WDT・再送キュー・BLEフィルタ・BLEスキャン前倒し・DS3231自動時刻設定）をベースラインとして継承
+- ファームウェアは v1.0 で確立した通信安定化策一式（WDT・再送キュー・BLEフィルタ・BLEスキャン前倒し）をベースラインとして継承
+- BLE / LoRa（E220-900T22S(JP)）をビルド時選択（`COMM_MODE_BLE` / `COMM_MODE_LORA`）で追加
+- 電源はAC電源（XIAO Type-C給電）、全部品DIP。SIM7080GはXIAOの5Vに直結（v1.0と同じ方式）
+- （旧検討）LiPoバッテリー駆動＋TCA9534によるSMD化は `gateway_v1.10_ARCHIVE_battery_TCA9534_design.md` にアーカイブ済み
+- **★2026-07-18**: DS3231の網時刻自動設定（`AT+CCLK?`）、BLE MSD解析の境界チェック、LoRa送信中取りこぼし対策、LoRa設定書込検証、送信バッチの8台分割を追加
+- **★2026-07-18**: コントローラー連携（BLE設定）をLoRaビルドに追加。送信間隔変更・コマンド（即時送信/NW再登録/起動確認/リセット）・ステータス通知をBLE GATTで提供。詳細は要件定義「コントローラー連携（BLE設定）」章
+- **★2026-07-19**: 回路図 ver1.10.sch に合わせてピン割当を確定（`GATEWAY_FW_VERSION` 4）。SD CS=D3、LoRa RX=D0/TX=D1/M0M1=D2
 
 ## 関連タスク
 
