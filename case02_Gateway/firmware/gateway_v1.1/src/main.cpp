@@ -155,7 +155,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 4;
+static uint8_t  const GATEWAY_FW_VERSION = 5;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -265,6 +265,31 @@ static void wdtInit(uint32_t timeoutMs) {
 
 static inline void wdtFeed() {
   NRF_WDT->RR[0] = WDT_RR_RR_Reload;  // キック（既定のリロードマジック値）
+}
+
+// ══════════════════════════════════════════════
+// アプリ層ウォッチドッグ（★2026-07-21 追加）
+//
+// ハードWDT（上記）は「wdtFeedが完全に止まる＝MCUフリーズ」した時だけ復旧する。
+// しかし実運用で発生した障害は、モデムはネットワークに接続したまま、GASへの送信
+// （SHCONN/SHREQ）だけが失敗し続け、ファームは送信リトライのループを回して
+// wdtFeedを呼び続ける「ソフトハング」だった。この場合ハードWDTには餌が入り続けるため
+// リセットがかからず、無人現場では復旧不能になった（有野川現場、2026-07-17〜）。
+//
+// 対策として「一定時間 GAS 送信が1回も成功しなかったら NVIC_SystemReset で強制再起動」
+// するアプリ層ウォッチドッグを設ける。再起動後は setup() が AT&F + CFUN=1,1 で
+// モデムもソフトリセットするため、モデム側スタックの詰まりも合わせて解消される。
+// ══════════════════════════════════════════════
+static uint32_t const APP_WDT_NO_SEND_RESET_MS = 1800000UL;  // 30分: この間GAS送信成功が無ければ再起動
+static uint32_t lastGasSuccessMs = 0;  // 最後にGAS送信が成功した millis()（setup先頭で初期化）
+
+static void appWatchdogCheck() {
+  if (millis() - lastGasSuccessMs >= APP_WDT_NO_SEND_RESET_MS) {
+    Serial.println(F("\n‼ アプリWDT: 規定時間 GAS 送信成功なし → NVIC_SystemReset で強制再起動"));
+    Serial.flush();
+    delay(200);
+    NVIC_SystemReset();  // setup() から全再初期化（モデムも AT&F + CFUN=1,1 でリセットされる）
+  }
 }
 
 #ifdef COMM_MODE_LORA
@@ -535,6 +560,7 @@ bool postToGAS(String queryParams) {
   // GAS は書き込み完了後に 302 を返す（200 は来ない）。302 も成功とみなす
   if (statusCode == 200 || statusCode == 302) {
     Serial.println(F("✓ GAS 送信成功！"));
+    lastGasSuccessMs = millis();  // アプリ層ウォッチドッグ: 送信成功を記録
     sendAT("AT+SHDISC"); return true;
   }
   Serial.println(F("✗ 予期しないレスポンス"));
@@ -1212,6 +1238,7 @@ static void handlePendingBleCommands() {
 // ══════════════════════════════════════════════
 void setup() {
   wdtInit(WDT_TIMEOUT_MS);  // 無人運用の安全網。以降 120 秒キックが無ければ自動リセット
+  lastGasSuccessMs = millis();  // アプリ層WDTの起点。以降 APP_WDT_NO_SEND_RESET_MS 内に送信成功が無ければ再起動
 
   Wire.begin();
   pinMode(SD_CS_PIN, OUTPUT);
@@ -1402,7 +1429,8 @@ void setup() {
 static uint32_t lastHeartbeat = 0;
 
 void loop() {
-  wdtFeed();  // BLE スキャン/LoRa待ち受けのみで sendAT が呼ばれない期間もハング扱いされないよう給餌
+  wdtFeed();          // BLE スキャン/LoRa待ち受けのみで sendAT が呼ばれない期間もハング扱いされないよう給餌
+  appWatchdogCheck();  // 一定時間 GAS 送信成功が無ければ強制再起動（ソフトハング対策）
   uint32_t now = millis();
 
 #ifdef COMM_MODE_LORA
