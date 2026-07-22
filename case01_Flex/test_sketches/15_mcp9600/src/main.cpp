@@ -70,7 +70,24 @@ void setup() {
   Serial.print("[INFO] MCP9600 アドレス: 0x");
   Serial.println(mcpAddr, HEX);
 
-  if (!mcp.begin(mcpAddr, &Wire)) {
+  // スキャン直後の最初のリピーテッドスタート読み取りは失敗しやすいため、
+  // 捨て読み（ウォームアップ）を1回入れてからbegin()する。
+  Wire.beginTransmission(mcpAddr);
+  Wire.write(0x20);
+  Wire.endTransmission(false);
+  Wire.requestFrom((int)mcpAddr, 2);
+  while (Wire.available()) Wire.read();
+  delay(20);
+
+  // begin()はデバイスIDレジスタを1回しか読まないため、
+  // 稀に発生する初回読み取り失敗に備えて数回リトライする。
+  bool ok = false;
+  for (uint8_t attempt = 0; attempt < 5 && !ok; attempt++) {
+    ok = mcp.begin(mcpAddr, &Wire);
+    if (!ok) delay(50);
+  }
+
+  if (!ok) {
     Serial.println("[ERROR] MCP9600 初期化失敗（デバイスID不一致）");
     while (1) delay(100);
   }
