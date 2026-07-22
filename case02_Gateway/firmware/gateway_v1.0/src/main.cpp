@@ -209,6 +209,13 @@ static void appWatchdogCheck() {
 // ══════════════════════════════════════════════
 // AT コマンド送受信
 // ══════════════════════════════════════════════
+// 応答バッファの上限（★2026-07-21）: 配線ノイズ・SIM7080Gの異常URC等でRX1に
+// ゴミデータが流れ込み続けた場合、上限が無いと res が際限なく肥大化してヒープを
+// 食い尽くす（AT+SHREQ=60秒・AT+COPS=?=180秒待機時に特にリスクが高い）。
+// 電波状況の良否とは無関係に発生しうるMCUハングの一因と推定されるため、
+// 上限超過分は読み捨てて（HWバッファは溢れさせない）ヒープ確保量を頭打ちにする。
+static uint16_t const SENDAT_MAX_RESPONSE_LEN = 2048;
+
 String sendAT(String cmd, int waitMs = 5000) {
   DLOG2("--");
   DLOGV2(">> ", cmd);
@@ -217,7 +224,10 @@ String sendAT(String cmd, int waitMs = 5000) {
   String res = "";
   while (millis() - start < waitMs) {
     wdtFeed();  // 長時間の AT 応答待ち（COPS スキャン等 最大3分）でもハング扱いされないよう給餌
-    while (Serial1.available()) res += (char)Serial1.read();
+    while (Serial1.available()) {
+      char c = (char)Serial1.read();
+      if (res.length() < SENDAT_MAX_RESPONSE_LEN) res += c;
+    }
     yield();
   }
   if (res.length() > 0) { DLOG2("<< "); DLOG2(res.c_str()); }
