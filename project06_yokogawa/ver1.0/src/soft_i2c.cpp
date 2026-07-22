@@ -2,7 +2,7 @@
 
 static uint8_t s_sda = 0;
 static uint8_t s_scl = 0;
-static constexpr uint16_t BIT_DELAY_US = 20;      // 約25kHz相当（プルアップ立ち上がりに余裕）
+static constexpr uint16_t BIT_DELAY_US = 50;      // 約10kHz相当（ACK応答タイミングに余裕、切り分け用）
 static constexpr uint16_t STRETCH_TIMEOUT_MS = 50; // クロックストレッチング最大待ち時間
 
 // オープンドレイン動作：Lowは能動駆動、Highはプルアップ任せ（INPUT化）

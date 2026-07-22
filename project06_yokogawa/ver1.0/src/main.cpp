@@ -161,6 +161,16 @@ void setup() {
   softI2CInit(PIN_SDA, PIN_SCL);
   delay(100);
 
+  // [DIAG] 全域スキャンより前に、ADS1115(0x48)だけを単独で複数回確認
+  Serial.println("[DIAG] 0x48 単独プローブ（5回）");
+  for (uint8_t i = 0; i < 5; i++) {
+    bool ack = softI2CProbe(ADS1115_ADDR);
+    Serial.print("  試行"); Serial.print(i); Serial.print(": ");
+    Serial.println(ack ? "ACKあり" : "応答なし");
+    delay(50);
+  }
+  Serial.println();
+
   i2cScan();
 
   if (mcpInit()) {
