@@ -95,6 +95,12 @@
 // GAS スクリプトID（デプロイURLの "AKfycb..." 部分）
 const char* GAS_SCRIPT_ID = "AKfycbw2IIQ1GyxtGh2Uis_zmwXW3VhftDy9HWKw5tSsUbwNOhNo6p9PnNv3ftfs3MvcMDT5ww/exec";
 
+// LTE-M送信のON/OFF切替（★2026-07-23追加）
+// false にすると SIM7080G の初期化・ネットワーク接続・GAS送信を一切行わず、
+// BLE（またはLoRa）受信データを直接SDカードへ記録するだけの「SD記録のみモード」になる。
+// SIM7080GのTX系統故障が疑われる現場での暫定運用（アンテナ交換ができない場合等）を想定。
+#define LTEM_SEND_ENABLED false
+
 // 起動確認送信 — true にするとネットワーク接続直後に、機器の設定情報の行と、
 // それまでに BLE スキャンで受信できていた実際の子機データ（実 RSSI 含む）を
 // GAS へ送信する（通信経路とアンテナ状況を起動のたびに確認できる）
@@ -155,7 +161,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 7;
+static uint8_t  const GATEWAY_FW_VERSION = 9;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -408,6 +414,14 @@ bool initNetwork() {
       Serial.println(pi >= 0 ? cpsi.substring(pi) : cpsi);
     }
 
+    // 拡張エラーレポート（★2026-07-23追加）: CSQ良好・COPSでキャリアが見えている
+    // (stat=1=利用可能)のにCREGが進まない場合、ネットワーク側のアタッチ拒否理由
+    // （Illegal MS / Roaming not allowed / PLMN not allowed 等）をここで特定できることがある
+    String ceer = sendAT("AT+CEER", 3000);
+    Serial.print(F("  CEER(拒否理由): "));
+    int ceerIdx = ceer.indexOf("+CEER:");
+    Serial.println(ceerIdx >= 0 ? ceer.substring(ceerIdx) : F("(応答なし)"));
+
     // 詳細 CREG
     sendAT("AT+CREG=2", 2000);
     String creg2 = sendAT("AT+CREG?", 3000);
@@ -514,6 +528,10 @@ bool initNetwork() {
   simStage("NET3: データ Attach (CGATT=1)", attachOk);
   if (!attachOk) {
     Serial.println(F("  → CGATT=0 のまま。APN 設定・SIM 契約を確認してください"));
+    String ceer = sendAT("AT+CEER", 3000);
+    Serial.print(F("  CEER(拒否理由): "));
+    int ceerIdx = ceer.indexOf("+CEER:");
+    Serial.println(ceerIdx >= 0 ? ceer.substring(ceerIdx) : F("(応答なし)"));
     return false;
   }
   delay(1000);
@@ -619,6 +637,20 @@ static void updateRecordFromPayload(const uint8_t mac[6], const uint8_t *payload
     }
     xSemaphoreGive(recordMutex);
   }
+
+#if !LTEM_SEND_ENABLED
+  // LTE-M送信が無効な「SD記録のみモード」では、GAS送信サイクルを待たず
+  // 受信のたびに即座にSDへ記録する（flushRecords()は呼ばれないため）。
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X-%02X-%02X-%02X-%02X-%02X",
+           mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
+  String hex = "";
+  for (uint8_t j = 0; j < payloadLen; j++) {
+    if (payload[j] < 0x10) hex += '0';
+    hex += String(payload[j], HEX);
+  }
+  sdLog(getTimestamp() + "," + String(macStr) + "," + hex + "," + String(rssi));
+#endif
 }
 
 #ifdef COMM_MODE_BLE
@@ -1364,6 +1396,15 @@ void setup() {
   Serial.println(F("✓ LoRa 初期化完了"));
 #endif
 
+#if !LTEM_SEND_ENABLED
+  // ★2026-07-23: LTE-M送信無効（SD記録のみモード）。SIM7080Gの初期化・ネットワーク接続は
+  // 一切行わず、BLE（またはLoRa）受信データを updateRecordFromPayload() 内で直接SDへ記録する。
+  Serial.println(F("\n△ LTEM_SEND_ENABLED=false: SIM7080G初期化・LTE-M送信をスキップ（SD記録のみモード）"));
+#ifdef COMM_MODE_BLE
+  Bluefruit.Scanner.start(0);
+  Serial.println(F("✓ BLE スキャン開始（SD記録のみモード）"));
+#endif
+#else
   // ── SIM7080G 初期化シーケンス ──────────────────
   // SIM7080GはXIAOの5Vに常時直結（AC電源、v1.0と同じ方式）のため、
   // ソフトウェアでの電源投入シーケンスは不要。
@@ -1465,6 +1506,7 @@ void setup() {
     Serial.println(F("=======================================================\n"));
   }
 #endif
+#endif  // LTEM_SEND_ENABLED
 }
 
 // ══════════════════════════════════════════════
@@ -1479,7 +1521,9 @@ static uint32_t lastHeartbeat = 0;
 
 void loop() {
   wdtFeed();          // BLE スキャン/LoRa待ち受けのみで sendAT が呼ばれない期間もハング扱いされないよう給餌
+#if LTEM_SEND_ENABLED
   appWatchdogCheck();  // 一定時間 GAS 送信成功が無ければ強制再起動（ソフトハング対策）
+#endif
   uint32_t now = millis();
 
 #ifdef COMM_MODE_LORA
@@ -1499,6 +1543,7 @@ void loop() {
 #endif
   }
 
+#if LTEM_SEND_ENABLED
   if (now - lastSend >= sendIntervalMs) {
     lastSend = now;
     Serial.println(F("\n=== 定期送信 ==="));
@@ -1522,4 +1567,5 @@ void loop() {
     if (line.length() > 0) sendAT(line);
   }
   while (Serial1.available()) Serial.write(Serial1.read());
+#endif  // LTEM_SEND_ENABLED
 }

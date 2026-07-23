@@ -55,6 +55,17 @@
 // GAS スクリプトID（デプロイURLの "AKfycb..." 部分）
 const char* GAS_SCRIPT_ID = "AKfycbywRcyl3059evcw-kFo9ypeejbhZWRyY9rILX9TUjlEWJ-4K2nGkZqIrZymA9cYGZ8maQ/exec";
 
+// LTE-M送信のON/OFF切替（★2026-07-23追加）
+// false にすると SIM7080G の初期化・ネットワーク接続・GAS送信を一切行わず、
+// BLE受信データを直接SDカードへ記録するだけの「SD記録のみモード」になる。
+// SIM7080GのTX系統故障が疑われる現場での暫定運用（アンテナ交換ができない場合等）を想定。
+#define LTEM_SEND_ENABLED false
+
+// SD記録のみモード（LTEM_SEND_ENABLED=false）でのSDカード記録インターバル（ms）★ここを変える
+// 受信のたびに書くとSDの書き込み回数・ファイルサイズが増えるため、この間隔ごとに
+// 「その時点で受信済みの全子機の最新データ」をまとめて1回記録する（LTE-M送信時と同じ考え方）。
+static uint32_t const SD_LOG_INTERVAL_MS = 300000;  // 既定 5 分
+
 // 起動確認送信 — true にするとネットワーク接続直後に、機器の設定情報の行と、
 // それまでに BLE スキャンで受信できていた実際の子機データ（実 RSSI 含む）を
 // GAS へ送信する（通信経路とアンテナ状況を起動のたびに確認できる）
@@ -304,6 +315,14 @@ bool initNetwork() {
       Serial.println(pi >= 0 ? cpsi.substring(pi) : cpsi);
     }
 
+    // 拡張エラーレポート（★2026-07-23追加）: CSQ良好・COPSでキャリアが見えている
+    // (stat=1=利用可能)のにCREGが進まない場合、ネットワーク側のアタッチ拒否理由
+    // （Illegal MS / Roaming not allowed / PLMN not allowed 等）をここで特定できることがある
+    String ceer = sendAT("AT+CEER", 3000);
+    Serial.print(F("  CEER(拒否理由): "));
+    int ceerIdx = ceer.indexOf("+CEER:");
+    Serial.println(ceerIdx >= 0 ? ceer.substring(ceerIdx) : F("(応答なし)"));
+
     // 詳細 CREG
     sendAT("AT+CREG=2", 2000);
     String creg2 = sendAT("AT+CREG?", 3000);
@@ -410,6 +429,10 @@ bool initNetwork() {
   simStage("NET3: データ Attach (CGATT=1)", attachOk);
   if (!attachOk) {
     Serial.println(F("  → CGATT=0 のまま。APN 設定・SIM 契約を確認してください"));
+    String ceer = sendAT("AT+CEER", 3000);
+    Serial.print(F("  CEER(拒否理由): "));
+    int ceerIdx = ceer.indexOf("+CEER:");
+    Serial.println(ceerIdx >= 0 ? ceer.substring(ceerIdx) : F("(応答なし)"));
     return false;
   }
   delay(1000);
@@ -640,6 +663,43 @@ void postBootInfoRow() {
 }
 
 // ══════════════════════════════════════════════
+// SD記録のみモード（LTEM_SEND_ENABLED=false）用のSD書き出し（★2026-07-23追加）
+//
+// SD_LOG_INTERVAL_MS ごとに呼ばれ、その時点で受信済みの全子機の最新データを
+// まとめてSDへ記録し、バッファをクリアする。LTE-M送信は一切行わない。
+// ══════════════════════════════════════════════
+#if !LTEM_SEND_ENABLED
+void flushRecordsToSdOnly() {
+  if (xSemaphoreTake(recordMutex, pdMS_TO_TICKS(200)) != pdTRUE) return;
+
+  int n = recordCount;
+  FlexRecord snap[MAX_DEVICES];
+  if (n > 0) memcpy(snap, records, sizeof(FlexRecord) * n);
+  recordCount = 0;
+
+  xSemaphoreGive(recordMutex);
+
+  if (n == 0) { Serial.println(F("[SD] 記録対象レコードなし")); return; }
+
+  String ts = getTimestamp();
+  for (int i = 0; i < n; i++) {
+    char mac[18];
+    snprintf(mac, sizeof(mac), "%02X-%02X-%02X-%02X-%02X-%02X",
+             snap[i].mac[5], snap[i].mac[4], snap[i].mac[3],
+             snap[i].mac[2], snap[i].mac[1], snap[i].mac[0]);
+
+    String hex = "";
+    for (int j = 0; j < snap[i].payloadLen; j++) {
+      if (snap[i].payload[j] < 0x10) hex += '0';
+      hex += String(snap[i].payload[j], HEX);
+    }
+    sdLog(ts + "," + String(mac) + "," + hex + "," + String(snap[i].rssi));
+  }
+  Serial.print(F("[SD] ")); Serial.print(n); Serial.println(F(" 件を記録しました"));
+}
+#endif
+
+// ══════════════════════════════════════════════
 // バッファを GAS へ送信＆SD へ記録（全台を1回の POST にまとめる）
 //
 // 送信失敗時は再送キュー（pendingRecords）に保持し、次回サイクルで
@@ -808,6 +868,13 @@ void setup() {
   );
   Serial.println(F("✓ BLE 初期化完了"));
 
+#if !LTEM_SEND_ENABLED
+  // ★2026-07-23: LTE-M送信無効（SD記録のみモード）。SIM7080Gの初期化・ネットワーク接続は
+  // 一切行わず、BLE受信データを scanCallback() 内で直接SDへ記録する。
+  Serial.println(F("\n△ LTEM_SEND_ENABLED=false: SIM7080G初期化・LTE-M送信をスキップ（SD記録のみモード）"));
+  Bluefruit.Scanner.start(0);
+  Serial.println(F("✓ BLE スキャン開始（SD記録のみモード）"));
+#else
   // ── SIM7080G 初期化シーケンス ──────────────────
   Serial.println(F("\n========== SIM7080G 初期化 =========="));
 
@@ -901,6 +968,7 @@ void setup() {
     Serial.println(F("=======================================================\n"));
   }
 #endif
+#endif  // LTEM_SEND_ENABLED
 }
 
 // ══════════════════════════════════════════════
@@ -910,18 +978,28 @@ static uint32_t lastHeartbeat = 0;
 
 void loop() {
   wdtFeed();          // BLE スキャンのみで sendAT が呼ばれない期間もハング扱いされないよう給餌
+#if LTEM_SEND_ENABLED
   appWatchdogCheck();  // 一定時間 GAS 送信成功が無ければ強制再起動（ソフトハング対策、有野川現場の教訓）
+#endif
   uint32_t now = millis();
 
-  // デバッグ心拍: 10秒ごとに次回送信までの残り時間を表示
+  // デバッグ心拍: 10秒ごとに状態を表示
   if (now - lastHeartbeat >= 10000) {
     lastHeartbeat = now;
+#if LTEM_SEND_ENABLED
     Serial.print(F("[HB] now=")); Serial.print(now);
     Serial.print(F(" lastSend=")); Serial.print(lastSend);
     Serial.print(F(" 残り=")); Serial.print((long)(SEND_INTERVAL_MS - (now - lastSend)));
     Serial.print(F("ms 受信台数=")); Serial.println(recordCount);
+#else
+    Serial.print(F("[HB/SDのみ] now=")); Serial.print(now);
+    Serial.print(F(" 次回SD記録まで=")); Serial.print((long)(SD_LOG_INTERVAL_MS - (now - lastSend)));
+    Serial.print(F("ms 受信台数=")); Serial.print(recordCount);
+    Serial.print(F(" SD=")); Serial.println(sdAvailable ? F("OK") : F("NG"));
+#endif
   }
 
+#if LTEM_SEND_ENABLED
   if (now - lastSend >= SEND_INTERVAL_MS) {
     lastSend = now;
     Serial.println(F("\n=== 定期送信 ==="));
@@ -941,4 +1019,14 @@ void loop() {
     if (line.length() > 0) sendAT(line);
   }
   while (Serial1.available()) Serial.write(Serial1.read());
+#else
+  // SD記録のみモード: SD_LOG_INTERVAL_MS ごとに受信済みデータをまとめてSDへ記録
+  if (now - lastSend >= SD_LOG_INTERVAL_MS) {
+    lastSend = now;
+    Serial.println(F("\n=== SD記録 ==="));
+    Serial.print(F("時刻: ")); Serial.println(getTimestamp());
+    Serial.print(F("受信済み Flex 台数: ")); Serial.println(recordCount);
+    flushRecordsToSdOnly();
+  }
+#endif  // LTEM_SEND_ENABLED
 }
