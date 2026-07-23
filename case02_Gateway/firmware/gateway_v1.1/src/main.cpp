@@ -161,7 +161,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 9;
+static uint8_t  const GATEWAY_FW_VERSION = 10;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -298,6 +298,63 @@ static uint32_t lastGasSuccessMs = 0;  // 最後にGAS送信が成功した mill
 static int const MODEM_RESET_FAIL_THRESHOLD = 3;  // 連続で全滅した送信サイクル数（5分間隔なら約15分）
 static int consecutiveSendFailures = 0;
 
+// ══════════════════════════════════════════════
+// アンテナ未接続保護（★2026-07-23 追加、有野川でのSIM7080G故障の教訓）
+//
+// 有野川ではアンテナ側の接続不良により、モデムが「無アンテナ相当（高VSWR）」の状態で
+// 6日間にわたり登録要求＝送信を繰り返した。反射電力がPA（パワーアンプ）に戻り続けた結果、
+// RXは生きたままTXだけが死ぬという壊れ方をした（別基板・別アンテナでも通信不能なことを確認）。
+//
+// 対策として、CSQ=99（信号を全く検出できない＝圏外またはアンテナ未接続）が連続で規定回数
+// 観測されたら AT+CFUN=0 でRFを停止し、送信そのものを止めてPAを保護する。
+// クールダウン後に AT+CFUN=1 で復帰して再試行するので、単なる一時的な圏外なら自動回復する。
+// ══════════════════════════════════════════════
+static int      const RF_PROTECT_CSQ99_THRESHOLD = 3;         // CSQ=99 が連続この回数で保護発動
+static uint32_t const RF_PROTECT_COOLDOWN_MS     = 1800000UL; // 30分 RF停止して待機
+static int      s_csq99Count       = 0;
+static bool     s_rfProtected      = false;
+static uint32_t s_rfProtectStartMs = 0;
+
+// RF保護中かどうかを返す。クールダウンが明けていればRFを復帰させて false を返す。
+// true の間は一切送信してはならない。
+static bool rfProtectActive() {
+  if (!s_rfProtected) return false;
+  if (millis() - s_rfProtectStartMs >= RF_PROTECT_COOLDOWN_MS) {
+    Serial.println(F("[RF保護] クールダウン終了 → AT+CFUN=1 でRFを再開し再試行します"));
+    sendAT("AT+CFUN=1", 5000);
+    delay(5000);
+    s_rfProtected = false;
+    s_csq99Count  = 0;
+    return false;
+  }
+  return true;
+}
+
+// CSQ値を観測し、信号が全く無い状態が続いたらRFを停止する。
+// csq: 0-31 = 受信強度、99 または負値 = 信号検出不可
+static void rfProtectObserveCsq(int csq) {
+  if (s_rfProtected) return;  // 保護中はRF停止のためCSQ=99が当然。判定しない
+
+  if (csq == 99 || csq < 0) {
+    s_csq99Count++;
+    Serial.print(F("[RF保護] 信号検出不可(CSQ=99) 連続 "));
+    Serial.print(s_csq99Count); Serial.print(F("/"));
+    Serial.println(RF_PROTECT_CSQ99_THRESHOLD);
+
+    if (s_csq99Count >= RF_PROTECT_CSQ99_THRESHOLD) {
+      Serial.println(F("\n‼ [RF保護] 信号を全く検出できません（アンテナ未接続・接続不良の可能性）"));
+      Serial.println(F("   無アンテナ状態での送信継続はPA(パワーアンプ)を熱損傷させるため、"));
+      Serial.println(F("   AT+CFUN=0 でRFを停止します。アンテナ・ケーブル・コネクタを確認してください。"));
+      sendAT("AT+CFUN=0", 5000);
+      delay(1000);
+      s_rfProtected      = true;
+      s_rfProtectStartMs = millis();
+    }
+  } else {
+    s_csq99Count = 0;  // 信号を検出できたのでカウンタをクリア
+  }
+}
+
 static void appWatchdogCheck() {
   if (millis() - lastGasSuccessMs >= APP_WDT_NO_SEND_RESET_MS) {
     Serial.println(F("\n‼ アプリWDT: 規定時間 GAS 送信成功なし → NVIC_SystemReset で強制再起動"));
@@ -355,6 +412,12 @@ void simStage(const char* name, bool ok) {
 // ネットワーク初期化（ltem_signal_test から流用）
 // ══════════════════════════════════════════════
 bool initNetwork() {
+  // ★2026-07-23: RF保護中（アンテナ未接続と判断してCFUN=0中）は送信を一切行わない
+  if (rfProtectActive()) {
+    Serial.println(F("[RF保護] RF停止中のためネットワーク初期化をスキップします（アンテナ確認要）"));
+    return false;
+  }
+
   // CREG モードをデフォルト（n=0）にリセット
   sendAT("AT+CREG=0", 2000); delay(200);
 
@@ -404,6 +467,13 @@ bool initNetwork() {
     else if (csqVal >= 20)          Serial.println(String(csqVal) + " → 電波良好");
     else if (csqVal >= 10)          Serial.println(String(csqVal) + " → 電波普通");
     else                            Serial.println(String(csqVal) + " → 電波弱い");
+
+    // ★2026-07-23: 信号を全く検出できない状態が続くならRFを停止してPAを保護する
+    rfProtectObserveCsq(csqVal);
+    if (rfProtectActive()) {
+      Serial.println(F("[RF保護] RFを停止しました。今回のネットワーク初期化を中断します"));
+      return false;
+    }
 
     // 詳細ネットワーク状態
     String cpsi = sendAT("AT+CPSI?", 3000);
@@ -1030,9 +1100,8 @@ bool postBatch(const FlexRecord* merged, int start, int count, const String& ts,
     params += "&m"; params += k; params += "="; params += mac;
     params += "&p"; params += k; params += "="; params += hex;
     params += "&r"; params += k; params += "="; params += String(rec.rssi);
-
-    // SD ログ（デバイスごとに1行。送信成否に関わらずローカルには残す）
-    sdLog(ts + "," + String(mac) + "," + hex + "," + String(rec.rssi));
+    // ※ SD記録はネットワーク確認より前に flushRecords() 内で実施済み
+    //   （LTE-M停止時もデータを残すため）
   }
 
   bool ok = postToGAS(params);
@@ -1081,9 +1150,27 @@ void flushRecords() {
   String ts = getTimestamp();
   Serial.print(F("フラッシュ: ")); Serial.print(n); Serial.println(F(" 件"));
 
+  // ★2026-07-23: SD記録は LTE-M の状態に関わらず、送信を試みる前に必ず実行する。
+  // 旧実装は下の ensureNetworkReady() 失敗時に early return しており、LTE-Mが停止すると
+  // SDにも一切残らずデータが完全に失われていた（有野川の教訓）。
+  // 記録対象はライブ受信分のみ（再送キュー分は前回のサイクルで記録済みのため重複させない）。
+  for (int i = 0; i < liveN; i++) {
+    char mac[18];
+    snprintf(mac, sizeof(mac), "%02X-%02X-%02X-%02X-%02X-%02X",
+             liveSnap[i].mac[5], liveSnap[i].mac[4], liveSnap[i].mac[3],
+             liveSnap[i].mac[2], liveSnap[i].mac[1], liveSnap[i].mac[0]);
+    String hex = "";
+    for (int j = 0; j < liveSnap[i].payloadLen; j++) {
+      if (liveSnap[i].payload[j] < 0x10) hex += '0';
+      hex += String(liveSnap[i].payload[j], HEX);
+    }
+    sdLog(ts + "," + String(mac) + "," + hex + "," + String(liveSnap[i].rssi));
+  }
+  if (liveN > 0) { Serial.print(F("[SD] ")); Serial.print(liveN); Serial.println(F(" 件を記録")); }
+
   // ネットワーク状態確認・必要なら再接続
   if (!ensureNetworkReady()) {
-    Serial.println(F("✗ ネットワーク再接続失敗。今回分は再送キューへ保留"));
+    Serial.println(F("✗ ネットワーク再接続失敗（SD記録は完了済み）。今回分は再送キューへ保留"));
     pendingCount = n;
     memcpy(pendingRecords, merged, sizeof(FlexRecord) * n);
     return;
