@@ -117,7 +117,7 @@ static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のとき
 // ============================================================
 #ifdef COMM_MODE_LORA
 static const uint8_t  DEVICE_ID  = 0x01;  // 子機 ID（複数台時は変える: 0x01〜0xFF）
-static const uint8_t  FW_VERSION = 4;     // 子機ファームのバージョン。コミットのたびに+1すること
+static const uint8_t  FW_VERSION = 5;     // 子機ファームのバージョン。コミットのたびに+1すること
 #endif
 
 // ============================================================
@@ -1602,6 +1602,19 @@ static void loraWriteConfig() {
   while (millis() - t0 < 300UL) { while (Serial1.available()) Serial1.read(); }
 }
 
+#if DEBUG_MODE
+// デバッグ用: 6バイトをHEXで出力（期待値と実測値の突き合わせに使う。Gateway側の実装を移植）
+static void loraPrintRegs(const char* label, const uint8_t regs[LORA_CFG_REG_LEN]) {
+  Serial.print("[LORA] "); Serial.print(label); Serial.print(": ");
+  for (int i = 0; i < LORA_CFG_REG_LEN; i++) {
+    if (regs[i] < 0x10) Serial.print('0');
+    Serial.print(regs[i], HEX);
+    Serial.print(' ');
+  }
+  Serial.println();
+}
+#endif
+
 // 起動（起床）毎に呼ぶ。現在の設定値を確認し、想定値と異なれば書き込む（選択肢A方式）。
 // 成功時 true。READ自体が失敗した場合は ERR_LORA_CFG をセットして false を返す。
 static bool loraCheckAndConfigure() {
@@ -1621,6 +1634,12 @@ static bool loraCheckAndConfigure() {
 #if DEBUG_MODE
   Serial.print("[LORA] config read ");
   Serial.println(!readOk ? "失敗" : (matches ? "一致" : "不一致→書込"));
+  if (readOk) {
+    loraPrintRegs("実測値(読込)", cur);
+    uint8_t expected[LORA_CFG_REG_LEN] = {LORA_CFG_ADDH, LORA_CFG_ADDL, LORA_CFG_REG0,
+                                           LORA_CFG_REG1, LORA_CFG_REG2, LORA_CFG_REG3};
+    loraPrintRegs("期待値      ", expected);
+  }
 #endif
 
   if (!readOk) {
@@ -1649,6 +1668,8 @@ static bool loraCheckAndConfigure() {
       Serial.print("[LORA] config write 確認(");
       Serial.print(attempt); Serial.print("/2): ");
       Serial.println(verifyOk ? "OK" : "NG");
+      if (verifyReadOk) loraPrintRegs("書込後の実測値", verify);
+      else              Serial.println("[LORA] 書込後の読込自体に失敗（応答なし）");
 #endif
     }
     if (!verifyOk) {
