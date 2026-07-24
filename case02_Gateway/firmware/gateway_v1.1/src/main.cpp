@@ -164,7 +164,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 16;
+static uint8_t  const GATEWAY_FW_VERSION = 17;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -1706,7 +1706,13 @@ void setup() {
   if (!netOk) {
     Serial.println(F("  → APN 設定・SIM 契約・電波状況を確認してください"));
     Serial.println(F("  → BLE スキャンは継続します（LTE-M なしで SD 保存のみ）"));
-  } else if (rtcAvailable && s_rtcNeedsTimeSet) {
+  } else if (rtcAvailable) {
+    // ★2026-07-24: 従来は lostPower()（DS3231のバックアップ電源喪失＝OSFフラグ）が
+    // 立った時だけ網時刻補正していたが、これだと「電源は喪失していないが最初から
+    // 間違った時刻がセットされている」場合に一度も補正されない問題があった
+    // （実機でGatewayのRTCが実際の日付と9日以上ずれたまま動き続ける事象を確認）。
+    // 電源喪失の有無に関わらず、ネットワーク接続に成功するたびに毎回網時刻で補正する
+    // （起動のたびに1回AT+CCLKを叩くだけなのでコストは無視できる）。
     if (syncRtcFromNetworkTime()) s_rtcNeedsTimeSet = false;
     else Serial.println(F("△ 網時刻の取得に失敗（次回起動時に再試行）"));
   }
