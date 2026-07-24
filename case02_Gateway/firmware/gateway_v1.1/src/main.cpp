@@ -99,7 +99,7 @@ const char* GAS_SCRIPT_ID = "AKfycbw2IIQ1GyxtGh2Uis_zmwXW3VhftDy9HWKw5tSsUbwNOhN
 // false にすると SIM7080G の初期化・ネットワーク接続・GAS送信を一切行わず、
 // BLE（またはLoRa）受信データを直接SDカードへ記録するだけの「SD記録のみモード」になる。
 // SIM7080GのTX系統故障が疑われる現場での暫定運用（アンテナ交換ができない場合等）を想定。
-#define LTEM_SEND_ENABLED false
+#define LTEM_SEND_ENABLED true
 
 // 起動確認送信 — true にするとネットワーク接続直後に、機器の設定情報の行と、
 // それまでに BLE スキャンで受信できていた実際の子機データ（実 RSSI 含む）を
@@ -161,7 +161,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 11;
+static uint8_t  const GATEWAY_FW_VERSION = 12;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -795,6 +795,15 @@ void scanCallback(ble_gap_evt_adv_report_t* report) {
 
 static Uart loraSerial(NRF_UARTE1, UARTE1_IRQn, LORA_RX_PIN, LORA_TX_PIN);
 
+// ★2026-07-23: Adafruit nRF52コアで第2UART(UARTE1)を自前で使う場合、割り込みハンドラを
+// このように手動で転送しないと send/receive の完了通知が届かず、write()が2バイト目以降で
+// 永久にブロックする（1バイト目は空バッファへ直接載るため気づかれにくい）。
+// 実機デバッグで loraSerial.write() が2回目の呼び出しで無期限にハングすることを確認し、
+// この転送関数が抜けていたことが原因と特定した。
+extern "C" void UARTE1_IRQHandler(void) {
+  loraSerial.IrqHandler();
+}
+
 static bool loraSetMode(bool high) {
   digitalWrite(LORA_M0M1_PIN, high ? HIGH : LOW);
   delay(LORA_MODE_SWITCH_DELAY_MS);
@@ -822,7 +831,21 @@ static const uint8_t LORA_CFG_REG2 = 0x00;  // チャンネル0
 static const uint8_t LORA_CFG_REG3 = 0x80;  // RSSIバイト有効化ON/透過送信モード
 
 static bool loraReadConfig(uint8_t *out6) {
-  while (loraSerial.available()) loraSerial.read();
+  // ★2026-07-23: 受信バッファの掃除ループに時間制限が無く、E220が継続的にバイトを
+  // 送り続ける状態（Configモードへの切替失敗等でNormalモードのまま無線ノイズを
+  // 垂れ流している場合等）になるとここで無限ループしフリーズすることが判明。
+  // 掃除は最大300msまでとし、それでも終わらなければ異常とみなして打ち切る。
+  {
+    unsigned long drainStart = millis();
+    while (loraSerial.available()) {
+      loraSerial.read();
+      if (millis() - drainStart > 300UL) {
+        Serial.println(F("[LORA] 受信バッファの掃除がタイムアウト（E220がConfigモードに"
+                          "切り替わっていない、またはノイズを継続受信している可能性）"));
+        break;
+      }
+    }
+  }
   loraSerial.write((uint8_t)0xC1);
   loraSerial.write((uint8_t)LORA_CFG_REG_START);
   loraSerial.write((uint8_t)LORA_CFG_REG_LEN);
