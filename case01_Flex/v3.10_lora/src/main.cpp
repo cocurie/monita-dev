@@ -117,7 +117,7 @@ static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のとき
 // ============================================================
 #ifdef COMM_MODE_LORA
 static const uint8_t  DEVICE_ID  = 0x01;  // 子機 ID（複数台時は変える: 0x01〜0xFF）
-static const uint8_t  FW_VERSION = 6;     // 子機ファームのバージョン。コミットのたびに+1すること
+static const uint8_t  FW_VERSION = 7;     // 子機ファームのバージョン。コミットのたびに+1すること
 #endif
 
 // ============================================================
@@ -512,9 +512,8 @@ static void deepSleep(uint32_t minutes) {
 
 #ifdef COMM_MODE_LORA
   // ★2026-07-24: 複数台展開時の送信タイミング衝突を避けるため±LORA_SLEEP_JITTER_MAX_SEC秒の
-  // ランダムジッターを加える。SLEEP_MINUTES=15分に対して±2分(全体の約13%)とし、周期を
-  // 大きく崩さずに衝突確率を下げる。
-  static uint16_t const LORA_SLEEP_JITTER_MAX_SEC = 120;  // ±2分
+  // ランダムジッターを加える。周期をほぼ崩さずに毎回ずらす目的で±10秒とした。
+  static uint16_t const LORA_SLEEP_JITTER_MAX_SEC = 10;  // ±10秒
   int32_t jitterSec = loraSleepJitterSeconds(LORA_SLEEP_JITTER_MAX_SEC);
   sleepSeconds += jitterSec;
   if (sleepSeconds < 1) sleepSeconds = 1;  // ジッターで0秒以下にならないよう下限を確保
