@@ -117,7 +117,7 @@ static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のとき
 // ============================================================
 #ifdef COMM_MODE_LORA
 static const uint8_t  DEVICE_ID  = 0x01;  // 子機 ID（複数台時は変える: 0x01〜0xFF）
-static const uint8_t  FW_VERSION = 3;     // 子機ファームのバージョン。コミットのたびに+1すること
+static const uint8_t  FW_VERSION = 4;     // 子機ファームのバージョン。コミットのたびに+1すること
 #endif
 
 // ============================================================
@@ -1556,7 +1556,16 @@ static inline bool loraModeConfig() { return loraSetMode(true); }
 
 // 設定モード中に READ(0xC1) でレジスタ6バイトを読み出す
 static bool loraReadConfig(uint8_t *out6) {
-  while (Serial1.available()) Serial1.read();  // 受信バッファ掃除
+  // ★2026-07-23: Gateway側で「E220が継続的にバイトを送り続ける状態（Configモード未切替時の
+  // ノイズ垂れ流し等）だと掃除ループが無限ループしフリーズする」バグが見つかったため、
+  // 同じ掃除ループに時間制限を追加（Flex側の未然防止）。
+  {
+    unsigned long drainStart = millis();
+    while (Serial1.available()) {
+      Serial1.read();
+      if (millis() - drainStart > 300UL) break;
+    }
+  }
   Serial1.write((uint8_t)0xC1);
   Serial1.write((uint8_t)LORA_CFG_REG_START);
   Serial1.write((uint8_t)LORA_CFG_REG_LEN);
@@ -1621,7 +1630,34 @@ static bool loraCheckAndConfigure() {
   }
 
   if (!matches) {
-    loraWriteConfig();
+    // ★2026-07-23: 書込直後の確認読み込みがタイミング次第で失敗することがある
+    // （E220内部のレジスタ書込処理完了前に読み返してしまう等）とGateway側の実機
+    // デバッグで確認したため、Flex側にも同じ「書込→確認」のリトライを移植する。
+    // 従来は書込むだけで確認せず、中途半端な設定のまま送信してしまう恐れがあった
+    // （2026-07-19実機ログで「不一致→書込」の直後に送信し、Gatewayで受信できない
+    // 事象が発生。この未確認書込が原因の可能性が高い）。
+    bool verifyOk = false;
+    for (int attempt = 1; attempt <= 2 && !verifyOk; attempt++) {
+      loraWriteConfig();
+      uint8_t verify[LORA_CFG_REG_LEN] = {0};
+      bool verifyReadOk = loraReadConfig(verify);
+      verifyOk = verifyReadOk &&
+          verify[0] == LORA_CFG_ADDH && verify[1] == LORA_CFG_ADDL &&
+          verify[2] == LORA_CFG_REG0 && verify[3] == LORA_CFG_REG1 &&
+          verify[4] == LORA_CFG_REG2 && verify[5] == LORA_CFG_REG3;
+#if DEBUG_MODE
+      Serial.print("[LORA] config write 確認(");
+      Serial.print(attempt); Serial.print("/2): ");
+      Serial.println(verifyOk ? "OK" : "NG");
+#endif
+    }
+    if (!verifyOk) {
+      // 2回とも確認NG → 設定が不確実なまま送信すると受信側で復号できない可能性が
+      // 高いため、エラーとしてこのサイクルの送信をスキップする（sendLoRa()側で判定）
+      s_errors |= ERR_LORA_CFG;
+      loraModeNormal();
+      return false;
+    }
   }
 
   return loraModeNormal();
