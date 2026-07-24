@@ -213,6 +213,35 @@ function parsePayloadV303(hex) {
 
 
 // ================================
+// 圧縮エンコード（DeviceID + CH1〜4のみ、9バイト/台）デコード
+// ================================
+// ★2026-07-25追加: 512バイト送信ポリシーのもと、MAC全体・RSSI・FWVersion・
+// BATT・Hour-Min・Rangeを送るのをやめ、1台9バイト（18 hex文字）に圧縮した。
+// 対応するGateway側: case02_Gateway/firmware/gateway_v1.1/src/main.cpp buildBatchQuery()
+// レイアウト: [0]DeviceID [1-2]CH1 [3-4]CH2 [5-6]CH3 [7-8]CH4（すべてint16 LE）
+function parseCompactRecord(hex9) {
+  var bytes = [];
+  for (var i = 0; i < hex9.length; i += 2) {
+    bytes.push(parseInt(hex9.substr(i, 2), 16));
+  }
+  function int16le(lo, hi) {
+    var val = lo | (hi << 8);
+    if (val > 32767) val -= 65536;
+    return val;
+  }
+  return {
+    deviceId: bytes[0],
+    ch: [
+      int16le(bytes[1], bytes[2]),
+      int16le(bytes[3], bytes[4]),
+      int16le(bytes[5], bytes[6]),
+      int16le(bytes[7], bytes[8]),
+    ],
+  };
+}
+
+
+// ================================
 // MACアドレス → シート名 取得（「シート名編集」シート参照）
 // ================================
 function getDeviceSheetNameByMac(ss, mac) {
@@ -254,17 +283,19 @@ function doGet(e) {
   try {
     lock.waitLock(10000);
 
-    for (var i = 0; i < n; i++) {
-      var mac  = p['m' + i] || '';
-      var hex  = p['p' + i] || '';
-      var rssi = p['r' + i] || '';
-      if (!hex) continue;
+    var dBlob = p.d || '';
 
-      // 先頭バイト（PktType）だけ見て、専用パーサーに振り分けるか判定
-      // v3.03(BLE)とv3.10(LoRa)はMSDレイアウトが同一のため同じパーサーを使う
-      var firstByte = parseInt(hex.substr(0, 2), 16);
-      var d = (firstByte === PKT_TYPE_V303 || firstByte === PKT_TYPE_V310_LORA)
-        ? parsePayloadV303(hex) : parsePayload(hex);
+    for (var i = 0; i < n; i++) {
+      var chunk = dBlob.substr(i * 18, 18);
+      if (chunk.length < 18) continue;
+      var d = parseCompactRecord(chunk);
+
+      // ★2026-07-25: 圧縮エンコードではMACを送らなくなったため、DeviceIDから
+      // 疑似MAC（00-00-00-00-00-XX）を組み立てて従来通り「シート名編集」で
+      // ルーティングする（LoRaの疑似MAC方式と統一。BLE運用時は「シート名編集」を
+      // 実MACではなくこの疑似MAC形式で登録し直す必要がある）
+      var macHex = ('0' + d.deviceId.toString(16)).slice(-2).toUpperCase();
+      var mac = '00-00-00-00-00-' + macHex;
 
       var sheetName = getDeviceSheetNameByMac(ss, mac);
       if (!sheetName) {
@@ -277,28 +308,28 @@ function doGet(e) {
         continue;
       }
 
-      // 列構成（datebox1 と同一。既存の数式・アラート設定の列位置を変えないため、
-      // fw_version・CH1-4レンジは CH12 の後ろに追記する）:
+      // 列構成（datebox1 と同一。圧縮エンコードでは送っていない項目
+      // （FlexHour/FlexMin/RSSI/fw_version/CH5-12/レンジ）は空欄で書き込む）:
       // 受信日時, 計測日時, MAC, PktType, DeviceID, FlexHour, FlexMin,
       // BLE_RSSI, SIM, LTE-M_RSSI, XIAO_ID, SIM_IMEI, SD記録, 送信間隔(分), 受信台数, CH1〜CH12,
       // fw_version, ch1_range, ch2_range, ch3_range, ch4_range
       sheet.appendRow([
         new Date(), ts ? new Date(ts) : '', mac,
-        d.pktType, d.deviceId,
-        d.hour, d.minute,
-        rssi, sim, csq,
+        PKT_TYPE_V303, d.deviceId,
+        '', '',
+        '', sim, csq,
         '', '', '', '', '',              // XIAO_ID,SIM_IMEI,SD記録,送信間隔(分),受信台数 → データ行では未使用
-        d.ch[0], d.ch[1], d.ch[2], d.ch[3], d.ch[4], d.ch[5],
-        d.ch[6], d.ch[7], d.ch[8], d.ch[9], d.ch[10], d.ch[11],
-        d.fwVersion,
-        d.chRange[0], d.chRange[1], d.chRange[2], d.chRange[3],
+        d.ch[0], d.ch[1], d.ch[2], d.ch[3], '', '',
+        '', '', '', '', '', '',
+        '',
+        '', '', '', '',
       ]);
 
       // 加工用データ（CH7〜CH12）の数式を1つ上の行からコピー
       // （相対参照は自動でその行にずれる。copyToはvalues指定していないので上書きされる）
       var lastRow = sheet.getLastRow();
       var prevRow = lastRow - 1;
-      var ch7to12 = [d.ch[6], d.ch[7], d.ch[8], d.ch[9], d.ch[10], d.ch[11]]; // フォールバック（数式が無い場合）
+      var ch7to12 = ['', '', '', '', '', '']; // フォールバック（数式が無い場合。圧縮エンコードにはCH7-12の生値がないため空欄）
 
       if (prevRow > DATA_HEADER_ROW) {
         sheet
@@ -314,10 +345,10 @@ function doGet(e) {
       }
 
       var dataObj = {
-        CH1: d.ch[0], CH2: d.ch[1], CH3: d.ch[2], CH4: d.ch[3], CH5: d.ch[4], CH6: d.ch[5],
+        CH1: d.ch[0], CH2: d.ch[1], CH3: d.ch[2], CH4: d.ch[3], CH5: '', CH6: '',
         CH7: ch7to12[0], CH8: ch7to12[1], CH9: ch7to12[2], CH10: ch7to12[3], CH11: ch7to12[4], CH12: ch7to12[5],
-        FlexHour: d.hour, FlexMin: d.minute,
-        BLE_RSSI: Number(rssi), 'LTE-M_RSSI': Number(csq),
+        FlexHour: '', FlexMin: '',
+        BLE_RSSI: '', 'LTE-M_RSSI': Number(csq),
       };
 
       checkAlertsForDeviceSheet(sheet, dataObj, mac);

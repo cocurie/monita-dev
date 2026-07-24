@@ -63,25 +63,10 @@
 #include <InternalFileSystem.h>
 #endif
 
-// ── デバッグレベル ─────────────────────────────
-// 0: 無効  1: ステージ結果のみ  2: AT コマンド生ログも表示
-#define DEBUG_LEVEL 0
-
-#if DEBUG_LEVEL >= 1
-  #define DLOG(msg)       Serial.println(F(msg))
-  #define DLOGV(msg, val) do { Serial.print(F(msg)); Serial.println(val); } while(0)
-#else
-  #define DLOG(msg)
-  #define DLOGV(msg, val)
-#endif
-
-#if DEBUG_LEVEL >= 2
-  #define DLOG2(msg)       Serial.println(F(msg))
-  #define DLOGV2(msg, val) do { Serial.print(F(msg)); Serial.println(val); } while(0)
-#else
-  #define DLOG2(msg)
-  #define DLOGV2(msg, val)
-#endif
+// ★2026-07-25: DEBUG_LEVEL切替（0/1/2で本番/デバッグを出し分ける方式）を廃止。
+// 必要なログ（ステージ結果・GAS送信の各段階・LORA受信・失敗時の生応答等）は常時出力する。
+// AT コマンド1行ごとの生ログ（旧DEBUG_LEVEL=2相当）は、GAS/STAGE/LORA等の要点ログで
+// 十分に状況を追えることが分かったため削除した。
 
 #include <Wire.h>
 #include <RTClib.h>
@@ -173,7 +158,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 20;
+static uint8_t  const GATEWAY_FW_VERSION = 21;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -409,8 +394,6 @@ static bool sendAtHasTerminator(const String& res, const char* waitForToken) {
 }
 
 String sendAT(String cmd, int waitMs, const char* waitForToken) {
-  DLOG2("--");
-  DLOGV2(">> ", cmd);
   Serial1.print(cmd + "\r\n");
   long start = millis();
   String res = "";
@@ -434,8 +417,6 @@ String sendAT(String cmd, int waitMs, const char* waitForToken) {
     }
     yield();
   }
-  if (res.length() > 0) { DLOG2("<< "); DLOG2(res.c_str()); }
-  else                   { DLOG2("<< (応答なし)"); }
   return res;
 }
 
@@ -445,27 +426,6 @@ void simStage(const char* name, bool ok) {
   Serial.println(name);
 }
 
-// ══════════════════════════════════════════════
-// SIM7080G初期化の進捗バー表示（★2026-07-23追加、LTE-Mテスト時の可視化用）
-// STAGE1〜NET4までの主要チェックポイントで、結果(OK/NG)と進捗バーを1行にまとめて出力する
-// （旧: simStage()の結果行＋printProgress()の進捗行で2行だったログを1行に整理）。
-// ══════════════════════════════════════════════
-static void printProgressBar(uint8_t percent) {
-  const uint8_t barWidth = 20;
-  uint8_t filled = (uint8_t)((uint16_t)percent * barWidth / 100);
-  Serial.print('[');
-  for (uint8_t i = 0; i < barWidth; i++) Serial.print(i < filled ? '#' : '-');
-  Serial.print(F("] "));
-  Serial.print(percent);
-  Serial.print(F("%"));
-}
-
-static void stageProgress(const char* name, bool ok, uint8_t percent) {
-  Serial.print(ok ? F("[OK] ") : F("[NG] "));
-  printProgressBar(percent);
-  Serial.print(' ');
-  Serial.println(name);
-}
 
 // ══════════════════════════════════════════════
 // ネットワーク初期化（ltem_signal_test から流用）
@@ -490,7 +450,7 @@ bool initNetwork() {
   if (strlen(APN_USER) > 0) {
     sendAT("AT+CGAUTH=1,1,\"" + String(APN_PASS) + "\",\"" + String(APN_USER) + "\""); delay(500);
   }
-  stageProgress("NET1: LTE-M モード & APN 設定", true, 65);
+  simStage("NET1: LTE-M モード & APN 設定", true);
 
   // CREG: ネットワーク登録確認（最大 60 秒）
   bool cregOk = false;
@@ -511,7 +471,7 @@ bool initNetwork() {
     if (i < 11) delay(5000);
   }
   Serial.println();
-  stageProgress("NET2: ネットワーク登録 (CREG=1 or 5)", cregOk, cregOk ? 80 : 65);
+  simStage("NET2: ネットワーク登録 (CREG=1 or 5)", cregOk);
 
   if (!cregOk) {
     Serial.println(F("\n--- NET2 NG: 原因診断 ---"));
@@ -633,7 +593,7 @@ bool initNetwork() {
 
     if (rescanOk) {
       cregOk = true;
-      stageProgress("NET2: リトライで登録成功", true, 80);
+      simStage("NET2: リトライで登録成功", true);
     }
   }
 
@@ -657,7 +617,7 @@ bool initNetwork() {
     if (att2.indexOf("+CGATT: 1") >= 0) attachOk = true;
   }
   Serial.println();
-  stageProgress("NET3: データ Attach (CGATT=1)", attachOk, attachOk ? 90 : 80);
+  simStage("NET3: データ Attach (CGATT=1)", attachOk);
   if (!attachOk) {
     Serial.println(F("  → CGATT=0 のまま。APN 設定・SIM 契約を確認してください"));
     String ceer = sendAT("AT+CEER", 3000);
@@ -672,8 +632,8 @@ bool initNetwork() {
   sendAT("AT+CNACT=0,1", 15000); delay(3000);
   String cnact = sendAT("AT+CNACT?", 3000);
   bool ipOk = cnact.indexOf("0,1") >= 0;
-  stageProgress("NET4: IP アドレス取得 (CNACT)", ipOk, ipOk ? 100 : 90);
-  if (!ipOk) { DLOGV("  → CNACT 応答: ", cnact); return false; }
+  simStage("NET4: IP アドレス取得 (CNACT)", ipOk);
+  if (!ipOk) { Serial.print(F("  → CNACT 応答: ")); Serial.println(cnact); return false; }
 
   return true;
 }
@@ -847,7 +807,7 @@ void scanCallback(ble_gap_evt_adv_report_t* report) {
   // Company ID だけでは無関係な BLE 機器を誤検出することがあるため、
   // Pkt type・Device ID がホワイトリストに一致するものだけを Flex とみなす
   if (!isAllowedFlexPacket(pktType, deviceId)) {
-    DLOG2("[BLE] 未登録の Company ID 0xFFFF パケットを無視（Flex 以外の可能性）");
+    // Company ID 0xFFFFの無関係な機器を毎回ログすると騒がしいだけなので出力しない（想定内の棄却）
     Bluefruit.Scanner.resume();
     return;
   }
@@ -1095,8 +1055,7 @@ static void loraPoll() {
       uint8_t pktType  = s_loraBody[0];
       uint8_t deviceId = s_loraBody[1];
       if (!isAllowedFlexPacket(pktType, deviceId)) {
-        DLOG2("[LORA] 未登録のPktType/DeviceIDを無視");
-        continue;
+        continue;  // 想定外のPktType/DeviceIDは棄却（ログは出さない）
       }
       int rssiDbm = (int)s_loraRssiRaw - 256;
       Serial.print(F("[LORA] フレーム受信 Device ID=0x"));
@@ -1115,7 +1074,7 @@ static void loraPoll() {
   // フレーム途中で一定時間バイトが届かない場合は同期探索状態へ強制的に戻す
   // （バイト抜け等で永久に詰まった状態になるのを防ぐ）
   if (s_loraState != LORA_WAIT_SYNC && millis() - s_loraFieldStartMs > LORA_FIELD_TIMEOUT_MS) {
-    DLOG2("[LORA] フレーム途中でタイムアウト。再同期します");
+    Serial.println(F("[LORA] フレーム途中でタイムアウト。再同期します"));
     s_loraState = LORA_WAIT_SYNC;
   }
 }
@@ -1240,31 +1199,32 @@ int buildBatchQuery(const FlexRecord* merged, int start, int n,
   header += "&csq=";
   header += String(csq);
 
+  // ★2026-07-25: 圧縮エンコードに変更。MAC全体やRSSI付きの冗長な per-device
+  // パラメータ（&m{i}=&p{i}=&r{i}=）をやめ、DeviceID(1B)+CH1〜4(各2B)＝9バイト/台
+  // だけを1本の &d= 16進blobにまとめて詰める（1台あたり18 hex文字）。
+  // BATT/FWVersion/Hour-Min/Range/RSSIは今はテスト段階のため送らない
+  // （必要になれば別途info行等で低頻度に送る方式を検討）。
   String body = "";
   int count = 0;
   for (int i = start; i < n; i++) {
     const FlexRecord& rec = merged[i];
-    char mac[18];
-    snprintf(mac, sizeof(mac), "%02X-%02X-%02X-%02X-%02X-%02X",
-             rec.mac[5], rec.mac[4], rec.mac[3], rec.mac[2], rec.mac[1], rec.mac[0]);
+    if (rec.payloadLen < 11) continue;  // DeviceID+CH1-4に満たない不正レコードは送らない
 
-    String hex = "";
-    for (int j = 0; j < rec.payloadLen; j++) {
-      if (rec.payload[j] < 0x10) hex += '0';
-      hex += String(rec.payload[j], HEX);
-    }
-
-    String oneDevice = "&m"; oneDevice += count; oneDevice += "="; oneDevice += mac;
-    oneDevice += "&p"; oneDevice += count; oneDevice += "="; oneDevice += hex;
-    oneDevice += "&r"; oneDevice += count; oneDevice += "="; oneDevice += String(rec.rssi);
+    char chunk[19];
+    snprintf(chunk, sizeof(chunk), "%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+             rec.payload[1], rec.payload[3], rec.payload[4], rec.payload[5],
+             rec.payload[6], rec.payload[7], rec.payload[8], rec.payload[9], rec.payload[10]);
 
     // "&n=" の桁数は最終台数が決まるまで確定しないため、2桁分（最大99台）を先に見込んでおく
+    // "&d=" は先頭1回だけ付くので、2台目以降は純粋にchunk(18文字)分だけ伸びる
+    size_t oneLen = (count == 0) ? (String(F("&d=")).length() + 18) : 18;
     size_t projected = baseUrl.length() + header.length() + String(F("&n=99")).length()
-                        + body.length() + oneDevice.length();
+                        + body.length() + oneLen;
     if (count > 0 && projected > SHREQ_MAX_URL_BYTES) {
       break;  // 512バイトを超えるので、この台はここでは入れず次のバッチへ回す
     }
-    body += oneDevice;
+    if (count == 0) body += "&d=";
+    body += chunk;
     count++;
     // ※ SD記録はネットワーク確認より前に flushRecords() 内で実施済み
     //   （LTE-M停止時もデータを残すため）
@@ -1710,14 +1670,14 @@ void setup() {
   // [STAGE 1] UART 設定
   Serial1.setPins(7, 6);  // RX=D7, TX=D6
   Serial1.begin(115200);
-  stageProgress("STAGE1: UART 設定 (D6=TX, D7=RX, 115200bps)", true, 5);
+  simStage("STAGE1: UART 設定 (D6=TX, D7=RX, 115200bps)", true);
 
   // [STAGE 2] 起動待ち
   for (int i = 0; i < 15; i++) {
     delay(1000);
     while (Serial1.available()) Serial1.read();  // 起動中の不定バイトは読み捨てる
   }
-  stageProgress("STAGE2: SIM7080G 起動待ち (15秒) 完了", true, 15);
+  simStage("STAGE2: SIM7080G 起動待ち (15秒) 完了", true);
 
 #ifdef COMM_MODE_BLE
   // SIM7080G 起動待ちが終わった時点で BLE スキャンを開始する。
@@ -1741,7 +1701,7 @@ void setup() {
     while (Serial1.available()) Serial1.read();
   }
   Serial.println();
-  stageProgress("STAGE3: AT 疎通", atOk, atOk ? 25 : 5);
+  simStage("STAGE3: AT 疎通", atOk);
   if (!atOk) {
     Serial.println(F("  → 配線・電源を確認してください"));
     Serial.println(F("  → D6(TX)→SIM RX / D7(RX)←SIM TX / 5V 供給 OK?"));
@@ -1765,16 +1725,16 @@ void setup() {
     if (r.indexOf("OK") >= 0) { atOk2 = true; break; }
     while (Serial1.available()) Serial1.read();
   }
-  stageProgress("STAGE4: モデムリセット (AT&F + CFUN=1,1)", atOk2, atOk2 ? 40 : 25);
+  simStage("STAGE4: モデムリセット (AT&F + CFUN=1,1)", atOk2);
   if (!atOk2) { Serial.println(F("  → リセット後に応答なし")); return; }
 
   // [STAGE 5] エコーオフ・SIM 確認
   sendAT("ATE0", 2000);
   String cpinRes = sendAT("AT+CPIN?", 3000);
   bool simReady = cpinRes.indexOf("READY") >= 0;
-  stageProgress("STAGE5: SIM カード認識 (CPIN=READY)", simReady, simReady ? 50 : 40);
+  simStage("STAGE5: SIM カード認識 (CPIN=READY)", simReady);
   if (!simReady) {
-    DLOGV("  → CPIN 応答: ", cpinRes);
+    Serial.print(F("  → CPIN 応答: ")); Serial.println(cpinRes);
     Serial.println(F("  → SIM カードが刺さっているか確認してください"));
   }
 
