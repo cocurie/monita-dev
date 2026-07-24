@@ -171,7 +171,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 18;
+static uint8_t  const GATEWAY_FW_VERSION = 19;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -226,7 +226,7 @@ static bool s_lastNetOk = false;  // 最後のネットワーク接続結果
 // ══════════════════════════════════════════════
 // RTC
 // ══════════════════════════════════════════════
-String sendAT(String cmd, int waitMs);  // 後方で定義（RTC の網時刻同期から使うため前方宣言。デフォルト引数は本体側のみで指定）
+String sendAT(String cmd, int waitMs = 5000, const char* waitForToken = nullptr);  // 後方で定義（RTC の網時刻同期から使うため前方宣言）
 
 static RTC_DS3231 rtc;
 static bool rtcAvailable = false;
@@ -394,7 +394,19 @@ static void loraPoll();
 // 上限超過分は読み捨てて（HWバッファは溢れさせない）ヒープ確保量を頭打ちにする。
 static uint16_t const SENDAT_MAX_RESPONSE_LEN = 2048;
 
-String sendAT(String cmd, int waitMs = 5000) {
+// ★2026-07-25: 従来はwaitMsをどんな場合も律儀にフルで待っていた（応答が数秒で返っても
+// タイムアウト時間いっぱい待機）。これがAT+SHREQ/AT+SHCONN等の待ち時間が成功時も失敗時も
+// ほぼタイムアウト値ぴったりになる原因だった。応答の完了を示すトークンを検出したら
+// 即座に返るようにし、起動処理・GAS送信の両方を大幅に短縮する。
+// waitForToken省略時（多くのAT+xxxコマンド）は "OK"/"ERROR" で終端とみなす。
+// AT+SHREQのように「OKはすぐ返るが実際の結果は+SHREQ:という別行で遅れて届く」コマンドは
+// 呼び出し側でwaitForTokenに"+SHREQ:"等を指定し、その行が来るまで待つようにする。
+static bool sendAtHasTerminator(const String& res, const char* waitForToken) {
+  if (waitForToken != nullptr) return res.indexOf(waitForToken) >= 0;
+  return res.indexOf("OK\r\n") >= 0 || res.indexOf("ERROR") >= 0;
+}
+
+String sendAT(String cmd, int waitMs, const char* waitForToken) {
   DLOG2("--");
   DLOGV2(">> ", cmd);
   Serial1.print(cmd + "\r\n");
@@ -409,6 +421,15 @@ String sendAT(String cmd, int waitMs = 5000) {
 #ifdef COMM_MODE_LORA
     loraPoll();
 #endif
+    // 応答完了を示すトークンが見えたら、タイムアウトを待たずに即座に返る
+    if (sendAtHasTerminator(res, waitForToken)) {
+      delay(20);  // 直後にまだ届く残りバイトを拾うための短い猶予
+      while (Serial1.available()) {
+        char c = (char)Serial1.read();
+        if (res.length() < SENDAT_MAX_RESPONSE_LEN) res += c;
+      }
+      break;
+    }
     yield();
   }
   if (res.length() > 0) { DLOG2("<< "); DLOG2(res.c_str()); }
@@ -709,7 +730,9 @@ bool gasSendRequest(String queryParams) {
   scriptPath += queryParams;
 
   Serial.println(F("[GAS] データ送信中(AT+SHREQ、最大60秒)..."));
-  String result = sendAT("AT+SHREQ=\"" + scriptPath + "\",1", 60000);
+  // AT+SHREQは"OK"が即座に返り、実際の結果("+SHREQ: ...")は非同期に遅れて届くため、
+  // "+SHREQ:"を検出するまで待つ（バレの"OK"だけで早期returnしてしまわないように）
+  String result = sendAT("AT+SHREQ=\"" + scriptPath + "\",1", 60000, "+SHREQ:");
 
   int statusCode = 0;
   int si = result.indexOf("+SHREQ: ");
