@@ -117,7 +117,7 @@ static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のとき
 // ============================================================
 #ifdef COMM_MODE_LORA
 static const uint8_t  DEVICE_ID  = 0x01;  // 子機 ID（複数台時は変える: 0x01〜0xFF）
-static const uint8_t  FW_VERSION = 5;     // 子機ファームのバージョン。コミットのたびに+1すること
+static const uint8_t  FW_VERSION = 6;     // 子機ファームのバージョン。コミットのたびに+1すること
 #endif
 
 // ============================================================
@@ -408,6 +408,31 @@ static void statusSigfoxBlinkTick() {
 // COMPARE0 ISR からメインループ側へ「起床した」ことを伝えるフラグ
 static volatile bool s_rtc2Compare0Wake;
 
+#ifdef COMM_MODE_LORA
+// ★2026-07-24追加: 複数台のLoRa子機を同時展開する際、E220の透過モードには
+// CSMA等の衝突回避機構が無いため、全台が同じSLEEP_MINUTES間隔で起床すると
+// 送信タイミングが揃い続け電波衝突が起きやすい。nRF52840内蔵ハードウェア乱数
+// 発生器(RNG)で毎回本物の乱数を取り、スリープ時間にジッターを加えて各台の
+// 送信タイミングをばらけさせる（デバイスIDベースの疑似乱数だと固定シードで
+// 同期しかねないため、電源投入毎に変わるHW RNGを使う）。
+static uint8_t nrfTrueRandomByte() {
+  NRF_RNG->TASKS_START = 1;
+  NRF_RNG->EVENTS_VALRDY = 0;
+  while (NRF_RNG->EVENTS_VALRDY == 0) { /* HW RNGの1バイト生成を待つ（数十us程度） */ }
+  uint8_t v = (uint8_t)NRF_RNG->VALUE;
+  NRF_RNG->EVENTS_VALRDY = 0;
+  NRF_RNG->TASKS_STOP = 1;
+  return v;
+}
+
+// -jitterMaxSec 〜 +jitterMaxSec の範囲でランダムな符号付きオフセット(秒)を返す
+static int32_t loraSleepJitterSeconds(uint16_t jitterMaxSec) {
+  uint16_t raw = ((uint16_t)nrfTrueRandomByte() << 8) | nrfTrueRandomByte();
+  uint32_t range = (uint32_t)jitterMaxSec * 2U + 1U;
+  return (int32_t)(raw % range) - (int32_t)jitterMaxSec;
+}
+#endif
+
 // RTC2 割り込み: 指定ティック経過でここが走り、待機ループを抜ける
 extern "C" void RTC2_IRQHandler(void) {
   if (NRF_RTC2->EVENTS_COMPARE[0]) {
@@ -483,9 +508,26 @@ static void deepSleep(uint32_t minutes) {
     minutes = 1U;
   }
 
-  // スリープ時間を RTC ティック数に変換（分 → 秒 → 8tick/秒）
+  int64_t sleepSeconds = (int64_t)minutes * 60LL;
+
+#ifdef COMM_MODE_LORA
+  // ★2026-07-24: 複数台展開時の送信タイミング衝突を避けるため±LORA_SLEEP_JITTER_MAX_SEC秒の
+  // ランダムジッターを加える。SLEEP_MINUTES=15分に対して±2分(全体の約13%)とし、周期を
+  // 大きく崩さずに衝突確率を下げる。
+  static uint16_t const LORA_SLEEP_JITTER_MAX_SEC = 120;  // ±2分
+  int32_t jitterSec = loraSleepJitterSeconds(LORA_SLEEP_JITTER_MAX_SEC);
+  sleepSeconds += jitterSec;
+  if (sleepSeconds < 1) sleepSeconds = 1;  // ジッターで0秒以下にならないよう下限を確保
+#if DEBUG_MODE
+  Serial.print("[LORA] sleep jitter: ");
+  Serial.print(jitterSec);
+  Serial.println(" sec");
+#endif
+#endif
+
+  // スリープ時間を RTC ティック数に変換（秒 → 8tick/秒）
   uint64_t ticks64 =
-      (uint64_t)minutes * 60ULL * (uint64_t)RTC2_TICKS_PER_SECOND;
+      (uint64_t)sleepSeconds * (uint64_t)RTC2_TICKS_PER_SECOND;
   // 24bit カウンタを超える長さは切り詰め（最大約 24 日相当）
   if (ticks64 > RTC2_COUNTER_MASK) {
     ticks64 = RTC2_COUNTER_MASK;
