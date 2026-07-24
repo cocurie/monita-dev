@@ -156,12 +156,15 @@ static uint32_t const SEND_INTERVAL_DEFAULT_MS = 300000;  // 既定 5 分
 static uint32_t       sendIntervalMs           = SEND_INTERVAL_DEFAULT_MS;  // 実行時可変
 
 // Pkt type と併せて二重チェックする Device ID ホワイトリスト（BLE/LoRa共通）
-static uint8_t  const ALLOWED_DEVICE_IDS[] = {0x01, 0x02};   // ★子機を増やしたらここに追加する
+// 2026-07-20: test_sketches/22_lora_multi_child によるLoRa複数台テスト(13台)用に拡張
+static uint8_t  const ALLOWED_DEVICE_IDS[] = {
+  0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+};   // ★子機を増やしたらここに追加する
 static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / sizeof(ALLOWED_DEVICE_IDS[0]);
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 15;
+static uint8_t  const GATEWAY_FW_VERSION = 16;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
