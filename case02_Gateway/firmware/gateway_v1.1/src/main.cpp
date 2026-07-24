@@ -93,7 +93,7 @@
 // ══════════════════════════════════════════════
 
 // GAS スクリプトID（デプロイURLの "AKfycb..." 部分）
-const char* GAS_SCRIPT_ID = "AKfycbw2IIQ1GyxtGh2Uis_zmwXW3VhftDy9HWKw5tSsUbwNOhNo6p9PnNv3ftfs3MvcMDT5ww/exec";
+const char* GAS_SCRIPT_ID = "AKfycbywRcyl3059evcw-kFo9ypeejbhZWRyY9rILX9TUjlEWJ-4K2nGkZqIrZymA9cYGZ8maQ/exec";
 
 // LTE-M送信のON/OFF切替（★2026-07-23追加）
 // false にすると SIM7080G の初期化・ネットワーク接続・GAS送信を一切行わず、
@@ -161,7 +161,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 13;
+static uint8_t  const GATEWAY_FW_VERSION = 14;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -413,6 +413,22 @@ void simStage(const char* name, bool ok) {
 }
 
 // ══════════════════════════════════════════════
+// SIM7080G初期化の進捗バー表示（★2026-07-23追加、LTE-Mテスト時の可視化用）
+// STAGE1〜NET4までの主要チェックポイントで呼ぶ。失敗時もその時点の進捗として表示する
+// （どこで止まった/失敗したかが一目でわかるように、成功/失敗に関わらず出力する）。
+// ══════════════════════════════════════════════
+static void printProgress(uint8_t percent, const char* label) {
+  const uint8_t barWidth = 20;
+  uint8_t filled = (uint8_t)((uint16_t)percent * barWidth / 100);
+  Serial.print(F("[進捗 "));
+  for (uint8_t i = 0; i < barWidth; i++) Serial.print(i < filled ? '#' : '-');
+  Serial.print(F("] "));
+  Serial.print(percent);
+  Serial.print(F("% "));
+  Serial.println(label);
+}
+
+// ══════════════════════════════════════════════
 // ネットワーク初期化（ltem_signal_test から流用）
 // ══════════════════════════════════════════════
 bool initNetwork() {
@@ -436,6 +452,7 @@ bool initNetwork() {
     sendAT("AT+CGAUTH=1,1,\"" + String(APN_PASS) + "\",\"" + String(APN_USER) + "\""); delay(500);
   }
   simStage("NET1: LTE-M モード & APN 設定", true);
+  printProgress(65, "NET1: LTE-M モード & APN 設定 完了");
 
   // CREG: ネットワーク登録確認（最大 60 秒）
   bool cregOk = false;
@@ -457,6 +474,7 @@ bool initNetwork() {
   }
   Serial.println();
   simStage("NET2: ネットワーク登録 (CREG=1 or 5)", cregOk);
+  printProgress(cregOk ? 80 : 65, cregOk ? "NET2: ネットワーク登録 完了" : "NET2: ネットワーク登録 失敗（診断へ）");
 
   if (!cregOk) {
     Serial.println(F("\n--- NET2 NG: 原因診断 ---"));
@@ -576,7 +594,10 @@ bool initNetwork() {
     Serial.println(F("    3. 電波の弱い場所にいないか"));
     Serial.println(F("-------------------------"));
 
-    if (rescanOk) cregOk = true;
+    if (rescanOk) {
+      cregOk = true;
+      printProgress(80, "NET2: リトライで登録成功");
+    }
   }
 
   // CGATT: データ Attach 確認
@@ -600,6 +621,7 @@ bool initNetwork() {
   }
   Serial.println();
   simStage("NET3: データ Attach (CGATT=1)", attachOk);
+  printProgress(attachOk ? 90 : 80, attachOk ? "NET3: データAttach 完了" : "NET3: データAttach 失敗");
   if (!attachOk) {
     Serial.println(F("  → CGATT=0 のまま。APN 設定・SIM 契約を確認してください"));
     String ceer = sendAT("AT+CEER", 3000);
@@ -615,6 +637,7 @@ bool initNetwork() {
   String cnact = sendAT("AT+CNACT?", 3000);
   bool ipOk = cnact.indexOf("0,1") >= 0;
   simStage("NET4: IP アドレス取得 (CNACT)", ipOk);
+  printProgress(ipOk ? 100 : 90, ipOk ? "NET4: IPアドレス取得 完了（接続完了）" : "NET4: IPアドレス取得 失敗");
   if (!ipOk) { DLOGV("  → CNACT 応答: ", cnact); return false; }
 
   return true;
@@ -1561,6 +1584,7 @@ void setup() {
   Serial1.setPins(7, 6);  // RX=D7, TX=D6
   Serial1.begin(115200);
   simStage("STAGE1: UART 設定 (D6=TX, D7=RX, 115200bps)", true);
+  printProgress(5, "STAGE1: UART設定 完了");
 
   // [STAGE 2] 起動待ち
   Serial.print(F("[   ] STAGE2: SIM7080G 起動待ち (15秒)"));
@@ -1569,6 +1593,7 @@ void setup() {
     while (Serial1.available()) Serial.write(Serial1.read());
   }
   Serial.println(F(" 完了"));
+  printProgress(15, "STAGE2: SIM7080G起動待ち 完了");
 
 #ifdef COMM_MODE_BLE
   // SIM7080G 起動待ちが終わった時点で BLE スキャンを開始する。
@@ -1593,6 +1618,7 @@ void setup() {
   }
   Serial.println();
   simStage("STAGE3: AT 疎通", atOk);
+  printProgress(atOk ? 25 : 5, atOk ? "STAGE3: AT疎通 完了" : "STAGE3: AT疎通 失敗");
   if (!atOk) {
     Serial.println(F("  → 配線・電源を確認してください"));
     Serial.println(F("  → D6(TX)→SIM RX / D7(RX)←SIM TX / 5V 供給 OK?"));
@@ -1617,6 +1643,7 @@ void setup() {
     while (Serial1.available()) Serial1.read();
   }
   simStage("STAGE4: モデムリセット (AT&F + CFUN=1,1)", atOk2);
+  printProgress(atOk2 ? 40 : 25, atOk2 ? "STAGE4: モデムリセット 完了" : "STAGE4: モデムリセット 失敗");
   if (!atOk2) { Serial.println(F("  → リセット後に応答なし")); return; }
 
   // [STAGE 5] エコーオフ・SIM 確認
@@ -1624,6 +1651,7 @@ void setup() {
   String cpinRes = sendAT("AT+CPIN?", 3000);
   bool simReady = cpinRes.indexOf("READY") >= 0;
   simStage("STAGE5: SIM カード認識 (CPIN=READY)", simReady);
+  printProgress(simReady ? 50 : 40, simReady ? "STAGE5: SIM認識 完了" : "STAGE5: SIM認識 失敗");
   if (!simReady) {
     DLOGV("  → CPIN 応答: ", cpinRes);
     Serial.println(F("  → SIM カードが刺さっているか確認してください"));
