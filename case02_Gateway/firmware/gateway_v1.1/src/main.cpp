@@ -111,11 +111,13 @@ const char* GAS_SCRIPT_ID = "AKfycbywRcyl3059evcw-kFo9ypeejbhZWRyY9rILX9TUjlEWJ-
 // 0 = 無効（通常運用時は必ず 0 に戻すこと）
 #define TEST_FORCE_SEND_FAIL 0
 
-// ★2026-07-24追加: バッチ分割(MAX_DEVICES_PER_REQUEST)の動作確認用。
+// ★2026-07-24追加、2026-07-25更新: バッチ分割の動作確認用。
 // 実機のFlexを複数台同時稼働させなくても、起動時にダミーの子機データをN件
-// バッファへ注入し、次の送信サイクルで複数バッチに分割されるかを検証できる。
-// gasConnect()が1回だけ呼ばれ、gasSendRequest()だけがバッチ数分繰り返されることを
-// シリアルログで確認する。0 = 無効（通常運用時は必ず 0 に戻すこと）。
+// バッファへ注入し、次の送信サイクルで正しく分割されるかを検証できる。
+// バッチ分割は固定台数ではなく実バイト数（512バイト上限）で動的に決まるため、
+// シリアルログの [BATCH] 行（採用台数とクエリ長）で「512バイト以内に収まっているか」
+// 「超えそうな時に正しく次バッチへ回っているか」を確認する。
+// 0 = 無効（通常運用時は必ず 0 に戻すこと）。
 #define TEST_INJECT_FAKE_DEVICE_COUNT 10  // ★テスト用に10に設定中。検証後は必ず0に戻すこと
 
 // SIM 切り替え — 使う方のブロックだけ有効にする
@@ -171,7 +173,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 19;
+static uint8_t  const GATEWAY_FW_VERSION = 20;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -1213,28 +1215,35 @@ void postBootInfoRow() {
 // ライブ受信データとマージして再送する（同一 MAC はライブ側を優先）。
 // これにより一時的な通信断でデータをロストしない。
 // ══════════════════════════════════════════════
-// 1回のGETに含める最大台数。台数が多いとクエリ文字列がSIM7080GのAT+SHREQ長制限
-// （HEADERLEN/BODYLENおよびAT実装上の実用上限）に達し送信が黙って失敗しうるため、
-// この件数ごとに複数回のGETへ分割する。
-// ★2026-07-24: SIMCom公式AT Command Manualで AT+SHREQ の <url> パラメータが
-// 「max is 512 bytes」と明記されていることを確認。子機1台あたり約71バイト
-// （MAC17+payload38hex+RSSI4+区切り文字）、固定オーバーヘッド約130バイトから逆算すると
-// 安全に収まるのは5台までのため、マージンを見て4台に設定する（旧8台は512バイト超過の恐れがあった）。
-static int const MAX_DEVICES_PER_REQUEST = 4;
+// ★2026-07-25: 固定台数での分割から、実際のバイト数を積算する動的分割に変更。
+// SIMCom公式AT Command Manualで AT+SHREQ の <url>（scriptPath全体）が「max is 512 bytes」と
+// 明記されていることを確認済み。「基本は512バイト以内に収め、よっぽどの例外でない限り
+// 送信回数を増やさない」という運用ポリシー（2026-07-25確定）のもと、ペイロードの
+// エンコード方式が変わっても常に上限ギリギリまで詰め込めるよう、固定台数ではなく
+// 実測バイト数で都度判定する方式にした。
+static uint16_t const SHREQ_MAX_URL_BYTES = 512;
 
-// merged[0..n-1] のうち [start, start+count) だけを1回のGETで送信する
-bool postBatch(const FlexRecord* merged, int start, int count, const String& ts, int csq) {
-  String params = "ts=";
-  params += ts;
-  params += "&sim=";
-  params += SIM_NAME;
-  params += "&csq=";
-  params += String(csq);
-  params += "&n=";
-  params += String(count);
+// merged[start..n) から、scriptPath全体（/macros/s/+ID+?+params）が512バイトを超えない
+// 範囲で可能な限り多くの台数を1バッチに詰め込む。採用した台数を返し、outParamsに
+// 完成したクエリ文字列（ts=...&sim=...&csq=...&n=...&m0=...）を格納する。
+// 最低1台は必ず入れる（1台分だけで512バイトを超える異常系は上位のAT+SHREQ側で失敗として扱う）。
+int buildBatchQuery(const FlexRecord* merged, int start, int n,
+                     const String& ts, int csq, String& outParams) {
+  String baseUrl = "/macros/s/";
+  baseUrl += GAS_SCRIPT_ID;
+  baseUrl += "?";
 
-  for (int k = 0; k < count; k++) {
-    const FlexRecord& rec = merged[start + k];
+  String header = "ts=";
+  header += ts;
+  header += "&sim=";
+  header += SIM_NAME;
+  header += "&csq=";
+  header += String(csq);
+
+  String body = "";
+  int count = 0;
+  for (int i = start; i < n; i++) {
+    const FlexRecord& rec = merged[i];
     char mac[18];
     snprintf(mac, sizeof(mac), "%02X-%02X-%02X-%02X-%02X-%02X",
              rec.mac[5], rec.mac[4], rec.mac[3], rec.mac[2], rec.mac[1], rec.mac[0]);
@@ -1245,13 +1254,30 @@ bool postBatch(const FlexRecord* merged, int start, int count, const String& ts,
       hex += String(rec.payload[j], HEX);
     }
 
-    params += "&m"; params += k; params += "="; params += mac;
-    params += "&p"; params += k; params += "="; params += hex;
-    params += "&r"; params += k; params += "="; params += String(rec.rssi);
+    String oneDevice = "&m"; oneDevice += count; oneDevice += "="; oneDevice += mac;
+    oneDevice += "&p"; oneDevice += count; oneDevice += "="; oneDevice += hex;
+    oneDevice += "&r"; oneDevice += count; oneDevice += "="; oneDevice += String(rec.rssi);
+
+    // "&n=" の桁数は最終台数が決まるまで確定しないため、2桁分（最大99台）を先に見込んでおく
+    size_t projected = baseUrl.length() + header.length() + String(F("&n=99")).length()
+                        + body.length() + oneDevice.length();
+    if (count > 0 && projected > SHREQ_MAX_URL_BYTES) {
+      break;  // 512バイトを超えるので、この台はここでは入れず次のバッチへ回す
+    }
+    body += oneDevice;
+    count++;
     // ※ SD記録はネットワーク確認より前に flushRecords() 内で実施済み
     //   （LTE-M停止時もデータを残すため）
   }
 
+  outParams = header + "&n=" + String(count) + body;
+  Serial.print(F("[BATCH] ")); Serial.print(count); Serial.print(F(" 台、クエリ長 "));
+  Serial.print(baseUrl.length() + outParams.length()); Serial.println(F(" / 512 バイト"));
+  return count;
+}
+
+// buildBatchQuery()で組み立て済みのクエリを1回のGETで送信する（失敗時30秒後に1回だけ再試行）
+bool postBatch(const String& params) {
   // ★2026-07-25: 「接続を1回張って複数回のSHREQを使い回す」最適化を撤回。
   // 実機検証の結果、同一AT+SHCONN接続で2回目以降のAT+SHREQが恒常的に
   // ステータスコード0（応答解析失敗）を返す事象を確認した。GAS側には実際に
@@ -1336,7 +1362,7 @@ void flushRecords() {
   int csq = getSimCsq();
   s_lastCsq = csq;  // コントローラー向けステータス用にキャッシュ
 
-  // クエリ長がAT+SHREQの512バイト上限に達しないよう、MAX_DEVICES_PER_REQUEST台ずつに分割して送信する。
+  // クエリ長がAT+SHREQの512バイト上限に達しないよう、実バイト数を見ながら動的に分割して送信する。
   // ★2026-07-25: 「接続を使い回す」最適化は撤回済み（postBatch()内で毎回postToGAS()を
   // 呼び、バッチごとに接続→送信→切断のフルシーケンスを行う。詳細はpostBatch()のコメント参照）。
   FlexRecord failedMerged[MAX_DEVICES];
@@ -1344,11 +1370,12 @@ void flushRecords() {
   bool cycleHadSuccess = false;  // このサイクルで1バッチでも送信成功したか
 
   {
-    for (int start = 0; start < n; start += MAX_DEVICES_PER_REQUEST) {
-      int count = n - start;
-      if (count > MAX_DEVICES_PER_REQUEST) count = MAX_DEVICES_PER_REQUEST;
+    int start = 0;
+    while (start < n) {
+      String params;
+      int count = buildBatchQuery(merged, start, n, ts, csq, params);
 
-      bool ok = postBatch(merged, start, count, ts, csq);
+      bool ok = postBatch(params);
       if (ok) {
         cycleHadSuccess = true;
         Serial.print(F("✓ 送信成功（")); Serial.print(count); Serial.println(F(" 件、再送キュー クリア）"));
@@ -1357,6 +1384,7 @@ void flushRecords() {
         Serial.println(F(" 件を次回送信サイクルで再送キューとしてリトライします"));
         for (int k = 0; k < count && failedN < MAX_DEVICES; k++) failedMerged[failedN++] = merged[start + k];
       }
+      start += count;
     }
   }
 
@@ -1615,8 +1643,9 @@ void setup() {
   recordMutex = xSemaphoreCreateMutex();
 
 #if TEST_INJECT_FAKE_DEVICE_COUNT > 0
-  // ★2026-07-24: バッチ分割の動作確認用ダミーデータ注入。実機を並べなくても
-  // MAX_DEVICES_PER_REQUEST(4台)超のバッチ分割・gasConnect()使い回しを検証できる。
+  // ★2026-07-24追加、2026-07-25更新: バッチ分割の動作確認用ダミーデータ注入。
+  // 実機を並べなくても、512バイトの動的分割ロジック（buildBatchQuery()）が
+  // 正しく複数バッチに割り振るかを検証できる。
   {
     int fakeN = TEST_INJECT_FAKE_DEVICE_COUNT;
     if (fakeN > MAX_DEVICES) fakeN = MAX_DEVICES;
