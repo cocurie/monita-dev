@@ -161,7 +161,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 12;
+static uint8_t  const GATEWAY_FW_VERSION = 13;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -878,6 +878,17 @@ static void loraWriteConfig() {
   while (millis() - t0 < 300UL) { while (loraSerial.available()) loraSerial.read(); }
 }
 
+// デバッグ用: 6バイトをHEXで出力（期待値と実測値の突き合わせに使う）
+static void loraPrintRegs(const char* label, const uint8_t regs[LORA_CFG_REG_LEN]) {
+  Serial.print(F("[LORA] ")); Serial.print(label); Serial.print(F(": "));
+  for (int i = 0; i < LORA_CFG_REG_LEN; i++) {
+    if (regs[i] < 0x10) Serial.print('0');
+    Serial.print(regs[i], HEX);
+    Serial.print(' ');
+  }
+  Serial.println();
+}
+
 // 起動時に1回呼ぶ（Gatewayは常時稼働のためFlexのように毎起床では確認しない）。
 // 現在の設定値を確認し、想定値と異なれば書き込む。
 static bool loraCheckAndConfigure() {
@@ -892,19 +903,41 @@ static bool loraCheckAndConfigure() {
 
   Serial.print(F("[LORA] config read "));
   Serial.println(!readOk ? F("失敗") : (matches ? F("一致") : F("不一致→書込")));
+  if (readOk) {
+    loraPrintRegs("実測値(読込)", cur);
+    uint8_t expected[LORA_CFG_REG_LEN] = {LORA_CFG_ADDH, LORA_CFG_ADDL, LORA_CFG_REG0,
+                                           LORA_CFG_REG1, LORA_CFG_REG2, LORA_CFG_REG3};
+    loraPrintRegs("期待値      ", expected);
+  }
 
   if (!readOk) { loraModeNormal(); return false; }
 
   if (!matches) {
-    loraWriteConfig();
-    // 書込後に読み返して実際に反映されたか確認する（配線不良等で書込が効いていないケースの検出）
-    uint8_t verify[LORA_CFG_REG_LEN] = {0};
-    bool verifyOk = loraReadConfig(verify) &&
-        verify[0] == LORA_CFG_ADDH && verify[1] == LORA_CFG_ADDL &&
-        verify[2] == LORA_CFG_REG0 && verify[3] == LORA_CFG_REG1 &&
-        verify[4] == LORA_CFG_REG2 && verify[5] == LORA_CFG_REG3;
-    Serial.println(verifyOk ? F("[LORA] config write 確認OK") : F("[LORA] config write 確認NG（配線・電源を確認）"));
-    if (!verifyOk) { loraModeNormal(); return false; }
+    // ★2026-07-23: 書込直後の確認読み込みがタイミング次第で失敗することがある
+    // （E220内部のレジスタ書込処理完了前に読み返してしまう等）と実機で確認したため、
+    // 最大2回まで「書込→確認」をリトライする。
+    bool verifyOk = false;
+    for (int attempt = 1; attempt <= 2 && !verifyOk; attempt++) {
+      loraWriteConfig();
+      // 書込後に読み返して実際に反映されたか確認する（配線不良等で書込が効いていないケースの検出）
+      uint8_t verify[LORA_CFG_REG_LEN] = {0};
+      bool verifyReadOk = loraReadConfig(verify);
+      verifyOk = verifyReadOk &&
+          verify[0] == LORA_CFG_ADDH && verify[1] == LORA_CFG_ADDL &&
+          verify[2] == LORA_CFG_REG0 && verify[3] == LORA_CFG_REG1 &&
+          verify[4] == LORA_CFG_REG2 && verify[5] == LORA_CFG_REG3;
+
+      Serial.print(F("[LORA] config write 確認("));
+      Serial.print(attempt); Serial.print(F("/2): "));
+      Serial.println(verifyOk ? F("OK") : F("NG"));
+      if (verifyReadOk) loraPrintRegs("書込後の実測値", verify);
+      else              Serial.println(F("[LORA] 書込後の読込自体に失敗（応答なし）"));
+    }
+    if (!verifyOk) {
+      Serial.println(F("[LORA] 2回とも書込確認NG（配線・電源を確認）"));
+      loraModeNormal();
+      return false;
+    }
   }
 
   return loraModeNormal();
