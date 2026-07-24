@@ -111,6 +111,13 @@ const char* GAS_SCRIPT_ID = "AKfycbywRcyl3059evcw-kFo9ypeejbhZWRyY9rILX9TUjlEWJ-
 // 0 = 無効（通常運用時は必ず 0 に戻すこと）
 #define TEST_FORCE_SEND_FAIL 0
 
+// ★2026-07-24追加: バッチ分割(MAX_DEVICES_PER_REQUEST)の動作確認用。
+// 実機のFlexを複数台同時稼働させなくても、起動時にダミーの子機データをN件
+// バッファへ注入し、次の送信サイクルで複数バッチに分割されるかを検証できる。
+// gasConnect()が1回だけ呼ばれ、gasSendRequest()だけがバッチ数分繰り返されることを
+// シリアルログで確認する。0 = 無効（通常運用時は必ず 0 に戻すこと）。
+#define TEST_INJECT_FAKE_DEVICE_COUNT 10  // ★テスト用に10に設定中。検証後は必ず0に戻すこと
+
 // SIM 切り替え — 使う方のブロックだけ有効にする
 // ── 1NCE SIM ──────────────────────────────────
 #define SIM_1NCE
@@ -164,7 +171,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 17;
+static uint8_t  const GATEWAY_FW_VERSION = 18;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -1222,14 +1229,20 @@ bool postBatch(const FlexRecord* merged, int start, int count, const String& ts,
     //   （LTE-M停止時もデータを残すため）
   }
 
-  // ★2026-07-24: 接続(gasConnect)はflushRecords()側で1回だけ行い、ここでは
-  // 既存の接続を使って送信(gasSendRequest)のみ行う（複数バッチでの接続使い回し）。
-  bool ok = gasSendRequest(params);
+  // ★2026-07-25: 「接続を1回張って複数回のSHREQを使い回す」最適化を撤回。
+  // 実機検証の結果、同一AT+SHCONN接続で2回目以降のAT+SHREQが恒常的に
+  // ステータスコード0（応答解析失敗）を返す事象を確認した。GAS側には実際に
+  // データが届いていた（スプレッドシートに記録されていた）ため、TCP/TLS接続
+  // 自体は生きているが、SIM7080G内部のAT応答処理が壊れていると見られる。
+  // SIMCom公式のHTTP(S)アプリケーションノートも「1接続につき1リクエスト」の
+  // 例しか示しておらず、複数リクエストの使い回しはサポート対象外の可能性が高い。
+  // バッチごとに毎回 接続→送信→切断 を行う元の設計に戻す（速度より正しさを優先）。
+  bool ok = postToGAS(params);
   if (!ok) {
-    // 一時的な通信不良を想定し、30秒待って1回だけ即時リトライ（同じ接続のまま）
+    // 一時的な通信不良を想定し、30秒待って1回だけ即時リトライ（再接続からやり直す）
     Serial.println(F("✗ 送信失敗。30秒後に再試行..."));
     delay(30000);
-    ok = gasSendRequest(params);
+    ok = postToGAS(params);
   }
   return ok;
 }
@@ -1301,17 +1314,13 @@ void flushRecords() {
   s_lastCsq = csq;  // コントローラー向けステータス用にキャッシュ
 
   // クエリ長がAT+SHREQの512バイト上限に達しないよう、MAX_DEVICES_PER_REQUEST台ずつに分割して送信する。
-  // ★2026-07-24: 接続(gasConnect)はここで1回だけ行い、複数バッチでも使い回す
-  // （バッチごとに接続し直すとSSLハンドシェイクが分割数だけ積み重なり遅くなるため）。
+  // ★2026-07-25: 「接続を使い回す」最適化は撤回済み（postBatch()内で毎回postToGAS()を
+  // 呼び、バッチごとに接続→送信→切断のフルシーケンスを行う。詳細はpostBatch()のコメント参照）。
   FlexRecord failedMerged[MAX_DEVICES];
   int failedN = 0;
   bool cycleHadSuccess = false;  // このサイクルで1バッチでも送信成功したか
 
-  if (!gasConnect()) {
-    Serial.println(F("✗ GAS接続失敗。今回分は再送キューへ保留"));
-    failedN = n;
-    memcpy(failedMerged, merged, sizeof(FlexRecord) * n);
-  } else {
+  {
     for (int start = 0; start < n; start += MAX_DEVICES_PER_REQUEST) {
       int count = n - start;
       if (count > MAX_DEVICES_PER_REQUEST) count = MAX_DEVICES_PER_REQUEST;
@@ -1326,7 +1335,6 @@ void flushRecords() {
         for (int k = 0; k < count && failedN < MAX_DEVICES; k++) failedMerged[failedN++] = merged[start + k];
       }
     }
-    gasDisconnect();
   }
 
   pendingCount = failedN;
@@ -1582,6 +1590,26 @@ void setup() {
   }
 
   recordMutex = xSemaphoreCreateMutex();
+
+#if TEST_INJECT_FAKE_DEVICE_COUNT > 0
+  // ★2026-07-24: バッチ分割の動作確認用ダミーデータ注入。実機を並べなくても
+  // MAX_DEVICES_PER_REQUEST(4台)超のバッチ分割・gasConnect()使い回しを検証できる。
+  {
+    int fakeN = TEST_INJECT_FAKE_DEVICE_COUNT;
+    if (fakeN > MAX_DEVICES) fakeN = MAX_DEVICES;
+    for (int i = 0; i < fakeN; i++) {
+      records[i].mac[0] = 0xFE; records[i].mac[1] = 0xFE; records[i].mac[2] = 0xFE;
+      records[i].mac[3] = 0xFE; records[i].mac[4] = 0xFE; records[i].mac[5] = (uint8_t)(0x80 + i);  // 疑似MAC（実デバイスと衝突しない0xFE系）
+      uint8_t fakePayload[19] = {0x04, (uint8_t)(0x80 + i), 1, 0,0, 0,0, 0,0, 0,0, 0,0, 0,0, 0,0,0,0};
+      memcpy(records[i].payload, fakePayload, sizeof(fakePayload));
+      records[i].payloadLen = sizeof(fakePayload);
+      records[i].rssi = -50 - i;
+      records[i].lastSeen = millis();
+    }
+    recordCount = fakeN;
+    Serial.print(F("[TEST] ダミー子機データを ")); Serial.print(fakeN); Serial.println(F(" 件注入しました"));
+  }
+#endif
 
 #ifdef COMM_MODE_BLE
   // BLE 初期化
