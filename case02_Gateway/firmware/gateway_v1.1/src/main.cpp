@@ -655,26 +655,14 @@ bool initNetwork() {
 
 // 全 Flex レコードを1回の GET でまとめて GAS へ送信
 // クエリ形式: ts=...&sim=...&n=3&mac0=...&payload0=...&rssi0=...&mac1=...
-bool postToGAS(String queryParams) {
-#if TEST_FORCE_SEND_FAIL > 0
-  static int s_forceFailRemaining = TEST_FORCE_SEND_FAIL;
-  if (s_forceFailRemaining > 0) {
-    s_forceFailRemaining--;
-    Serial.print(F("[TEST] 強制送信失敗（実通信スキップ）残り "));
-    Serial.print(s_forceFailRemaining);
-    Serial.println(F(" 回"));
-    return false;
-  }
-#endif
-
-  Serial.println(F("\n--- GAS 送信 ---"));
-  String scriptPath = "/macros/s/";
-  scriptPath += GAS_SCRIPT_ID;
-  scriptPath += "?";
-  scriptPath += queryParams;
-
-  // ★2026-07-23: SHCONN/SHREQは応答まで最大15秒/60秒かかり、その間DEBUG_LEVEL=0では
-  // 何も出力されず進捗が分からなかったため、主要ステップごとに1行出すようにした。
+// SSL設定＋AT+SHCONN接続のみ行う（送信・切断は含まない）。
+// ★2026-07-24: 台数増加に備えMAX_DEVICES_PER_REQUESTを8→4に引き下げた結果、1サイクルで
+// 複数バッチに分割されるケースが増える。以前は「接続→送信→切断」をバッチごとに毎回
+// 繰り返しており、SSLハンドシェイク（数十秒）が分割数だけ積み重なって遅くなっていた。
+// 接続はサイクル全体で1回だけ張り、複数回のSHREQをその接続の中で使い回すことで、
+// 分割してもトータルの送信時間がほぼ伸びないようにする。
+bool gasConnect() {
+  Serial.println(F("\n--- GAS 接続 ---"));
   Serial.println(F("[GAS] SSL設定中..."));
   sendAT("AT+SHDISC", 2000); delay(300);
   sendAT("AT+CSSLCFG=\"ignorertctime\",1,1"); delay(200);
@@ -688,6 +676,30 @@ bool postToGAS(String queryParams) {
   Serial.println(F("[GAS] 接続中(AT+SHCONN、最大15秒)..."));
   String conn = sendAT("AT+SHCONN", 15000);
   if (conn.indexOf("OK") < 0) { Serial.println(F("✗ 接続失敗")); return false; }
+  return true;
+}
+
+void gasDisconnect() {
+  sendAT("AT+SHDISC");
+}
+
+// gasConnect() 済みの接続を使って1回分のクエリを送信する（接続・切断は行わない）
+bool gasSendRequest(String queryParams) {
+#if TEST_FORCE_SEND_FAIL > 0
+  static int s_forceFailRemaining = TEST_FORCE_SEND_FAIL;
+  if (s_forceFailRemaining > 0) {
+    s_forceFailRemaining--;
+    Serial.print(F("[TEST] 強制送信失敗（実通信スキップ）残り "));
+    Serial.print(s_forceFailRemaining);
+    Serial.println(F(" 回"));
+    return false;
+  }
+#endif
+
+  String scriptPath = "/macros/s/";
+  scriptPath += GAS_SCRIPT_ID;
+  scriptPath += "?";
+  scriptPath += queryParams;
 
   Serial.println(F("[GAS] データ送信中(AT+SHREQ、最大60秒)..."));
   String result = sendAT("AT+SHREQ=\"" + scriptPath + "\",1", 60000);
@@ -705,10 +717,19 @@ bool postToGAS(String queryParams) {
   if (statusCode == 200 || statusCode == 302) {
     Serial.println(F("✓ GAS 送信成功！"));
     lastGasSuccessMs = millis();  // アプリ層ウォッチドッグ: 送信成功を記録
-    sendAT("AT+SHDISC"); return true;
+    return true;
   }
   Serial.println(F("✗ 予期しないレスポンス"));
-  sendAT("AT+SHDISC"); return false;
+  return false;
+}
+
+// 単発送信用（起動確認等、1サイクル内で1回しか送らない箇所に使う）。
+// 接続→送信→切断を一括で行う（従来のpostToGAS()と同じ挙動）。
+bool postToGAS(String queryParams) {
+  if (!gasConnect()) return false;
+  bool ok = gasSendRequest(queryParams);
+  gasDisconnect();
+  return ok;
 }
 
 // ══════════════════════════════════════════════
@@ -1165,7 +1186,11 @@ void postBootInfoRow() {
 // 1回のGETに含める最大台数。台数が多いとクエリ文字列がSIM7080GのAT+SHREQ長制限
 // （HEADERLEN/BODYLENおよびAT実装上の実用上限）に達し送信が黙って失敗しうるため、
 // この件数ごとに複数回のGETへ分割する。
-static int const MAX_DEVICES_PER_REQUEST = 8;
+// ★2026-07-24: SIMCom公式AT Command Manualで AT+SHREQ の <url> パラメータが
+// 「max is 512 bytes」と明記されていることを確認。子機1台あたり約71バイト
+// （MAC17+payload38hex+RSSI4+区切り文字）、固定オーバーヘッド約130バイトから逆算すると
+// 安全に収まるのは5台までのため、マージンを見て4台に設定する（旧8台は512バイト超過の恐れがあった）。
+static int const MAX_DEVICES_PER_REQUEST = 4;
 
 // merged[0..n-1] のうち [start, start+count) だけを1回のGETで送信する
 bool postBatch(const FlexRecord* merged, int start, int count, const String& ts, int csq) {
@@ -1197,12 +1222,14 @@ bool postBatch(const FlexRecord* merged, int start, int count, const String& ts,
     //   （LTE-M停止時もデータを残すため）
   }
 
-  bool ok = postToGAS(params);
+  // ★2026-07-24: 接続(gasConnect)はflushRecords()側で1回だけ行い、ここでは
+  // 既存の接続を使って送信(gasSendRequest)のみ行う（複数バッチでの接続使い回し）。
+  bool ok = gasSendRequest(params);
   if (!ok) {
-    // 一時的な通信不良を想定し、30秒待って1回だけ即時リトライ
+    // 一時的な通信不良を想定し、30秒待って1回だけ即時リトライ（同じ接続のまま）
     Serial.println(F("✗ 送信失敗。30秒後に再試行..."));
     delay(30000);
-    ok = postToGAS(params);
+    ok = gasSendRequest(params);
   }
   return ok;
 }
@@ -1273,23 +1300,33 @@ void flushRecords() {
   int csq = getSimCsq();
   s_lastCsq = csq;  // コントローラー向けステータス用にキャッシュ
 
-  // クエリ長がAT+SHREQの実用上限に達しないよう、MAX_DEVICES_PER_REQUEST台ずつに分割して送信する
+  // クエリ長がAT+SHREQの512バイト上限に達しないよう、MAX_DEVICES_PER_REQUEST台ずつに分割して送信する。
+  // ★2026-07-24: 接続(gasConnect)はここで1回だけ行い、複数バッチでも使い回す
+  // （バッチごとに接続し直すとSSLハンドシェイクが分割数だけ積み重なり遅くなるため）。
   FlexRecord failedMerged[MAX_DEVICES];
   int failedN = 0;
   bool cycleHadSuccess = false;  // このサイクルで1バッチでも送信成功したか
-  for (int start = 0; start < n; start += MAX_DEVICES_PER_REQUEST) {
-    int count = n - start;
-    if (count > MAX_DEVICES_PER_REQUEST) count = MAX_DEVICES_PER_REQUEST;
 
-    bool ok = postBatch(merged, start, count, ts, csq);
-    if (ok) {
-      cycleHadSuccess = true;
-      Serial.print(F("✓ 送信成功（")); Serial.print(count); Serial.println(F(" 件、再送キュー クリア）"));
-    } else {
-      Serial.print(F("✗ 再試行も失敗。")); Serial.print(count);
-      Serial.println(F(" 件を次回送信サイクルで再送キューとしてリトライします"));
-      for (int k = 0; k < count && failedN < MAX_DEVICES; k++) failedMerged[failedN++] = merged[start + k];
+  if (!gasConnect()) {
+    Serial.println(F("✗ GAS接続失敗。今回分は再送キューへ保留"));
+    failedN = n;
+    memcpy(failedMerged, merged, sizeof(FlexRecord) * n);
+  } else {
+    for (int start = 0; start < n; start += MAX_DEVICES_PER_REQUEST) {
+      int count = n - start;
+      if (count > MAX_DEVICES_PER_REQUEST) count = MAX_DEVICES_PER_REQUEST;
+
+      bool ok = postBatch(merged, start, count, ts, csq);
+      if (ok) {
+        cycleHadSuccess = true;
+        Serial.print(F("✓ 送信成功（")); Serial.print(count); Serial.println(F(" 件、再送キュー クリア）"));
+      } else {
+        Serial.print(F("✗ 再試行も失敗。")); Serial.print(count);
+        Serial.println(F(" 件を次回送信サイクルで再送キューとしてリトライします"));
+        for (int k = 0; k < count && failedN < MAX_DEVICES; k++) failedMerged[failedN++] = merged[start + k];
+      }
     }
+    gasDisconnect();
   }
 
   pendingCount = failedN;
