@@ -74,11 +74,48 @@
 #include <SPI.h>
 
 // ══════════════════════════════════════════════
+// シリアルログの二重化（USB Serial + SDカード）
+// ══════════════════════════════════════════════
+// ★2026-07-25追加: シリアルモニタに出ている内容を、データCSV（gateway.csv）とは別の
+// gwlog.csv にそのままミラー保存する。Print基底クラスのwrite()だけ実装すれば
+// print()/println()の全オーバーロードが自動的に経由するため、既存の200箇所以上ある
+// Serial.print/println呼び出しを1つも書き換えずに済む（下の #define Serial で差し替え）。
+// 1バイト単位でそのまま複製するので、複数回のprint()で1行を組み立てている箇所
+// （進捗表示の"."追記等）も実際の表示と完全に一致した形でSDに残る。
+static File gLogFile;
+static bool gLogAvailable = false;
+
+class TeeSerial : public Print {
+ public:
+  void   begin(unsigned long baud) { Serial.begin(baud); }
+  operator bool() { return (bool)Serial; }
+  int    available() { return Serial.available(); }
+  int    read() { return Serial.read(); }
+  String readStringUntil(char terminator) { return Serial.readStringUntil(terminator); }
+  void   flush() { Serial.flush(); if (gLogAvailable) gLogFile.flush(); }
+
+  size_t write(uint8_t c) override {
+    if (gLogAvailable) { gLogFile.write(c); if (c == '\n') gLogFile.flush(); }
+    return Serial.write(c);
+  }
+  size_t write(const uint8_t *buf, size_t sz) override {
+    if (gLogAvailable) {
+      gLogFile.write(buf, sz);
+      if (sz > 0 && buf[sz - 1] == '\n') gLogFile.flush();
+    }
+    return Serial.write(buf, sz);
+  }
+};
+
+static TeeSerial gSerialTee;
+#define Serial gSerialTee
+
+// ══════════════════════════════════════════════
 // ▼ ユーザー設定
 // ══════════════════════════════════════════════
 
 // GAS スクリプトID（デプロイURLの "AKfycb..." 部分）
-const char* GAS_SCRIPT_ID = "AKfycbywRcyl3059evcw-kFo9ypeejbhZWRyY9rILX9TUjlEWJ-4K2nGkZqIrZymA9cYGZ8maQ/exec";
+const char* GAS_SCRIPT_ID = "AKfycbxt3oOSeaB88Ow2duUpeN3VIG4WqGtakJkUwAFrrH1V9PQf3C7gqj1FE09Fm4Uk45k3/exec";
 
 // LTE-M送信のON/OFF切替（★2026-07-23追加）
 // false にすると SIM7080G の初期化・ネットワーク接続・GAS送信を一切行わず、
@@ -103,7 +140,7 @@ const char* GAS_SCRIPT_ID = "AKfycbywRcyl3059evcw-kFo9ypeejbhZWRyY9rILX9TUjlEWJ-
 // シリアルログの [BATCH] 行（採用台数とクエリ長）で「512バイト以内に収まっているか」
 // 「超えそうな時に正しく次バッチへ回っているか」を確認する。
 // 0 = 無効（通常運用時は必ず 0 に戻すこと）。
-#define TEST_INJECT_FAKE_DEVICE_COUNT 10  // ★テスト用に10に設定中。検証後は必ず0に戻すこと
+#define TEST_INJECT_FAKE_DEVICE_COUNT 0  // 0=無効（通常運用）。バッチ分割検証時のみ一時的に台数を入れる
 
 // SIM 切り替え — 使う方のブロックだけ有効にする
 // ── 1NCE SIM ──────────────────────────────────
@@ -158,7 +195,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 21;
+static uint8_t  const GATEWAY_FW_VERSION = 25;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -1184,20 +1221,26 @@ static uint16_t const SHREQ_MAX_URL_BYTES = 512;
 
 // merged[start..n) から、scriptPath全体（/macros/s/+ID+?+params）が512バイトを超えない
 // 範囲で可能な限り多くの台数を1バッチに詰め込む。採用した台数を返し、outParamsに
-// 完成したクエリ文字列（ts=...&sim=...&csq=...&n=...&m0=...）を格納する。
+// 完成したクエリ文字列（q=...&n=...&d=...）を格納する。
 // 最低1台は必ず入れる（1台分だけで512バイトを超える異常系は上位のAT+SHREQ側で失敗として扱う）。
+//
+// ★2026-07-25: 固定オーバーヘッド削減。
+//   ts: DS3231のタイムスタンプはSDカード記録専用とし、GAS送信からは廃止
+//      （受信日時はGAS側のnew Date()で代用可能なため）。
+//   sim: キャリア名は基本固定運用のため送信自体を廃止（必要ならGAS/スプレッドシート側で管理）。
+//   csq: "csq=23"(7B)→"q="+1バイトhex(5B)に短縮。値の意味は
+//        [gateway_csq_signal_strength_notes]（開発メモ）参照。
 int buildBatchQuery(const FlexRecord* merged, int start, int n,
-                     const String& ts, int csq, String& outParams) {
+                     int csq, String& outParams) {
   String baseUrl = "/macros/s/";
   baseUrl += GAS_SCRIPT_ID;
   baseUrl += "?";
 
-  String header = "ts=";
-  header += ts;
-  header += "&sim=";
-  header += SIM_NAME;
-  header += "&csq=";
-  header += String(csq);
+  char qHex[3];
+  snprintf(qHex, sizeof(qHex), "%02X", (uint8_t)csq);
+
+  String header = "q=";
+  header += qHex;
 
   // ★2026-07-25: 圧縮エンコードに変更。MAC全体やRSSI付きの冗長な per-device
   // パラメータ（&m{i}=&p{i}=&r{i}=）をやめ、DeviceID(1B)+CH1〜4(各2B)＝9バイト/台
@@ -1333,7 +1376,7 @@ void flushRecords() {
     int start = 0;
     while (start < n) {
       String params;
-      int count = buildBatchQuery(merged, start, n, ts, csq, params);
+      int count = buildBatchQuery(merged, start, n, csq, params);
 
       bool ok = postBatch(params);
       if (ok) {
@@ -1590,6 +1633,17 @@ void setup() {
   // SD カード初期化（CS直結）
   if (SD.begin(SD_CS_PIN)) {
     sdAvailable = true;
+
+    // シリアルログのミラー先を開く（データCSVとは別ファイル）。以降のSerial.print/println
+    // は全てここにも複製される。追記モードなので前回起動分のログの後ろに継ぎ足される。
+    // ★ファイル名は8.3形式（拡張子除き8文字以内）に収めること。Arduino SDライブラリは
+    // 長いファイル名(LFN)に対応していないため、超えるとSD.open()が黙って失敗する。
+    gLogFile = SD.open("gwlog.csv", FILE_WRITE);
+    gLogAvailable = (bool)gLogFile;
+    if (!gLogAvailable) {
+      Serial.println(F("✗ gwlog.csv を開けませんでした（シリアルログのSD保存は無効）"));
+    }
+
     Serial.println(F("✓ SD カード初期化完了"));
     // ヘッダ行がなければ書く
     if (!SD.exists("gateway.csv")) {
