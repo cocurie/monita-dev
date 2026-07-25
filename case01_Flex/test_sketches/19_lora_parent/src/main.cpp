@@ -44,6 +44,7 @@
 #include <Arduino.h>
 #include <Adafruit_TinyUSB.h>  // USB CDC（Serial）。USE_TINYUSBビルド時に必要
 
+// ブレッドボード配線（18_lora_childと同じ）。M0/M1はGNDへ直結（Mode0固定）してから書き込むこと。
 #define LORA_TX_PIN 8
 #define LORA_RX_PIN 9
 #define LORA_BAUD   9600

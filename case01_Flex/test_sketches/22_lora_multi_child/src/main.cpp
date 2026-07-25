@@ -47,11 +47,11 @@
 // ▼ 設定（台ごとに変更するのは基本的に DEVICE_ID のみ）
 // ============================================================
 // ★★★ 書き込み前に必ず変更: 13台テストなら 0x01〜0x0D のように重複しない値にする ★★★
-static const uint8_t DEVICE_ID = 0x01;
-static const uint8_t FW_VERSION = 1;
+static const uint8_t DEVICE_ID = 0x0B;
+static const uint8_t FW_VERSION = 2;
 
 #define DEBUG_MODE          1     // 1: USB Serialデバッグログ有効
-#define TEST_SLEEP_MINUTES  5     // 送信間隔（分）。初期値5分。衝突をたくさん見たい場合は短くする
+#define TEST_SLEEP_MINUTES  4     // 送信間隔（分）。初期値5分。衝突をたくさん見たい場合は短くする
 #define BOOT_BLUE_MS         500
 
 // ============================================================
@@ -62,6 +62,12 @@ static const uint8_t FW_VERSION = 1;
 #define LORA_M0_PIN 1
 #define LORA_M1_PIN 2
 #define LORA_UART_BAUD 9600
+
+// AUXピン（任意配線・デバッグ用）。E220のAUXはモジュール内部処理中（送信中含む）LOWになり、
+// 準備完了でHIGHに戻る。配線した場合のみ -1 以外にすると、送信の瞬間に本当にモジュールが
+// 動作しているか（=UARTに書いただけでなく実際にBUSYになったか）をログで確認できる。
+// 未配線のまま有効にすると浮動ピンの不定値を拾うだけなので、必ず配線してから有効にすること。
+#define LORA_AUX_PIN 3  // 例: 配線したら 3 などの空きピン番号に変更する
 
 // ============================================================
 // ステータスLED（XIAO nRF52840 Sense 内蔵の離散RGB。アクティブLOW）
@@ -228,8 +234,8 @@ static void loraWriteConfig() {
   while (millis() - t0 < 300UL) { while (Serial1.available()) Serial1.read(); }
 }
 
-// 起動毎に呼ぶ。現在の設定値を確認し、想定値と異なれば書き込む（選択肢A方式）。
-static bool loraCheckAndConfigure() {
+// 1回分の確認・書込処理（下のloraCheckAndConfigure()からリトライ付きで呼ばれる）
+static bool loraCheckAndConfigureOnce() {
   loraModeConfig();
 
   uint8_t cur[LORA_CFG_REG_LEN] = {0};
@@ -263,16 +269,88 @@ static bool loraCheckAndConfigure() {
   return true;
 }
 
+// ブレッドボードは接触が不安定になりやすく、READ/WRITEのどこか1箇所が
+// たまたま失敗しただけで毎回送信をスキップしてしまうのはもったいないため、
+// 数回リトライする（2026-07-20追加。config read/write確認の間欠的な失敗を吸収する）。
+#define LORA_CONFIG_RETRY 5
+#define LORA_CONFIG_RETRY_DELAY_MS 500U
+
+static bool loraCheckAndConfigure() {
+  for (uint8_t attempt = 0; attempt < LORA_CONFIG_RETRY; attempt++) {
+    if (loraCheckAndConfigureOnce()) return true;
+#if DEBUG_MODE
+    Serial.print("[LORA] config check 失敗、リトライ ");
+    Serial.print(attempt + 1);
+    Serial.print("/");
+    Serial.println(LORA_CONFIG_RETRY);
+#endif
+    delay(LORA_CONFIG_RETRY_DELAY_MS);
+  }
+  return false;
+}
+
+#if LORA_AUX_PIN >= 0
+// AUXレベルをログに出す（配線している場合のみ意味を持つ）。
+// LOW=モジュール内部処理中（送信中含む）、HIGH=待機中/準備完了。
+static void loraLogAux(const char *label) {
+  Serial.print("[LORA] AUX(");
+  Serial.print(label);
+  Serial.print(")=");
+  Serial.println(digitalRead(LORA_AUX_PIN) == HIGH ? "HIGH" : "LOW");
+}
+#endif
+
+// デバッグ用: 送信する生バイト列をそのままHEXダンプする
+// （「Serial1.write()に何を渡したか」を目視で追えるようにする。実際に電波に乗ったかまでは
+//   分からないが、ソフト側のフレーム組み立てミスの切り分けには使える）。
+static void loraPrintFrameHex(const uint8_t *msd, uint8_t msdLen, uint8_t sum) {
+  Serial.print("[LORA] TXフレーム(HEX): AA ");
+  if (msdLen < 0x10) Serial.print('0');
+  Serial.print(msdLen, HEX);
+  Serial.print(' ');
+  for (uint8_t i = 0; i < msdLen; i++) {
+    if (msd[i] < 0x10) Serial.print('0');
+    Serial.print(msd[i], HEX);
+    Serial.print(' ');
+  }
+  if (sum < 0x10) Serial.print('0');
+  Serial.println(sum, HEX);
+}
+
 // 透過モードでフレームを送信する（[SYNC][LEN][payload...][checksum]）。v3.10_loraと同一形式
 static void loraSendFrame(const uint8_t *msd, uint8_t msdLen) {
   uint8_t sum = (uint8_t)(0xAAU + msdLen);
+  for (uint8_t i = 0; i < msdLen; i++) sum = (uint8_t)(sum + msd[i]);
+
+#if DEBUG_MODE
+  loraPrintFrameHex(msd, msdLen, sum);
+#endif
+#if LORA_AUX_PIN >= 0
+  loraLogAux("write前");
+#endif
+
   Serial1.write((uint8_t)0xAA);
   Serial1.write(msdLen);
-  for (uint8_t i = 0; i < msdLen; i++) {
-    Serial1.write(msd[i]);
-    sum = (uint8_t)(sum + msd[i]);
-  }
+  for (uint8_t i = 0; i < msdLen; i++) Serial1.write(msd[i]);
   Serial1.write(sum);
+  Serial1.flush();  // UARTバッファ送出完了を待つ（write()はバッファに積むだけなので明示的にflush）
+
+#if LORA_AUX_PIN >= 0
+  loraLogAux("write直後");
+  // AUXがLOWに落ちて戻るまでを最大500msポーリングし、実際にモジュールがBUSYになったか確認する
+  unsigned long auxT0 = millis();
+  bool sawBusy = false;
+  while (millis() - auxT0 < 500UL) {
+    if (digitalRead(LORA_AUX_PIN) == LOW) { sawBusy = true; break; }
+  }
+  Serial.println(sawBusy ? "[LORA] AUX BUSY検出（モジュールが処理を開始した）"
+                          : "[LORA] AUX BUSY未検出（モジュールが反応していない疑い）");
+  if (sawBusy) {
+    unsigned long readyT0 = millis();
+    while (millis() - readyT0 < 1000UL && digitalRead(LORA_AUX_PIN) == LOW) { /* wait */ }
+    loraLogAux("処理完了後");
+  }
+#endif
 }
 
 // v3.10_loraと同じ理由（AUX未接続で送信完了を検知できないため）。冗長送信も同様に行う
@@ -330,6 +408,18 @@ static void sendLoRaDummy() {
   }
 
 #if DEBUG_MODE
+  // ★送信直後にもう一度Configモードへ入って読み出せるか確認する。
+  // TX時の電流バーストでブラウンアウト・内部リセット・ハングが起きていれば、
+  // ここでread失敗 or 期待値と不一致になって現れるはず（電源不足の直接証拠になる）。
+  {
+    Serial.println("[LORA] 送信直後の生存確認（再度Config読み出し）...");
+    bool postOk = loraCheckAndConfigureOnce();
+    Serial.println(postOk ? "[LORA] 送信後も生存確認OK（設定一致 or 再書込成功）"
+                           : "[LORA] ★送信後の生存確認NG（TX時に電源断/ハングした疑い）");
+  }
+#endif
+
+#if DEBUG_MODE
   Serial.print("[LORA] TX DeviceID=0x"); Serial.print(DEVICE_ID, HEX);
   Serial.print(" counter="); Serial.print(s_dummyCounter);
   Serial.print(" CH="); for (int i = 0; i < 4; i++) { Serial.print(ch[i]); Serial.print(" "); }
@@ -358,6 +448,9 @@ void setup() {
   pinMode(LORA_M1_PIN, OUTPUT);
   digitalWrite(LORA_M0_PIN, LOW);
   digitalWrite(LORA_M1_PIN, LOW);
+#if LORA_AUX_PIN >= 0
+  pinMode(LORA_AUX_PIN, INPUT);
+#endif
 
 #if DEBUG_MODE
   Serial.begin(115200);

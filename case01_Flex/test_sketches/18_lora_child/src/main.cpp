@@ -44,12 +44,34 @@
 #define SEND_INTERVAL_MS 2000UL
 #define MSG_LEN 13  // "MONITA " (7バイト) + 6桁カウンタ = 13バイト固定長
 
+// ★診断用に追加: 送信の瞬間を目視確認するためのLED点灯（このスケッチ自体はLED制御が
+// 一切無かったため、ハードウェア側の充電LED等と紛らわしくなっていた。ソフトで確実に
+// 制御するLEDを別途用意し、送信タイミングと連動させる）。
+// XIAO nRF52840 Senseのオンボード離散RGB LED（アクティブLOW）を使う。
+static void ledInit() {
+#ifdef LED_RED
+  pinMode(LED_RED, OUTPUT);
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_BLUE, OUTPUT);
+  digitalWrite(LED_RED, HIGH);
+  digitalWrite(LED_GREEN, HIGH);
+  digitalWrite(LED_BLUE, HIGH);
+#endif
+}
+static void ledGreen(bool on) {
+#ifdef LED_GREEN
+  digitalWrite(LED_GREEN, on ? LOW : HIGH);
+#endif
+}
+
 static uint32_t s_counter = 0;
 static uint32_t s_lastSendMs = 0;
 
 void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000) yield();
+
+  ledInit();
 
   Serial.println(F("\n[Step18] LoRa子機（送信側）起動"));
   Serial.println(F("※ E220のM0/M1はGNDに直結してください（Mode0固定）"));
@@ -71,7 +93,11 @@ void loop() {
 
     char msg[MSG_LEN + 1];
     snprintf(msg, sizeof(msg), "MONITA %06lu", (unsigned long)s_counter);
+
+    ledGreen(true);
     Serial1.write((const uint8_t*)msg, MSG_LEN);
+    Serial1.flush();  // UART送出完了を待ってからLEDを消す（送信中を可視化するため）
+    ledGreen(false);
 
     Serial.print(F("[TX] "));
     Serial.println(msg);
