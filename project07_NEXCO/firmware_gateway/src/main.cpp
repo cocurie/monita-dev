@@ -119,6 +119,19 @@ class TeeSerial : public Print {
 static TeeSerial gSerialTee;
 #define Serial gSerialTee
 
+// ★2026-07-25追加: gwlog.csvは起動時に一度開いたまま close() されない設計だった。
+// flush()はデータブロックを書き込むが、多くのSD実装ではファイルサイズ(ディレクトリ
+// エントリ)の確定はclose()／明示的なsync()のタイミングに依存する。WDTリセットや
+// アプリ層WDT(NVIC_SystemReset)、現場での電源断はclose()を経由しないため、
+// 「ファイルは存在するが中身が空に見える」事象の原因になっていた（実機で確認）。
+// 対策として定期的にclose→reopen(追記)し、直近分だけを再オープンのリスクにとどめる。
+void gLogPeriodicCommit() {
+  if (!gLogAvailable) return;
+  gLogFile.close();
+  gLogFile = SD.open("gwlog.csv", FILE_WRITE);
+  gLogAvailable = (bool)gLogFile;
+}
+
 // ══════════════════════════════════════════════
 // ▼ ユーザー設定
 // ══════════════════════════════════════════════
@@ -204,7 +217,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 26;
+static uint8_t  const GATEWAY_FW_VERSION = 35;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -242,6 +255,7 @@ struct FlexRecord {
   uint8_t  payloadLen;
   int      rssi;
   uint32_t lastSeen; // millis()
+  uint32_t rtcEpoch; // Gateway RTC(DS3231)のUNIX時刻。BLE/LoRa受信時刻の記録用（GASの受信日時=サーバ側new Date()とは別物）
 };
 
 static FlexRecord records[MAX_DEVICES];
@@ -265,14 +279,58 @@ static RTC_DS3231 rtc;
 static bool rtcAvailable = false;
 static bool s_rtcNeedsTimeSet = false;  // lostPower() 検知時にtrue。ネットワーク接続後にAT+CCLKで時刻セットする
 
+// DS3231はAT+CCLKの網時刻でJST（日本時間）に設定される（UTCではない）。
+// RTClibのunixtime()はUTCとして無条件変換するため、真のUTCエポックが必要な箇所
+// （GAS送信用のrtcEpoch）ではこのオフセットを差し引いて補正する。
+static int32_t const JST_OFFSET_SEC = 9 * 3600;
+
+// ★2026-07-27追加: I2Cノイズ/接触不良でDS3231から明らかにおかしい値（年が範囲外）を
+// 読んでしまうことがある。readRtcEpochSafe()は既にこの対策を持っていたが、getTimestamp()
+// 自体（SDログ・シリアル表示・GAS送信パラメータ等、より広い範囲で使われる）には
+// 対策が無かったため、同じくキャッシュ＆フォールバックする。
+static DateTime s_lastGoodRtc(2026, 1, 1, 0, 0, 0);
+static bool     s_lastGoodRtcSet = false;
+
 String getTimestamp() {
   if (!rtcAvailable) return String(millis() / 1000UL) + "s";
   DateTime now = rtc.now();
+  if (now.year() < 2026 || now.year() > 2035) {
+    if (s_lastGoodRtcSet) now = s_lastGoodRtc;
+  } else {
+    s_lastGoodRtc = now;
+    s_lastGoodRtcSet = true;
+  }
   char buf[20];
   snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d",
            now.year(), now.month(), now.day(),
            now.hour(), now.minute(), now.second());
   return String(buf);
+}
+
+// ★2026-07-27追加: I2Cバスリカバリ（Wire.begin()/rtc.begin()より前に必ず呼ぶ）。
+// 車載輸送中の振動でRTC(DS3231)への配線が瞬間的に接触不良になり、I2C通信がSDAを
+// LOWに張り付かせたまま止まる「バスロック」でMCU全体がフリーズする障害が発生した
+// （NEXCO案件のGateway、輸送中に約3.5時間データ途絶。復帰は電源の入れ直しのみで、
+// ソフトWDTでは復旧しなかった＝真のMCUフリーズだったことを示す）。
+// nRF52のWireライブラリの内部実装はこの状態に対するタイムアウトを持たないため、
+// 一度ハングすると内蔵WDTの強制リセット待ちになる。さらに配線の接触不良が再起動後も
+// 続いていると、起動のたびに同じ場所でハングする無限リセットループに陥る。
+// 標準的なI2Cバスリカバリ手順（SCLを最大9回クロックしてスタックしたスレーブの送信を
+// 完了させ、STOPコンディションを生成する）を起動時に必ず一度実行することで、
+// バスが詰まった状態のままrtc.begin()に入ってしまうのを防ぐ。
+static void i2cBusRecovery() {
+  pinMode(SCL, OUTPUT);
+  pinMode(SDA, INPUT_PULLUP);
+  digitalWrite(SCL, HIGH);
+  delayMicroseconds(10);
+  for (int i = 0; i < 9 && digitalRead(SDA) == LOW; i++) {
+    digitalWrite(SCL, LOW);  delayMicroseconds(5);
+    digitalWrite(SCL, HIGH); delayMicroseconds(5);
+  }
+  pinMode(SDA, OUTPUT);
+  digitalWrite(SDA, LOW);  delayMicroseconds(5);
+  digitalWrite(SCL, HIGH); delayMicroseconds(5);
+  digitalWrite(SDA, HIGH); delayMicroseconds(5);
 }
 
 // SIM7080G の AT+CCLK?（網時刻）を取得し、有効な応答であれば DS3231 に反映する。
@@ -697,6 +755,8 @@ bool initNetwork() {
 // 繰り返しており、SSLハンドシェイク（数十秒）が分割数だけ積み重なって遅くなっていた。
 // 接続はサイクル全体で1回だけ張り、複数回のSHREQをその接続の中で使い回すことで、
 // 分割してもトータルの送信時間がほぼ伸びないようにする。
+int getSimCsq();  // 後方で定義（SHCONN失敗時の電波強度診断ログから使うため前方宣言）
+
 bool gasConnect() {
   Serial.println(F("\n--- GAS 接続 ---"));
   Serial.println(F("[GAS] SSL設定中..."));
@@ -711,7 +771,17 @@ bool gasConnect() {
 
   Serial.println(F("[GAS] 接続中(AT+SHCONN、最大15秒)..."));
   String conn = sendAT("AT+SHCONN", 15000);
-  if (conn.indexOf("OK") < 0) { Serial.println(F("✗ 接続失敗")); return false; }
+  if (conn.indexOf("OK") < 0) {
+    // ★2026-07-25: 断続的なSHCONN失敗の原因（電波起因か否か）を切り分けられるよう、
+    // 失敗時にCSQ（電波強度）も合わせてログに残す。
+    int csqVal = getSimCsq();
+    Serial.print(F("✗ 接続失敗（CSQ="));
+    Serial.print(csqVal);
+    if (csqVal == 99) Serial.print(F(" 圏外/アンテナ未接続の可能性"));
+    else if (csqVal < 10) Serial.print(F(" 電波弱い"));
+    Serial.println(F("）"));
+    return false;
+  }
   return true;
 }
 
@@ -774,11 +844,31 @@ bool postToGAS(String queryParams) {
 // SD カード操作
 // ══════════════════════════════════════════════
 static bool sdAvailable = false;
+static uint32_t s_sdLogFailCount = 0;  // ★2026-07-25追加: 書き込み失敗の可視化用（従来は失敗が完全に無音だった）
 
-void sdLog(String line) {
-  if (!sdAvailable) return;
+// gateway.csv への1行書き込み。戻り値は成否（呼び出し側でログ件数の実績と突き合わせられるように）。
+bool sdLog(String line) {
+  if (!sdAvailable) return false;
   File f = SD.open("gateway.csv", FILE_WRITE);
-  if (f) { f.println(line); f.close(); }
+  if (!f) {
+    s_sdLogFailCount++;
+    Serial.print(F("✗ [SD] gateway.csv を開けませんでした（累計失敗 "));
+    Serial.print(s_sdLogFailCount);
+    Serial.println(F(" 回）"));
+    return false;
+  }
+  // print/printlnの戻り値（書き込みバイト数）が0なら、オープンはできても実書き込みが
+  // 失敗している（カードの接触不良・書き込み保護・容量不足等）。これも従来は無音だった。
+  size_t written = f.println(line);
+  f.close();
+  if (written == 0) {
+    s_sdLogFailCount++;
+    Serial.print(F("✗ [SD] gateway.csv 書き込み失敗（累計失敗 "));
+    Serial.print(s_sdLogFailCount);
+    Serial.println(F(" 回）"));
+    return false;
+  }
+  return true;
 }
 
 // ══════════════════════════════════════════════
@@ -787,6 +877,22 @@ void sdLog(String line) {
 // mac は識別キー。BLEは実MACアドレス、LoRaはMACを持たないため
 // {0,0,0,0,0,DeviceID} の疑似MACで代用する（Device IDで一意性を担保）。
 // ══════════════════════════════════════════════
+// ★2026-07-26追加: I2C通信のノイズ（LTE-M送信中の電気的ノイズ等が疑われる）でDS3231から
+// 破損した値を読んでしまい、GAS側に「2026/5/15」等の全く見当違いな実測時刻が記録される
+// 事象を確認した（有野川連続動作テスト）。年が明らかにおかしい場合は読み取り失敗とみなし、
+// 直前の正常な値（fallbackEpoch）を代わりに使うことで、破損した1回分の読み取りが
+// スプレッドシートに残らないようにする。
+static uint32_t readRtcEpochSafe(uint32_t fallbackEpoch) {
+  if (!rtcAvailable) return 0;
+  DateTime now = rtc.now();
+  if (now.year() < 2026 || now.year() > 2035) {
+    Serial.print(F("✗ [RTC] 読み取り値が異常（年=")); Serial.print(now.year());
+    Serial.println(F("）。直前の値を使用します"));
+    return fallbackEpoch;
+  }
+  return (uint32_t)(now.unixtime() - JST_OFFSET_SEC);
+}
+
 static void updateRecordFromPayload(const uint8_t mac[6], const uint8_t *payload, uint8_t payloadLen, int rssi) {
   if (xSemaphoreTake(recordMutex, 0) == pdTRUE) {
     int idx = -1;
@@ -800,6 +906,13 @@ static void updateRecordFromPayload(const uint8_t mac[6], const uint8_t *payload
       records[idx].payloadLen = payloadLen;
       records[idx].rssi       = rssi;
       records[idx].lastSeen   = millis();
+      // ★DS3231はAT+CCLKの網時刻で「日本時間(JST)の時刻表記」に設定されている
+      // （syncRtcFromNetworkTime()参照）。RTClibのunixtime()は保持している年月日時分秒を
+      // 無条件にUTCとみなして変換するため、そのまま使うとJSTの値をUTCエポックとして
+      // 送ってしまい、GAS側でスプレッドシートのタイムゾーン(JST)表示時にもう一度+9時間され、
+      // 合計+18時間（実質+9時間の見た目のズレ）になる。JST_OFFSET_SECを引いて真のUTC
+      // エポックに変換することで、GAS側のnew Date()表示が正しいJST時刻になるようにする。
+      records[idx].rtcEpoch   = readRtcEpochSafe(records[idx].rtcEpoch);
     }
     xSemaphoreGive(recordMutex);
   }
@@ -1258,16 +1371,20 @@ int buildBatchQuery(const FlexRecord* merged, int start, int n,
   //   [19-20]=CH3Max [21-22]=CH3Min [23-24]=CH4Max [25-26]=CH4Min
   //
   // GAS へ送るデータ:
-  //   DeviceID(1B)+Temp(1B)+CH1-4med(8B)+CH1Max/Min(4B)+CH2Max/Min(4B)+CH3Max/Min(4B)+CH4Max/Min(4B)
-  //   = 26B/台 = 52 hex文字
+  //   ★2026-07-25: Gateway RTC(DS3231)の受信時刻(UNIX epoch, uint32 LE)を先頭に追加。
+  //   GAS側の受信日時(サーバnew Date())は送信サイクルの時刻であり実測時刻ではないため、
+  //   再送キューで複数回分がまとめて届いた場合に測定タイミングを区別できるようにする。
+  //   Epoch(4B)+DeviceID(1B)+Temp(1B)+CH1-4med(8B)+CH1Max/Min(4B)+CH2Max/Min(4B)+CH3Max/Min(4B)+CH4Max/Min(4B)
+  //   = 30B/台 = 60 hex文字
   String body = "";
   int count = 0;
   for (int i = start; i < n; i++) {
     const FlexRecord& rec = merged[i];
     if (rec.payloadLen < 27) continue;  // フルペイロード未満は棄却
 
-    char chunk[53];  // 52 hex文字 + null
+    char chunk[61];  // 60 hex文字 + null
     snprintf(chunk, sizeof(chunk),
+             "%02X%02X%02X%02X"                               // Gateway RTC epoch (uint32 LE)
              "%02X"                                            // DeviceID
              "%02X"                                            // 温度(int8_t)
              "%02X%02X%02X%02X%02X%02X%02X%02X"               // CH1-4 メジアン (4×2B LE)
@@ -1275,6 +1392,10 @@ int buildBatchQuery(const FlexRecord* merged, int start, int n,
              "%02X%02X%02X%02X"                               // CH2 Max(2B) + CH2 Min(2B)
              "%02X%02X%02X%02X"                               // CH3 Max(2B) + CH3 Min(2B)
              "%02X%02X%02X%02X",                              // CH4 Max(2B) + CH4 Min(2B)
+             (uint8_t)(rec.rtcEpoch & 0xFF),
+             (uint8_t)((rec.rtcEpoch >> 8) & 0xFF),
+             (uint8_t)((rec.rtcEpoch >> 16) & 0xFF),
+             (uint8_t)((rec.rtcEpoch >> 24) & 0xFF),
              rec.payload[1],                                   // DeviceID
              rec.payload[2],                                   // 温度
              rec.payload[3],  rec.payload[4],                  // CH1 med
@@ -1291,8 +1412,8 @@ int buildBatchQuery(const FlexRecord* merged, int start, int n,
              rec.payload[25], rec.payload[26]                  // CH4 Min
     );
 
-    // "&d=" は先頭1回だけ付くので、2台目以降は chunk(52文字)分だけ伸びる
-    size_t oneLen = (count == 0) ? (String(F("&d=")).length() + 52) : 52;
+    // "&d=" は先頭1回だけ付くので、2台目以降は chunk(60文字)分だけ伸びる
+    size_t oneLen = (count == 0) ? (String(F("&d=")).length() + 60) : 60;
     size_t projected = baseUrl.length() + header.length() + String(F("&n=99")).length()
                         + body.length() + oneLen;
     if (count > 0 && projected > SHREQ_MAX_URL_BYTES) {
@@ -1339,22 +1460,35 @@ void flushRecords() {
 
   xSemaphoreGive(recordMutex);
 
-  // ライブデータ＋再送キューをマージ（同一 MAC はライブ側＝最新を優先）
+  // ライブデータ＋再送キューをマージ。
+  // ★2026-07-25: 以前は同一MACのライブデータがあれば再送キュー側を「重複」として破棄していたが、
+  // これは別時刻の実測値であり重複ではない（子機はBLEで最新値を常時ブロードキャストするだけなので、
+  // 再送キューの値とライブ値は異なる測定サイクルのデータ）。破棄すると送信失敗した測定が
+  // 恒久的に失われるため、両方をそのまま送信する（GAS側は受信ごとに行を追加するだけなので
+  // 同一DeviceIDが1バッチに複数件あっても問題ない）。
   FlexRecord merged[MAX_DEVICES];
   int n = 0;
   for (int i = 0; i < liveN && n < MAX_DEVICES; i++) merged[n++] = liveSnap[i];
 
   int pendingSpaceDropped = 0;  // バッファ上限で本当に破棄された件数のみカウント
   for (int i = 0; i < pendingCount; i++) {
-    bool dup = false;
-    for (int j = 0; j < liveN; j++) {
-      if (memcmp(pendingRecords[i].mac, liveSnap[j].mac, 6) == 0) { dup = true; break; }
-    }
-    if (dup) continue;  // ライブ側に同一 MAC の新しいデータがあるので再送キュー側は不要（正常な重複排除）
     if (n < MAX_DEVICES) merged[n++] = pendingRecords[i];
     else pendingSpaceDropped++;
   }
   pendingCount = 0;
+
+  // ★2026-07-25: 再送キュー分とライブ分が1バッチにまとまる場合、rtcEpoch昇順（古い実測時刻が先）
+  // に並べ替える。以前はライブ→再送キューの順（新しい→古い）で送られており、スプレッドシートの
+  // 見た目が時系列と逆転して分かりにくかった。単純挿入ソート（nはMAX_DEVICES=20以下）。
+  for (int i = 1; i < n; i++) {
+    FlexRecord key = merged[i];
+    int j = i - 1;
+    while (j >= 0 && merged[j].rtcEpoch > key.rtcEpoch) {
+      merged[j + 1] = merged[j];
+      j--;
+    }
+    merged[j + 1] = key;
+  }
 
   if (n == 0) { Serial.println(F("送信対象レコードなし")); return; }
   if (pendingSpaceDropped > 0) {
@@ -1369,6 +1503,9 @@ void flushRecords() {
   // 旧実装は下の ensureNetworkReady() 失敗時に early return しており、LTE-Mが停止すると
   // SDにも一切残らずデータが完全に失われていた（有野川の教訓）。
   // 記録対象はライブ受信分のみ（再送キュー分は前回のサイクルで記録済みのため重複させない）。
+  // ★2026-07-25: 以前はsdLog()の戻り値を見ずに「liveN件を記録」と無条件表示していたため、
+  // 実際は書き込みに失敗していても成功したかのようなログが残っていた。実成功件数を数えて表示する。
+  int sdWrittenCount = 0;
   for (int i = 0; i < liveN; i++) {
     char mac[18];
     snprintf(mac, sizeof(mac), "%02X-%02X-%02X-%02X-%02X-%02X",
@@ -1379,9 +1516,12 @@ void flushRecords() {
       if (liveSnap[i].payload[j] < 0x10) hex += '0';
       hex += String(liveSnap[i].payload[j], HEX);
     }
-    sdLog(ts + "," + String(mac) + "," + hex + "," + String(liveSnap[i].rssi));
+    if (sdLog(ts + "," + String(mac) + "," + hex + "," + String(liveSnap[i].rssi))) sdWrittenCount++;
   }
-  if (liveN > 0) { Serial.print(F("[SD] ")); Serial.print(liveN); Serial.println(F(" 件を記録")); }
+  if (liveN > 0) {
+    Serial.print(F("[SD] ")); Serial.print(sdWrittenCount); Serial.print(F("/")); Serial.print(liveN);
+    Serial.println(F(" 件を記録"));
+  }
 
   // ネットワーク状態確認・必要なら再接続
   if (!ensureNetworkReady()) {
@@ -1627,9 +1767,17 @@ static void handlePendingBleCommands() {
 // setup
 // ══════════════════════════════════════════════
 void setup() {
+  // ★2026-07-25追加: リセット原因（RESETREAS）の診断ログ。
+  // 現場で説明のつかない短間隔の再起動（有野川以外でも複数回確認）が発生しており、
+  // WDT満了・ソフトリセット・電源瞬断（ブラウンアウト）のどれが原因か切り分けられなかった。
+  // 他コードがRESETREASに触れる前、setup()の最初に読み取ってすぐクリアする。
+  uint32_t resetReason = NRF_POWER->RESETREAS;
+  NRF_POWER->RESETREAS = 0xFFFFFFFFUL;  // 読み取り後すぐクリア（次回リセット時に前回分と混ざらないように）
+
   wdtInit(WDT_TIMEOUT_MS);  // 無人運用の安全網。以降 120 秒キックが無ければ自動リセット
   lastGasSuccessMs = millis();  // アプリ層WDTの起点。以降 APP_WDT_NO_SEND_RESET_MS 内に送信成功が無ければ再起動
 
+  i2cBusRecovery();  // Wire.begin()より前に必ず実行（詳細は関数コメント参照）
   Wire.begin();
   pinMode(SD_CS_PIN, OUTPUT);
   digitalWrite(SD_CS_PIN, HIGH);  // SDカード非選択で起動
@@ -1646,6 +1794,20 @@ void setup() {
   Serial.println(F("===================================="));
   Serial.print(F("SIM: ")); Serial.println(SIM_NAME);
   Serial.print(F("APN: ")); Serial.println(APN);
+
+  Serial.print(F("[RESETREAS] 0x")); Serial.println(resetReason, HEX);
+  if (resetReason == 0) {
+    Serial.println(F("  - (フラグなし。パワーオン起動、または電源瞬断/ブラウンアウトの可能性)"));
+  }
+  if (resetReason & POWER_RESETREAS_RESETPIN_Msk) Serial.println(F("  - RESETPIN: 外部リセットピン"));
+  if (resetReason & POWER_RESETREAS_DOG_Msk)      Serial.println(F("  - DOG: ウォッチドッグタイマー満了"));
+  if (resetReason & POWER_RESETREAS_SREQ_Msk)     Serial.println(F("  - SREQ: ソフトウェアリセット（NVIC_SystemReset。アプリ層WDT等）"));
+  if (resetReason & POWER_RESETREAS_LOCKUP_Msk)   Serial.println(F("  - LOCKUP: CPUロックアップ"));
+  if (resetReason & POWER_RESETREAS_OFF_Msk)      Serial.println(F("  - OFF: GPIOによるOFF状態からの復帰"));
+  if (resetReason & POWER_RESETREAS_LPCOMP_Msk)   Serial.println(F("  - LPCOMP"));
+  if (resetReason & POWER_RESETREAS_DIF_Msk)      Serial.println(F("  - DIF: デバッグ割り込み"));
+  if (resetReason & POWER_RESETREAS_NFC_Msk)      Serial.println(F("  - NFC"));
+  if (resetReason & POWER_RESETREAS_VBUS_Msk)     Serial.println(F("  - VBUS: USB接続によるリセット"));
 
   // RTC 初期化
   if (rtc.begin()) {
@@ -1890,6 +2052,7 @@ void loop() {
 #ifdef COMM_MODE_LORA
     updateStatusChar();  // コントローラーへ最新状態を反映（接続中はnotify）
 #endif
+    gLogPeriodicCommit();  // gwlog.csvのFATサイズ情報を10秒おきに確定させる
   }
 
 #if LTEM_SEND_ENABLED

@@ -155,14 +155,51 @@ static int        pendingCount = 0;
 static RTC_DS3231 rtc;
 static bool rtcAvailable = false;
 
+// ★2026-07-27追加: I2Cノイズ/接触不良でDS3231から明らかにおかしい値（年が範囲外）を
+// 読んでしまうことがある（有野川連続運用時・輸送中フリーズの両方で確認済み。詳細は
+// [gateway_softhang_incident]・今回の輸送中フリーズの原因調査を参照）。getTimestamp()を
+// 呼ぶ全箇所で共通して直前の正常値にフォールバックできるよう、ここでキャッシュする。
+static DateTime s_lastGoodRtc(2026, 1, 1, 0, 0, 0);
+static bool     s_lastGoodRtcSet = false;
+
 String getTimestamp() {
   if (!rtcAvailable) return String(millis() / 1000UL) + "s";
   DateTime now = rtc.now();
+  if (now.year() < 2026 || now.year() > 2035) {
+    if (s_lastGoodRtcSet) now = s_lastGoodRtc;
+  } else {
+    s_lastGoodRtc = now;
+    s_lastGoodRtcSet = true;
+  }
   char buf[20];
   snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d",
            now.year(), now.month(), now.day(),
            now.hour(), now.minute(), now.second());
   return String(buf);
+}
+
+// ★2026-07-27追加: I2Cバスリカバリ（rtc.begin()より前に必ず呼ぶ）。
+// 車載輸送中の振動でRTC(DS3231)への配線が瞬間的に接触不良になり、I2C通信がSDAを
+// LOWに張り付かせたまま止まる「バスロック」でMCU全体がフリーズする障害が発生した
+// （nRF52のWireライブラリの内部実装はこの状態に対するタイムアウトを持たないため、
+// 一度ハングすると内蔵WDTの強制リセット待ちになる。さらに配線の接触不良が再起動後も
+// 続いていると、起動のたびに同じ場所でハングする無限リセットループに陥る）。
+// 標準的なI2Cバスリカバリ手順（SCLを最大9回クロックしてスタックしたスレーブの送信を
+// 完了させ、STOPコンディションを生成する）を起動時に必ず一度実行することで、
+// バスが詰まった状態のままrtc.begin()に入ってしまうのを防ぐ。
+static void i2cBusRecovery() {
+  pinMode(SCL, OUTPUT);
+  pinMode(SDA, INPUT_PULLUP);
+  digitalWrite(SCL, HIGH);
+  delayMicroseconds(10);
+  for (int i = 0; i < 9 && digitalRead(SDA) == LOW; i++) {
+    digitalWrite(SCL, LOW);  delayMicroseconds(5);
+    digitalWrite(SCL, HIGH); delayMicroseconds(5);
+  }
+  pinMode(SDA, OUTPUT);
+  digitalWrite(SDA, LOW);  delayMicroseconds(5);
+  digitalWrite(SCL, HIGH); delayMicroseconds(5);
+  digitalWrite(SDA, HIGH); delayMicroseconds(5);
 }
 
 // ══════════════════════════════════════════════
@@ -923,6 +960,7 @@ void setup() {
   Serial.print(F("APN: ")); Serial.println(APN);
 
   // RTC 初期化
+  i2cBusRecovery();  // rtc.begin()より前に必ず実行（詳細は関数コメント参照）
   if (rtc.begin()) {
     rtcAvailable = true;
     if (rtc.lostPower()) {
