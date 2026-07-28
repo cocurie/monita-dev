@@ -98,10 +98,10 @@ static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のとき
 // アプリ設定（ここを主に編集する）
 // ============================================================
 
-#define DEBUG_MODE           1        // 1: USB Serial デバッグログ有効。本番は 0 ★ボタン誤作動調査のため一時的に1にしている
+#define DEBUG_MODE           0        // 1: USB Serial デバッグログ有効。本番は 0 ★ボタン誤作動調査のため一時的に1にしている
 #define DEBUG_NO_SLEEP       0        // 1: deepSleep をスキップして即 loop() に戻る（DEBUG_MODE 1 時のみ有効）
 #define DEBUG_NO_SIGFOX      0        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
-#define SLEEP_MINUTES        15       // 1サイクル後のスリープ時間（分）
+#define SLEEP_MINUTES        60       // 1サイクル後のスリープ時間（分）
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 #define BUTTON_LONG_PRESS_MS 5000UL  // D0 長押し閾値（ms）: 以上で tare、未満でリセット
 
@@ -152,7 +152,7 @@ static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のとき
 //   2 = TCA9546A 経由 I2C センサ（LSM6DS 等の加速度センサなど）
 //       ※ DS3231 はオンボード U7（0x68）と競合するため CH 接続不可
 //   3 = DS18B20（1-Wire 温度センサ）※ 外部プルアップ 4.7kΩ（3V3_SW → CH pin3）必要
-const uint8_t CH_ASSIGN[4] = {1, 1, 1, 1};
+const uint8_t CH_ASSIGN[4] = {3, 3, 1, 1};
 
 // ── ひずみ補正係数（キャリブレーション） ──────────────────────────
 //
@@ -398,7 +398,7 @@ extern "C" void RTC2_IRQHandler(void) {
 // これによりタイムアウトは「スリープ時間」「活動時間」の長い方だけを
 // 超える値であればよい（合計値をカバーする必要はない）。
 // ============================================================
-static uint32_t const WDT_TIMEOUT_MS = 25UL * 60UL * 1000UL;  // 25分（MEASURE_INTERVAL_MIN=20分, ADV_DURATION_MIN=10分に余裕を持たせた値）
+static uint32_t const WDT_TIMEOUT_MS = 65UL * 60UL * 1000UL;  // 25分（MEASURE_INTERVAL_MIN=20分, ADV_DURATION_MIN=10分に余裕を持たせた値）
 
 static void wdtInit(uint32_t timeoutMs) {
   NRF_WDT->CONFIG  = (WDT_CONFIG_SLEEP_Run << WDT_CONFIG_SLEEP_Pos);  // スリープ中も継続動作
@@ -525,6 +525,11 @@ static void deepSleep(uint32_t minutes) {
           return;
         } else {
           // 短押し: ソフトウェアリセット
+          // logEvent() が内部で DS3231 に I2C アクセスするため、3V3_SW を
+          // 先に復電しておく（スリープ中は OFF のため、電源が無いままだと
+          // I2C 応答待ちでハングし NVIC_SystemReset() に到達できなくなる）。
+          digitalWrite(SW_POWER_PIN, HIGH);
+          delay(10);  // 電源安定待ち
           logEvent("RESET_SHORT", 0);
 #if DEBUG_MODE
           Serial.println("[BTN] short press -> reset");
@@ -535,6 +540,9 @@ static void deepSleep(uint32_t minutes) {
         }
       } else {
         // ボタンはすでに離されている → 短押しとみなしてリセット
+        // 同上: logEvent() の I2C アクセス前に 3V3_SW を復電する
+        digitalWrite(SW_POWER_PIN, HIGH);
+        delay(10);  // 電源安定待ち
         logEvent("RESET_SHORT", 0);
 #if DEBUG_MODE
         Serial.println("[BTN] short press (released) -> reset");
