@@ -2,7 +2,7 @@
 title: LoRa複数台テスト用 GAS（受信・記録）
 domain: iot_device
 tags: [experimental, lora, e220, gateway, gas, xiao_nrf52840]
-updated: 2026-07-24
+updated: 2026-07-25
 ---
 
 # LoRa複数台テスト用 GAS
@@ -22,23 +22,30 @@ Gatewayの `buildBatchQuery()` / `postBootInfoRow()` が送る形式に対応:
 - **データ行**（`row_type`なし）
   - `q` = CSQ（1バイトを16進2文字。10進は `parseInt(q,16)`）
   - `n` = 台数
-  - `d` = 各台 9バイト=18hex文字の連結。1台の内訳:
-    `DeviceID(1B) + CH1(int16 LE) + CH2 + CH3 + CH4`
+  - `d` = 各台 13バイト=26hex文字の連結。1台の内訳:
+    `Epoch(uint32 LE, 4B) + DeviceID(1B) + CH1(int16 LE) + CH2 + CH3 + CH4`
 - **info行**（起動確認、`row_type=info`）
   - `ts, sim, csq, xiao_id, sim_imei, sd, interval_min, devcount, gw_fw`
 
 ※子機の元ペイロードは19バイト（PktType/FW/BATT/Hour/Min/Range含む）だが、
-Gatewayが送信時に `DeviceID + CH1-4` の9バイトだけ抜き出して `&d=` に圧縮している。
-BATT/FW/時刻/Range/RSSIはこのテストでは送られてこない。
+Gatewayが送信時に `Epoch + DeviceID + CH1-4` の13バイトだけ抜き出して `&d=` に圧縮している。
+BATT/FW/Range/RSSIはこのテストでは送られてこない。EpochはGateway RTC(DS3231)のUNIX時刻
+（RTC無し起動時は`0`）。
+
+> ⚠️ **フォーマット変更に注意**: 2026-07-25にGateway側でEpoch(4B)が先頭に追加され、
+> 1台あたり9B(18hex)→13B(26hex)に変わった。このGASがまだ18hex決め打ちのままだった時期に、
+> DeviceIDが`0x00`や`0xD4`等の範囲外値になる形で壊れて記録される事象が実際に発生した。
+> `main.cpp`の`buildBatchQuery()`の`snprintf`引数順・チャンク長を変更したら、
+> 必ずこのGASの`parseLoraChunk()`もあわせて直すこと。
 
 ## 記録先シート `lora_test` の列構成
 
-| A | B | C | D | E | F | G | H |
-|---|---|---|---|---|---|---|---|
-| 受信日時 | DeviceID | CH1 | CH2 | CH3 | CH4 | CSQ(10進) | 備考 |
+| A | B | C | D | E | F | G | H | I |
+|---|---|---|---|---|---|---|---|---|
+| 受信日時(サーバ) | 計測日時(Gateway RTC) | DeviceID | CH1 | CH2 | CH3 | CH4 | CSQ(10進) | 備考 |
 
-- データ行: B=`0x0B`等、C〜F=ダミーCH値、G=CSQ
-- info行: B=`GW`、C〜F空欄、H=`fw.. xiao=.. imei=.. sd=.. interval_min=.. devcount=..`
+- データ行: B=RTC由来の計測時刻（RTC無しで`epoch=0`の場合は空欄）、C=`0x0B`等、D〜G=ダミーCH値、H=CSQ
+- info行: C=`GW`、B・D〜G空欄、I=`fw.. xiao=.. imei=.. sd=.. interval_min=.. devcount=..`
 
 ## セットアップ
 

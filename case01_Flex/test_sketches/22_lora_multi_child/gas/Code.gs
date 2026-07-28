@@ -14,28 +14,35 @@
 //     q  = CSQ（1バイトを16進2文字。10進へは parseInt(q,16)。意味は開発メモ
 //          [gateway_csq_signal_strength_notes] 参照）
 //     n  = 台数
-//     d  = 各台9バイト=18hex文字の連結。1台分の内訳:
-//            [0]    DeviceID (1B)
-//            [1-2]  CH1 (int16 LE)
-//            [3-4]  CH2 (int16 LE)
-//            [5-6]  CH3 (int16 LE)
-//            [7-8]  CH4 (int16 LE)
+//     d  = 各台13バイト=26hex文字の連結。1台分の内訳:
+//            [0-3]  Gateway RTC(DS3231)のUNIX時刻 epoch (uint32 LE)。
+//                   RTC無し起動時は0（★2026-07-25追加。main.cpp:1300-1317参照）
+//            [4]    DeviceID (1B)
+//            [5-6]  CH1 (int16 LE)
+//            [7-8]  CH2 (int16 LE)
+//            [9-10] CH3 (int16 LE)
+//            [11-12] CH4 (int16 LE)
 //          ※子機ファーム(22)の元ペイロードは19B(PktType/FW/BATT/Hour/Min/Range含む)だが、
-//            Gatewayが送信時にDeviceID+CH1-4の9Bだけ抜き出して&d=に圧縮している。
-//            BATT/FW/時刻/Range/RSSIはこのテストでは送られてこない。
+//            Gatewayが送信時にEpoch+DeviceID+CH1-4の13Bだけ抜き出して&d=に圧縮している。
+//            BATT/FW/Range/RSSIはこのテストでは送られてこない。
+//          ★このフォーマットはfirmware(gateway_v1.1)の実装に追従が必要。ズレると
+//            DeviceIDが範囲外の値(0x00, 0xD4等)になる形で壊れた値が記録される
+//            （2026-07-25、Epoch追加をGAS側が未追従で発生した実例あり）。
+//            main.cppのbuildBatchQuery()のsnprintf/chunk長と必ず突き合わせること。
 //
 //   info行（起動確認、row_type=info）:
 //     ts, sim, csq, xiao_id, sim_imei, sd, interval_min, devcount, gw_fw
 // ================================
 // スプレッドシート列構成（lora_test シート）
 // ================================
-//   A: 受信日時   B: DeviceID(16進)   C: CH1   D: CH2   E: CH3   F: CH4   G: CSQ(10進)   H: 備考
+//   A: 受信日時(サーバ)   B: 計測日時(Gateway RTC。RTC無しは空欄)   C: DeviceID(16進)
+//   D: CH1   E: CH2   F: CH3   G: CH4   H: CSQ(10進)   I: 備考
 // ================================
 
 // ★スプレッドシートID。このスクリプトをスプレッドシートに紐付け（コンテナバインド）
 //   している場合は空文字のままでよい（getActiveSpreadsheet()を使う）。
 //   スタンドアロンスクリプトの場合は、記録先スプレッドシートのIDをここに設定する。
-var SPREADSHEET_ID = '';
+var SPREADSHEET_ID = '12VfgxPoRmpr9tkI1myzvIgvjqcDxERkVcQxXWzvYr0I';
 
 // データ・info行の記録先シート名（無ければ自動生成する）
 var SHEET_NAME = 'lora_test';
@@ -51,7 +58,7 @@ function getOrCreateSheet() {
   var sheet = ss.getSheetByName(SHEET_NAME);
   if (!sheet) {
     sheet = ss.insertSheet(SHEET_NAME);
-    sheet.appendRow(['受信日時', 'DeviceID', 'CH1', 'CH2', 'CH3', 'CH4', 'CSQ', '備考']);
+    sheet.appendRow(['受信日時', '計測日時(RTC)', 'DeviceID', 'CH1', 'CH2', 'CH3', 'CH4', 'CSQ', '備考']);
   }
   return sheet;
 }
@@ -63,17 +70,25 @@ function int16le(lo, hi) {
   return v;
 }
 
-// &d= の1台分（18hex文字）を {deviceId, ch:[CH1..4]} に復号する
-function parseLoraChunk(hex18) {
+// 符号無し32ビット（リトルエンディアン）を復号する（Gateway RTCのUNIX epoch用）
+function uint32le(b0, b1, b2, b3) {
+  return (b0 + b1 * 0x100 + b2 * 0x10000) + b3 * 0x1000000;  // *演算は32bit符号あり左シフトの罠を避けるため乗算で合成
+}
+
+// &d= の1台分（26hex文字=13バイト）を {epoch, deviceId, ch:[CH1..4]} に復号する
+// バイト順は firmware(gateway_v1.1) buildBatchQuery() の snprintf 引数順と必ず一致させること:
+//   Epoch(4B LE) + DeviceID(1B) + CH1-4(各2B LE)
+function parseLoraChunk(hex26) {
   var b = [];
-  for (var i = 0; i < 9; i++) b.push(parseInt(hex18.substr(i * 2, 2), 16));
+  for (var i = 0; i < 13; i++) b.push(parseInt(hex26.substr(i * 2, 2), 16));
   return {
-    deviceId: b[0],
+    epoch: uint32le(b[0], b[1], b[2], b[3]),
+    deviceId: b[4],
     ch: [
-      int16le(b[1], b[2]),
-      int16le(b[3], b[4]),
       int16le(b[5], b[6]),
       int16le(b[7], b[8]),
+      int16le(b[9], b[10]),
+      int16le(b[11], b[12]),
     ],
   };
 }
@@ -91,9 +106,10 @@ function doGet(e) {
     var infoSheet = getOrCreateSheet();
     infoSheet.appendRow([
       new Date(),   // A: 受信日時
-      'GW',         // B: DeviceID欄にGateway識別子
-      '', '', '', '',  // C-F: CH（info行は空欄）
-      p.csq || '',  // G: CSQ
+      '',           // B: 計測日時(RTC)（info行は空欄）
+      'GW',         // C: DeviceID欄にGateway識別子
+      '', '', '', '',  // D-G: CH（info行は空欄）
+      p.csq || '',  // H: CSQ
       'fw' + (p.gw_fw || '?') + ' xiao=' + (p.xiao_id || '') +
         ' imei=' + (p.sim_imei || '') + ' sd=' + (p.sd || '') +
         ' interval_min=' + (p.interval_min || '') + ' devcount=' + (p.devcount || ''),
@@ -113,17 +129,20 @@ function doGet(e) {
     lock.waitLock(10000);
 
     for (var i = 0; i < n; i++) {
-      var chunk = dBlob.substr(i * 18, 18);
-      if (chunk.length < 18) continue;
+      var chunk = dBlob.substr(i * 26, 26);
+      if (chunk.length < 26) continue;
       var d = parseLoraChunk(chunk);
       var idHex = ('0' + d.deviceId.toString(16)).slice(-2).toUpperCase();
+      // epoch=0はRTC未初期化（main.cppのrtcAvailable=false時）を意味するため空欄にする
+      var measuredAt = d.epoch > 0 ? new Date(d.epoch * 1000) : '';
 
       sheet.appendRow([
-        new Date(),                                   // A: 受信日時
-        '0x' + idHex,                                 // B: DeviceID
-        d.ch[0], d.ch[1], d.ch[2], d.ch[3],           // C-F: CH1-4
-        csq,                                          // G: CSQ(10進)
-        '',                                           // H: 備考
+        new Date(),                                   // A: 受信日時(サーバ)
+        measuredAt,                                   // B: 計測日時(Gateway RTC)
+        '0x' + idHex,                                 // C: DeviceID
+        d.ch[0], d.ch[1], d.ch[2], d.ch[3],           // D-G: CH1-4
+        csq,                                          // H: CSQ(10進)
+        '',                                           // I: 備考
       ]);
     }
   } catch (err) {

@@ -208,7 +208,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 31;
+static uint8_t  const GATEWAY_FW_VERSION = 34;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -1153,6 +1153,106 @@ static uint8_t     s_loraSum = 0;
 static uint8_t     s_loraRssiRaw = 0;
 static uint32_t    s_loraFieldStartMs = 0;
 
+// ★2026-07-29追加: 「USBホストが居ないとLoRa受信が止まる」現象の切り分け用カウンタ。
+// PCにシリアル接続できない状態でもBLEステータス経由で中身を確認できるようにする。
+// これで以下の3つを区別できる:
+//   生バイト数=0          → E220が何も出力していない（RF受信していない/モード違い）
+//   バイトは来るがCKSUM NG → UART通信が化けている
+//   CKSUM OKだが受信台数0  → 受信後のフィルタ（isAllowedFlexPacket等）で弾かれている
+static uint32_t s_loraRxBytes    = 0;  // UARTE1から読んだ生バイトの累計
+static uint32_t s_loraCksumNg    = 0;  // チェックサム不一致で破棄したフレーム数
+static uint32_t s_loraFramesOk   = 0;  // チェックサムまで通ったフレーム数
+static bool     s_loraConfigOk   = false;  // 起動時のconfig check結果
+
+// ★2026-07-29追加: UARTE1 受信ストールからの自己復旧。
+// Adafruit nRF52コアのUartドライバは RXD.MAXCNT=1 の1バイトDMAで、
+// 「ENDRX割り込みの中でのみ TASKS_STARTRX を再発行する」構造になっている
+// （framework-arduinoadafruitnrf52/cores/nRF5/Uart.cpp の IrqHandler 参照）。
+// このため割り込み連鎖が一度でも途切れると受信が永久に再開せず、
+// EVENTS_ERROR（オーバーラン等）は有効化もクリアもされていないため検出もされない。
+// 実際「起動時のconfig readは成功するのに、その後は永久に0バイト」という
+// 症状が出たため、一定時間受信が無ければRXを再起動して自力復帰させる。
+#define LORA_RX_STALL_MS 30000UL   // この時間1バイトも来なければストールとみなす
+static uint32_t s_loraLastRxMs  = 0;  // 最後に1バイト受信した時刻
+static uint32_t s_loraRekicks   = 0;  // RX再起動の実行回数
+static uint8_t  s_loraErrSrcAcc = 0;  // 観測したERRORSRCの累積OR（bit0=OVERRUN,1=PARITY,2=FRAMING,3=BREAK）
+
+// ★2026-07-29追加: 「本当に通常モード(Mode0)にいるか」をM0/M1に触らずに検査する。
+// Mode0(透過)では 0xC1... は設定コマンドとして解釈されず、そのまま電波として送出されるため
+// 応答は返ってこない。逆に応答が返れば、モジュールは設定モード(Mode3)に留まっている＝
+// M0/M1の制御が効いていない。Mode3ではRF受信を行わないので「コマンドには応答するが
+// 受信データが1バイトも出ない」という症状の説明になる。
+static bool s_loraProbeDone     = false;  // 検査を実施したか
+static bool s_loraProbeInConfig = false;  // 検査結果: trueなら設定モードのままだった
+static void loraProbeMode() {
+  while (loraSerial.available()) loraSerial.read();
+  loraSerial.write((uint8_t)0xC1);
+  loraSerial.write((uint8_t)LORA_CFG_REG_START);
+  loraSerial.write((uint8_t)1);
+
+  bool answered = false;
+  unsigned long t0 = millis();
+  while (millis() - t0 < 300UL) {
+    if (loraSerial.available()) { answered = true; break; }
+  }
+  while (loraSerial.available()) loraSerial.read();  // 応答は読み捨て（受信カウンタを汚さない）
+
+  s_loraProbeDone     = true;
+  s_loraProbeInConfig = answered;
+  Serial.print(F("[LORA] モード検査: "));
+  Serial.println(answered ? F("★設定モード(Mode3)のまま＝M0/M1制御が効いていない")
+                          : F("通常モード(Mode0)にいる＝モードは正常"));
+}
+
+// ★2026-07-29追加: 起動直後のE220「受信不能ラッチ」を解除するキック送信。
+//
+// 【経緯】バッテリー給電時に、E220がコマンド(Config)には正常応答するのに
+// 通常モードでRF受信データを1バイトも出さない状態が再現した。UARTのエラーは0、
+// M0/M1も通常モードと確認済み（loraProbeMode()）、UARTEの再武装も無効だったため、
+// E220モジュール内部が受信不能状態でラッチしていたと考えられる。
+// 実機では「通常モードで数バイト送信させる」と受信が復活することを確認した
+// （PC給電では再現せず、電源投入時の電圧の立ち上がり方が引き金と推定）。
+// XIAOをリセットしてもE220は給電され続けるため、この状態はMCUのリセットでは解除されない。
+//
+// 送出する3バイトは全て0x00。受信側の状態機械は同期バイト0xAAを探すため、
+// 他機がこれをフレームとして誤認することはない。
+static void loraKickTx() {
+  const uint8_t dummy[3] = {0x00, 0x00, 0x00};
+  loraSerial.write(dummy, sizeof(dummy));
+  loraSerial.flush();
+  delay(200);  // 送信完了待ち（AUX未接続のため固定ディレイ）
+  while (loraSerial.available()) loraSerial.read();  // 反射・エコーがあれば捨てる
+}
+
+// UARTE1のエラー要因を回収し、受信が止まっていれば受信を再起動する
+static void loraRxWatchdog() {
+  // ERRORSRCは書き戻すとクリアされる。何が起きたかを累積して残す
+  uint32_t errsrc = NRF_UARTE1->ERRORSRC;
+  if (errsrc) {
+    NRF_UARTE1->ERRORSRC = errsrc;
+    s_loraErrSrcAcc |= (uint8_t)(errsrc & 0x0F);
+  }
+  if (NRF_UARTE1->EVENTS_ERROR) NRF_UARTE1->EVENTS_ERROR = 0;
+
+  if (millis() - s_loraLastRxMs >= LORA_RX_STALL_MS) {
+    s_loraLastRxMs = millis();  // 次の判定まで再度この時間だけ待つ
+    s_loraRekicks++;
+    NRF_UARTE1->TASKS_STARTRX = 1;  // DMA受信を再武装する（既に動作中でも実害はない）
+    Serial.print(F("[LORA] 受信ストール検出 → RX再起動 #"));
+    Serial.print(s_loraRekicks);
+    Serial.print(F(" ERRORSRC累積=0x"));
+    Serial.println(s_loraErrSrcAcc, HEX);
+
+    // 初回のストール時だけモードを検査する（毎回やると余計な電波を出すため）
+    if (!s_loraProbeDone) loraProbeMode();
+
+    // モードが設定側に張り付いている可能性に備え、通常モードを再設定してから
+    // 受信不能ラッチ解除のキックを送る（起動時と同じ処置。実機で復帰を確認済み）
+    loraModeNormal();
+    loraKickTx();
+  }
+}
+
 // 1バイト処理して、フレーム＋RSSIまで完成したら true を返す
 // （s_loraBody[0..s_loraLen-1]・s_loraRssiRaw が有効）
 static bool loraFeedByte(uint8_t b) {
@@ -1173,7 +1273,7 @@ static bool loraFeedByte(uint8_t b) {
       if (s_loraBodyIdx >= s_loraLen) s_loraState = LORA_WAIT_CKSUM;
       return false;
     case LORA_WAIT_CKSUM:
-      if (b != s_loraSum) { s_loraState = LORA_WAIT_SYNC; return false; }  // チェックサム不一致は破棄
+      if (b != s_loraSum) { s_loraCksumNg++; s_loraState = LORA_WAIT_SYNC; return false; }  // チェックサム不一致は破棄
       s_loraState = LORA_WAIT_RSSI;
       return false;
     case LORA_WAIT_RSSI:
@@ -1190,7 +1290,10 @@ static bool loraFeedByte(uint8_t b) {
 static void loraPoll() {
   while (loraSerial.available()) {
     uint8_t b = (uint8_t)loraSerial.read();
+    s_loraRxBytes++;
+    s_loraLastRxMs = millis();  // 受信が生きている証跡（ストール監視の基準）
     if (loraFeedByte(b)) {
+      s_loraFramesOk++;
       uint8_t pktType  = s_loraBody[0];
       uint8_t deviceId = s_loraBody[1];
       if (!isAllowedFlexPacket(pktType, deviceId)) {
@@ -1216,6 +1319,8 @@ static void loraPoll() {
     Serial.println(F("[LORA] フレーム途中でタイムアウト。再同期します"));
     s_loraState = LORA_WAIT_SYNC;
   }
+
+  loraRxWatchdog();  // UARTE1のRXが止まっていないか監視し、必要なら再起動する
 }
 #endif  // COMM_MODE_LORA
 
@@ -1608,9 +1713,35 @@ static void saveConfig() {
   f.close();
 }
 
-// ステータス8バイトを組み立てる
-// [0]FWバージョン [1]受信台数 [2]SD有無 [3]NW接続OK [4-5]送信間隔(分,LE) [6]最終CSQ [7]予約
-static void buildStatus(uint8_t out[8]) {
+// ★2026-07-29追加: HFCLK（64MHz高速クロック）の供給源と稼働状態を1バイトにまとめる。
+// nRF52840のHFCLKは、明示的に要求しない限り内蔵RC発振器(HFINT、精度±1.5%程度)で動き、
+// TASKS_HFCLKSTARTを叩くか、RADIO(BLE)・USBのようにHFXOを必須とする機能が要求したときだけ
+// 外付け水晶(HFXO、±20〜40ppm)に切り替わる。UARTEのボーレートはHFCLKから作られるため、
+// HFINTのままだとE220とのUART通信が化けて「電波は届いているのに1台も受信できない」
+// 状態になり得る（PC接続時のみ受信できる症状の検証用。2026-07-29の切り分け）。
+//   bit0 = SRC   : 1=HFXO(水晶) / 0=HFINT(内蔵RC)
+//   bit1 = STATE : 1=稼働中 / 0=停止
+// → 0x03=水晶で稼働(正常) / 0x02=内蔵RCで稼働(UART誤差の懸念あり)
+static uint8_t readHfclkStatus() {
+  uint32_t st = NRF_CLOCK->HFCLKSTAT;
+  uint8_t v = 0;
+  if (st & CLOCK_HFCLKSTAT_SRC_Msk)   v |= 0x01;
+  if (st & CLOCK_HFCLKSTAT_STATE_Msk) v |= 0x02;
+  return v;
+}
+
+// 255で頭打ちにして1バイトへ収める（桁溢れで小さい値に見えるのを防ぐ）
+static uint8_t sat8(uint32_t v) { return (v > 255U) ? 255U : (uint8_t)v; }
+
+// ステータス12バイトを組み立てる
+// [0]FWバージョン [1]受信台数 [2]SD有無 [3]NW接続OK [4-5]送信間隔(分,LE) [6]最終CSQ [7]HFCLK状態
+// ★2026-07-29追加のLoRa診断（いずれも255飽和）:
+// [8]LoRa生受信バイト数 [9]チェックサムNG数
+// [10] bit0-6=CKSUM通過フレーム数(127飽和) / bit7=起動時config check成功
+// [11]起動からの経過秒/4（観測のたびに0付近へ戻る場合は再起動を繰り返している）
+// [12]UARTE1 ERRORSRC累積(bit0=OVERRUN,1=PARITY,2=FRAMING,3=BREAK) [13]RX再起動回数
+#define GW_STATUS_LEN 14
+static void buildStatus(uint8_t out[GW_STATUS_LEN]) {
   uint16_t mins = (uint16_t)(sendIntervalMs / 60000UL);
   out[0] = GATEWAY_FW_VERSION;
   out[1] = (uint8_t)recordCount;
@@ -1619,11 +1750,26 @@ static void buildStatus(uint8_t out[8]) {
   out[4] = mins & 0xFF;
   out[5] = (mins >> 8) & 0xFF;
   out[6] = (uint8_t)s_lastCsq;
-  out[7] = 0;
+  out[7] = readHfclkStatus();
+#ifdef COMM_MODE_LORA
+  out[8]  = sat8(s_loraRxBytes);
+  out[9]  = sat8(s_loraCksumNg);
+  uint8_t frames = (s_loraFramesOk > 127U) ? 127U : (uint8_t)s_loraFramesOk;
+  out[10] = (uint8_t)(frames | (s_loraConfigOk ? 0x80 : 0x00));
+  // [12]: bit0-3=ERRORSRC累積 / bit6=モード検査実施済み / bit7=検査結果「設定モードのまま」
+  out[12] = (uint8_t)(s_loraErrSrcAcc
+                      | (s_loraProbeDone     ? 0x40 : 0x00)
+                      | (s_loraProbeInConfig ? 0x80 : 0x00));
+  out[13] = sat8(s_loraRekicks);
+#else
+  out[8] = out[9] = out[10] = 0;
+  out[12] = out[13] = 0;
+#endif
+  out[11] = sat8(millis() / 4000UL);
 }
 
 static void updateStatusChar() {
-  uint8_t st[8];
+  uint8_t st[GW_STATUS_LEN];
   buildStatus(st);
   gwCharStatus.write(st, sizeof(st));
   if (Bluefruit.connected()) gwCharStatus.notify(st, sizeof(st));
@@ -1667,7 +1813,7 @@ static void bleControllerBegin() {
 
   gwCharStatus.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
   gwCharStatus.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
-  gwCharStatus.setFixedLen(8);
+  gwCharStatus.setFixedLen(GW_STATUS_LEN);
   gwCharStatus.begin();
   updateStatusChar();
 
@@ -1852,7 +1998,10 @@ void setup() {
   loraSerial.begin(9600);  // E220-900T22S(JP) デフォルト（要データシート確認）
   delay(500);              // E220 起動待ち（暫定値、要実測）
   loraModeNormal();
-  if (!loraCheckAndConfigure()) {
+  s_loraConfigOk = loraCheckAndConfigure();  // 結果はBLEステータスからも確認できる（PC非接続時の診断用）
+  loraKickTx();               // 受信不能ラッチの解除（詳細はloraKickTx()のコメント参照）
+  s_loraLastRxMs = millis();  // ストール監視の起点（config中のバイトは数えないのでここで初期化）
+  if (!s_loraConfigOk) {
     Serial.println(F("✗ LoRa設定確認に失敗（配線・電源を確認してください）"));
   }
   Serial.println(F("✓ LoRa 初期化完了"));
@@ -2007,7 +2156,20 @@ void loop() {
     Serial.print(F("[HB] now=")); Serial.print(now);
     Serial.print(F(" lastSend=")); Serial.print(lastSend);
     Serial.print(F(" 残り=")); Serial.print((long)(sendIntervalMs - (now - lastSend)));
-    Serial.print(F("ms 受信台数=")); Serial.println(recordCount);
+    Serial.print(F("ms 受信台数=")); Serial.print(recordCount);
+    // HFCLK供給源（PC接続時とバッテリー駆動時で差が出るかの確認用。readHfclkStatus()のコメント参照）
+    Serial.print(F(" HFCLK="));
+    Serial.print((NRF_CLOCK->HFCLKSTAT & CLOCK_HFCLKSTAT_SRC_Msk) ? F("XTAL(HFXO)") : F("RC(HFINT)"));
+#ifdef COMM_MODE_LORA
+    // BLEステータス[8][9][10]と同じ値。PC接続時の基準値を取るために出す
+    Serial.print(F(" LoRa[rxB=")); Serial.print(s_loraRxBytes);
+    Serial.print(F(" cksumNG=")); Serial.print(s_loraCksumNg);
+    Serial.print(F(" frames=")); Serial.print(s_loraFramesOk);
+    Serial.print(F(" err=0x")); Serial.print(s_loraErrSrcAcc, HEX);
+    Serial.print(F(" rekick=")); Serial.print(s_loraRekicks);
+    Serial.print(F("]"));
+#endif
+    Serial.println();
 #ifdef COMM_MODE_LORA
     updateStatusChar();  // コントローラーへ最新状態を反映（接続中はnotify）
 #endif
