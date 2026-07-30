@@ -133,7 +133,20 @@ static const uint8_t  FW_VERSION = 7;     // 子機ファームのバージョ�
 #define DEBUG_NO_LORA        0        // 1: LoRa送信を行わずログだけ出す
 #define SLEEP_MINUTES        15       // 1サイクル後のスリープ時間（分）
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
-#define BUTTON_LONG_PRESS_MS 5000UL  // D0 長押し閾値（ms）: 以上で tare、未満でリセット
+// ── タレ（ゼロ点補正）操作 ─────────────────────────────────────
+// 【操作方法】D0 のタクトスイッチを押しながら電源スイッチ(S1)を ON にし、
+//   LED（青）が点灯したらボタンを離す → タレ実行（成功時シアン点滅）。
+//
+// 【なぜ「離したら実行」なのか】
+//   ボタンが物理的に固着・浸水した場合、「押されていたら即実行」だと
+//   WDT リセットや電源瞬断のたびに勝手に再タレされてしまう。
+//   「離す」ことを条件にすれば、固着状態では永遠に実行されない。
+//
+// 【なぜスリープ中の長押しをやめたのか】
+//   nRF52 の attachInterrupt() は GPIOTE の IN event モードを使い、
+//   スリープ電流が約14µA増える（PPK2 実測: 17.5µA → 31.6µA）。
+//   起動時判定なら割り込み不要で digitalRead() だけで済む。
+#define BOOT_TARE_RELEASE_TIMEOUT_MS 15000UL  // ボタンが離されるのを待つ上限（ms）
 
 // ── DS3231 RTC 設定 ────────────────────────────────────────────
 // 起動時に DS3231 の OSF（発振停止フラグ）を確認し、時刻が無効な場合
@@ -239,6 +252,43 @@ static const float STRAIN_SCALE = 1110.0f;  // 1.0f = 生値そのまま出力�
 // v3.10ではP2をLoRa(E220) M0/M1共通駆動にも使用（基板上でM0/M1短絡・新規配線）
 #define TCA9534_ADDR 0x20
 
+// ── スリープ時の I2C 完全切り離し用（消費電流対策）────────────────
+// Wire（TwoWire）が使うのは NRF_TWIM0（ベースアドレス 0x40003000）。
+// framework-arduinoadafruitnrf52/libraries/Wire/Wire_nRF52.cpp:406 で確認済み。
+#define TWIM0_BASE_ADDR 0x40003000UL
+
+// nRF52 ペリフェラルの強制パワーサイクル（Nordic 案内のワークアラウンド）。
+// ENABLE=0 だけでは内部が完全停止しないため、ベースアドレス+0xFFC に
+// 0 → 読み戻し → 1 を書いてリセットする。実行後は再初期化が必要。
+static inline void nrfPeripheralPowerCycle(uint32_t baseAddr) {
+  *(volatile uint32_t *)(baseAddr + 0xFFC) = 0;
+  (void)*(volatile uint32_t *)(baseAddr + 0xFFC);
+  *(volatile uint32_t *)(baseAddr + 0xFFC) = 1;
+}
+
+// 指定した Arduino ピンを「入力バッファ切断・プルなし」の最小消費状態にする。
+//
+// 【なぜ必要か】Wire.begin() は SDA/SCL を
+//   DIR=Input / INPUT=Connect / PULL=**Pullup** に設定するが（Wire_nRF52.cpp:55-64）、
+//   Wire.end() は ENABLE=0 を書くだけでこれを元に戻さない。
+// Flex基板の I2C 外部プルアップ（R9/R10, 4.7kΩ）は 3V3_SW に接続されており、
+// スリープ中は 3V3_SW = 0V になる。このとき nRF52 の内部プルアップ（約13kΩ）から
+// 外部4.7kΩ を通って GND へ電流が流れ続ける:
+//   3.3V ÷ (13kΩ + 4.7kΩ) ≒ 186µA/本 × 2本 ≒ 372µA
+// PPK2 実測でも Wire.begin() の有無でスリープ電流が 18µA ↔ 305µA と変化し、
+// このピン切り離しを行うことで 17µA まで復帰することを確認済み
+// （test_sketches/24_sleep_current_baseline による二分探索）。
+static inline void nrfPinDisconnect(uint8_t arduinoPin) {
+  uint32_t p = g_ADigitalPinMap[arduinoPin];
+  NRF_GPIO_Type *port = (p < 32) ? NRF_P0 : NRF_P1;
+  port->PIN_CNF[p & 0x1F] =
+      ((uint32_t)GPIO_PIN_CNF_DIR_Input        << GPIO_PIN_CNF_DIR_Pos)
+    | ((uint32_t)GPIO_PIN_CNF_INPUT_Disconnect << GPIO_PIN_CNF_INPUT_Pos)
+    | ((uint32_t)GPIO_PIN_CNF_PULL_Disabled    << GPIO_PIN_CNF_PULL_Pos)
+    | ((uint32_t)GPIO_PIN_CNF_DRIVE_S0S1       << GPIO_PIN_CNF_DRIVE_Pos)
+    | ((uint32_t)GPIO_PIN_CNF_SENSE_Disabled   << GPIO_PIN_CNF_SENSE_Pos);
+}
+
 // DS3231（U7）: RTC + 温度センサ。I²C アドレスは固定（0x68）
 #define DS3231_ADDR  0x68
 
@@ -270,29 +320,13 @@ enum : uint32_t {
 
 static uint32_t s_errors;
 
-// D0 ボタン: ISR からメインへ「押下エッジあり」を伝えるフラグ
-static volatile bool s_btnFlag = false;
-// deepSleep() がタイマー満了前にボタン長押しで抜けたとき、次の loop() で tare を実行する
-static bool s_pendingTare = false;
+// 電源投入時に D0 ボタンが押されていたか（起動直後に1回だけ読み取る）。
+// true の場合、初期化完了後に「ボタンが離されるのを待ってからタレ実行」する。
+// ※ ボタン割り込み（attachInterrupt/GPIOTE）は使わない。スリープ電流が
+//    約14µA増えるため（PPK2実測: 17.5µA → 31.6µA）。
+static bool s_bootButtonHeld = false;
 
-// setup()実行時のタスク（=loop()を回しているFreeRTOSタスク）のハンドル。
-// deepSleep()をFreeRTOSのulTaskNotifyTake()でブロッキング待機させ、
-// ボタンISRからvTaskNotifyGiveFromISR()で早期起床させるために使う。
-// 独自のRTC2 busy-loop(__WFI())ではFreeRTOSのTickless Idleが発動せず、
-// システムティックにより頻繁にCPUが起こされ続け、実測でスリープ電流が
-// 期待値（約150µA）の数十倍（実測約8〜10mA）になっていたことが判明したための対策。
-static TaskHandle_t s_loopTaskHandle = NULL;
-
-static void btnISR() {
-  s_btnFlag = true;
-  if (s_loopTaskHandle != NULL) {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    vTaskNotifyGiveFromISR(s_loopTaskHandle, &xHigherPriorityTaskWoken);
-    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-  }
-}
-
-// ボタンイベント（タレ成功・短押しリセット等）をフラッシュへ記録する。定義は後方（DS3231関連の後）。
+// ボタンイベント（タレ実行等）をフラッシュへ記録する。定義は後方（DS3231関連の後）。
 static void logEvent(const char *type, int32_t extra);
 
 // ============================================================
@@ -376,8 +410,6 @@ static void statusErrorRed() {
 // タレ（ゼロ点補正）成功時: シアン（緑+青）を約4秒間点滅させる。
 // 他のどの状態表示（測定=緑・エラー=赤・スリープ=青ディム・送信=緑点滅）とも
 // 色の組み合わせが重ならないよう選定。現場でボタン操作の結果が目視で分かるようにする。
-// 4秒間かけて点滅させることで、ボタンを離す際のチャタリングが収まるまでの
-// 猶予時間としても機能する（呼び出し側で s_btnFlag を再クリアする前提）。
 static void statusTareSuccessBlink() {
   const unsigned long totalMs     = 4000UL;
   const unsigned long halfPeriodMs = 200UL;
@@ -419,14 +451,17 @@ static void statusSigfoxBlinkTick() {
 }
 
 // ============================================================
-// スリープ（FreeRTOS ulTaskNotifyTake ベース）
+// スリープ（FreeRTOS vTaskDelay ベース）
 //
 // 【経緯】以前は独自にRTC2レジスタを操作し while(!flag){__WFI();} で待機していたが、
 // この方式ではFreeRTOSのスケジューラから見てタスクが「実行中」のままになるため
 // Tickless Idle が発動せず、システムティック割り込みにより頻繁にCPUが起こされ
-// 続けていた。PPK2実測でスリープ電流が期待値（約150µA）に対し実測約8〜10mAと
-// 数十倍高くなっていることが判明したため、ulTaskNotifyTake() によるブロッキング
-// 待機に置き換えた（Tickless Idle が正しく発動し、CPUが低消費電力状態に入る）。
+// 続けていた。PPK2実測でスリープ電流が期待値に対し数十倍（約8〜10mA）高くなって
+// いることが判明したため、FreeRTOSのブロッキング待機に置き換えた
+// （Tickless Idle が正しく発動し、CPUが低消費電力状態に入る）。
+//
+// ボタンによる早期起床は廃止したため、タスク通知（ulTaskNotifyTake）ではなく
+// 単純な vTaskDelay() を使う。タレはボタンを押しながら電源ONする方式に変更した。
 // ============================================================
 
 #ifdef COMM_MODE_LORA
@@ -479,8 +514,8 @@ static inline void wdtFeed() {
 }
 
 // 周辺（Sigfox/LoRa・HX711 電源レール 3V3_SW）をオフにし、minutes 分だけ
-// ulTaskNotifyTake() でブロッキング待機してから復帰する（Tickless Idle 発動のため）。
-// ボタンISR（btnISR）からの vTaskNotifyGiveFromISR() により早期起床できる。
+// vTaskDelay() でブロッキング待機してから復帰する（Tickless Idle 発動のため）。
+// ボタンによる早期起床は行わない（タレは起動時ボタン押下で実行する方式）。
 static void deepSleep(uint32_t minutes) {
   wdtFeed();  // これから始まる長時間スリープ区間の給餌
 
@@ -530,6 +565,20 @@ static void deepSleep(uint32_t minutes) {
   Serial1.end();
 #endif
 
+  // ── I2C（TWIM）をスリープ前に完全に切り離す ──────────────────
+  // Wire.end() は ENABLE=0 を書くだけで以下が残るため、個別に対処する:
+  //   (1) TWIM ペリフェラルが完全停止しない → 強制パワーサイクル
+  //   (2) IRQ が有効なまま                  → NVIC_DisableIRQ
+  //   (3) SDA/SCL の内部プルアップが残る    → ピン切断（これが電流の主因）
+  // 3V3_SW を LOW にした「後」に実行すること（外部プルアップ先が 0V になった
+  // 状態で内部プルアップが残ると電流が流れ続けるため）。
+  // 復帰後は loop() 先頭の Wire.begin() で再初期化される。
+  Wire.end();
+  NVIC_DisableIRQ(SPIM0_SPIS0_TWIM0_TWIS0_SPI0_TWI0_IRQn);
+  nrfPeripheralPowerCycle(TWIM0_BASE_ADDR);
+  nrfPinDisconnect(PIN_WIRE_SDA);
+  nrfPinDisconnect(PIN_WIRE_SCL);
+
   // 0 分指定は誤設定扱いで最低 1 分
   if (minutes == 0U) {
     minutes = 1U;
@@ -560,62 +609,11 @@ static void deepSleep(uint32_t minutes) {
 
   uint32_t sleepMs = (uint32_t)(sleepSeconds * 1000LL);
 
-  // 計測・送信フェーズ中に発生したボタン通知の残りをここで破棄する。
-  // スリープ中に届いた通知のみを有効とするため。
-  ulTaskNotifyTake(pdTRUE, 0);
-  s_btnFlag = false;
-
-  // sleepMs だけブロッキング待機。ボタンISRからの通知があれば即座に返る
-  // （戻り値が非0）。この間、FreeRTOSのTickless Idleにより実際にCPUが
-  // 低消費電力状態へ落ちる（独自WFI busy-loopでは発動しなかった問題の対策）。
-  uint32_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(sleepMs));
-
-  if (notified == 0) {
-    // タイムアウト（通常のスリープ満了）。何もせず呼び出し元へ戻る。
-    return;
-  }
-
-  // ボタン割り込みによる早期起床 → デバウンス・長押し判定
-  s_btnFlag = false;
-  delay(20);  // チャタリング除去
-  if (digitalRead(USER_BUTTON_PIN) == LOW) {
-    // ボタンがまだ押されている → 長押し判定
-    unsigned long pressStart = millis();
-    bool longPress = false;
-    while (digitalRead(USER_BUTTON_PIN) == LOW) {
-      if (millis() - pressStart >= BUTTON_LONG_PRESS_MS) {
-        longPress = true;
-        break;
-      }
-    }
-    if (longPress) {
-      // 長押し: tare フラグを立てて早期リターン（loop() で実行）
-      s_pendingTare = true;
-#if DEBUG_MODE
-      Serial.println("[BTN] long press -> tare pending");
-      Serial.flush();
-#endif
-      return;
-    } else {
-      // 短押し: ソフトウェアリセット
-      logEvent("RESET_SHORT", 0);
-#if DEBUG_MODE
-      Serial.println("[BTN] short press -> reset");
-      Serial.flush();
-      delay(150);  // USB送信完了待ち（flush()だけではリセットで送信が打ち切られることがある）
-#endif
-      NVIC_SystemReset();
-    }
-  } else {
-    // ボタンはすでに離されている → 短押しとみなしてリセット
-    logEvent("RESET_SHORT", 0);
-#if DEBUG_MODE
-    Serial.println("[BTN] short press (released) -> reset");
-    Serial.flush();
-    delay(150);  // USB送信完了待ち
-#endif
-    NVIC_SystemReset();
-  }
+  // sleepMs だけブロッキング待機する。この間、FreeRTOS の Tickless Idle により
+  // CPU が低消費電力状態へ落ちる（独自 WFI busy-loop では発動しなかった問題の対策）。
+  // ボタンによる早期起床は行わない（GPIOTE を使うとスリープ電流が約14µA増えるため。
+  // タレはボタンを押しながら電源ONする方式に変更した）。
+  vTaskDelay(pdMS_TO_TICKS(sleepMs));
 }
 
 // ============================================================
@@ -882,13 +880,58 @@ static void performTare() {
     statusTareSuccessBlink();
   }
 
-  // 長押し中〜点滅中にボタンを離した際のチャタリングでFALLING割り込みが
-  // 再発生し、s_btnFlag が立ってしまうことがある（離す動作は制御できないため）。
-  // これを次サイクルまで持ち越すと「タレ成功直後に勝手にリセットがかかる」
-  // 誤動作になるため、ここで確実に破棄する。
-  s_btnFlag = false;
-
   logEvent("TARE_OK", (int32_t)successCount);
+}
+
+// ============================================================
+// 起動時タレ（ゼロ点補正）
+//
+// 【操作方法】D0 のタクトスイッチを押しながら電源スイッチ(S1)を ON にし、
+//   LED（青）が点灯したらボタンを離す → タレ実行（成功時シアン約4秒点滅）。
+//
+// 【「離したら実行」にしている理由】
+//   ボタンが浸水・振動などで物理的に固着した場合、「押されていたら即実行」
+//   だと WDT リセットや電源瞬断のたびに勝手に再タレされてしまう。
+//   「離す」ことを条件にすれば、固着状態では永久に実行されない。
+//   タイムアウトした場合は赤点灯で異常を知らせ、タレは行わない。
+//
+// 呼び出しは 3V3_SW ON・Wire 初期化済み・tca9534Configure() 済みの状態で行うこと。
+// ============================================================
+static void handleBootTare() {
+  if (!s_bootButtonHeld) return;
+
+#if DEBUG_MODE
+  Serial.println("[TARE] 起動時ボタン押下を検出。離すのを待っています...");
+  Serial.flush();
+#endif
+
+  // ボタンが離されるのを待つ（押されている間は青点灯で「受付中」を示す）
+  statusBootBlueStrong();
+  unsigned long t0 = millis();
+  while (digitalRead(USER_BUTTON_PIN) == LOW) {
+    if (millis() - t0 >= BOOT_TARE_RELEASE_TIMEOUT_MS) {
+      // 離されないままタイムアウト → ボタン固着の疑い。タレは実行しない。
+      statusErrorRed();
+      logEvent("TARE_STUCK", (int32_t)(millis() - t0));
+#if DEBUG_MODE
+      Serial.println("[TARE] タイムアウト: ボタンが離されません（固着の疑い）。タレを中止します。");
+      Serial.flush();
+#endif
+      delay(2000);   // 赤点灯を現場で視認できる時間だけ保持
+      rgbOff();
+      return;
+    }
+    delay(10);
+  }
+
+  delay(50);  // 離す際のチャタリングが収まるのを待つ
+
+#if DEBUG_MODE
+  Serial.println("[TARE] ボタンが離されました。タレを実行します。");
+  Serial.flush();
+#endif
+
+  performTare();
 }
 
 // 小さな配列のバブルソートで中央値（外れ値に強い簡易ロバスト化）を求める。
@@ -2020,13 +2063,15 @@ void setup() {
   pinMode(SW_POWER_PIN, OUTPUT);
   digitalWrite(SW_POWER_PIN, HIGH);  // 3V3_SW ON
 
-  // setup()/loop() を実行しているタスクのハンドルを保持しておく（deepSleep()の
-  // ulTaskNotifyTake()をボタンISRからvTaskNotifyGiveFromISR()で早期解除するため）。
-  s_loopTaskHandle = xTaskGetCurrentTaskHandle();
-
   pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
   pinMode(SPARE_GPIO_PIN,  INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(USER_BUTTON_PIN), btnISR, FALLING);
+
+  // 電源投入時にボタンが押されているかを、ここで1回だけ読み取る。
+  // 実際のタレ実行は各種初期化（Wire/TCA9534/タレオフセット復元）が済んだ後、
+  // 「ボタンが離されたこと」を確認してから行う（後述の handleBootTare()）。
+  // ※ 割り込み（attachInterrupt/GPIOTE）は使わない。スリープ電流が約14µA増えるため。
+  delay(20);  // チャタリング除去
+  s_bootButtonHeld = (digitalRead(USER_BUTTON_PIN) == LOW);
 
   statusBootBlueStrong();
   delay((unsigned long)BOOT_BLUE_MS);
@@ -2112,6 +2157,11 @@ void setup() {
 #endif
   printEventLog();
 
+  // 起動時にボタンが押されていたらタレを実行する（離されるのを待ってから実行）。
+  // loadTareOffsets() の後に置くこと（復元したオフセットを上書きする形になるため）。
+  // measureAll() の前に置くことで、直後の計測値に新しいタレが反映される。
+  handleBootTare();
+
   measureAll();
 
 #ifdef COMM_MODE_SIGFOX
@@ -2193,60 +2243,11 @@ void loop() {
     Serial.println("[TCA9534] re-init failed");
 #endif
   }
-  // ── ボタン処理（DEBUG_NO_SLEEP時 or スリープ中に押されてloop()到達時に処理）──
-  if (s_btnFlag) {
-    s_btnFlag = false;
-#if DEBUG_MODE
-    Serial.print("[BTN] ISRフラグ検出 t=");
-    Serial.print(millis());
-    Serial.println(" ms");
-#endif
-    delay(20);  // チャタリング除去
-    if (digitalRead(USER_BUTTON_PIN) == LOW) {
-      // ボタンがまだ押されている → 長押し判定
-      unsigned long pressStart = millis();
-      bool longPress = false;
-      while (digitalRead(USER_BUTTON_PIN) == LOW) {
-        if (millis() - pressStart >= BUTTON_LONG_PRESS_MS) {
-          longPress = true;
-          break;
-        }
-      }
-      unsigned long heldMs = millis() - pressStart;
-      if (longPress) {
-        s_pendingTare = true;
-#if DEBUG_MODE
-        Serial.print("[BTN] long press -> tare pending (held=");
-        Serial.print(heldMs);
-        Serial.println(" ms)");
-#endif
-      } else {
-        logEvent("RESET_SHORT", (int32_t)heldMs);
-#if DEBUG_MODE
-        Serial.print("[BTN] short press -> reset (held=");
-        Serial.print(heldMs);
-        Serial.println(" ms, ボタンが早期に離された可能性)");
-        Serial.flush();
-        delay(150);  // USB送信完了待ち（flush()だけではリセットで送信が打ち切られることがある）
-#endif
-        NVIC_SystemReset();
-      }
-    } else {
-      // ボタンはすでに離されている（計測中等に押されてloop()到達時に検知）→ 短押しとみなしてリセット
-      logEvent("RESET_SHORT", 0);
-#if DEBUG_MODE
-      Serial.println("[BTN] short press (released) -> reset（チャタリング除去20ms待機時点で既にHIGH）");
-      Serial.flush();
-      delay(150);  // USB送信完了待ち
-#endif
-      NVIC_SystemReset();
-    }
-  }
+  // ボタン処理は loop() では行わない。
+  // タレはボタンを押しながら電源ONする方式（setup() の handleBootTare()）に変更し、
+  // 短押しリセットは電源スイッチ(S1)で代替するため廃止した。
+  // これによりスリープ中の割り込み（GPIOTE）が不要になり、約14µA削減できる。
 
-  if (s_pendingTare) {
-    s_pendingTare = false;
-    performTare();
-  }
   measureAll();
 
 #ifdef COMM_MODE_SIGFOX
