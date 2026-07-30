@@ -127,7 +127,7 @@ static const uint8_t  FW_VERSION = 7;     // 子機ファームのバージョ�
 // アプリ設定（ここを主に編集する）
 // ============================================================
 
-#define DEBUG_MODE           1        // 1: USB Serial デバッグログ有効。本番は 0 ★ボタン誤作動調査のため一時的に1にしている
+#define DEBUG_MODE           0        // 1: USB Serial デバッグログ有効。本番は 0 ★ボタン誤作動調査のため一時的に1にしている
 #define DEBUG_NO_SLEEP       0        // 1: deepSleep をスキップして即 loop() に戻る（DEBUG_MODE 1 時のみ有効）
 #define DEBUG_NO_SIGFOX      0        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
 #define DEBUG_NO_LORA        0        // 1: LoRa送信を行わずログだけ出す
@@ -142,6 +142,13 @@ static const uint8_t  FW_VERSION = 7;     // 子機ファームのバージョ�
 // （WDT リセット等で頻繁に再起動しても時刻が巻き戻らないようにするため）。
 // 手動で時刻を指定したい場合は DS3231_FORCE_SET_TIME を 1 にする（使用後は 0 に戻すこと）。
 #define DS3231_FORCE_SET_TIME 0
+
+// DS3231が未実装・取り外し済みの基板で動作確認する場合は 0 にする。
+// 0 のとき: DS3231へのI2Cアクセス（時刻書き込み・温度読み取り・時刻読み取り）を一切行わず、
+//   ERR_DS3231_I2C も立てない（他のセンサ・送信処理がエラーでスキップされるのを防ぐ）。
+// 温度は0固定、時刻は取得不可（BLE/LoRaのタイムスタンプ・アドバタイズ時間窓判定は無効化される）。
+// 本番基板（DS3231実装済み）に戻す際は必ず 1 に戻すこと。
+#define DS3231_PRESENT 0
 
 // USE_DS3231_TIMESTAMP=1 にすると各サイクルで DS3231 の現在時刻を読み出し、
 // DEBUG_MODE=1 の場合はシリアルに出力する（BLE/LoRaモードではペイロードにも使用）。
@@ -268,8 +275,21 @@ static volatile bool s_btnFlag = false;
 // deepSleep() がタイマー満了前にボタン長押しで抜けたとき、次の loop() で tare を実行する
 static bool s_pendingTare = false;
 
+// setup()実行時のタスク（=loop()を回しているFreeRTOSタスク）のハンドル。
+// deepSleep()をFreeRTOSのulTaskNotifyTake()でブロッキング待機させ、
+// ボタンISRからvTaskNotifyGiveFromISR()で早期起床させるために使う。
+// 独自のRTC2 busy-loop(__WFI())ではFreeRTOSのTickless Idleが発動せず、
+// システムティックにより頻繁にCPUが起こされ続け、実測でスリープ電流が
+// 期待値（約150µA）の数十倍（実測約8〜10mA）になっていたことが判明したための対策。
+static TaskHandle_t s_loopTaskHandle = NULL;
+
 static void btnISR() {
   s_btnFlag = true;
+  if (s_loopTaskHandle != NULL) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    vTaskNotifyGiveFromISR(s_loopTaskHandle, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+  }
 }
 
 // ボタンイベント（タレ成功・短押しリセット等）をフラッシュへ記録する。定義は後方（DS3231関連の後）。
@@ -399,20 +419,15 @@ static void statusSigfoxBlinkTick() {
 }
 
 // ============================================================
-// スリープ（RTC2 + __WFI）
+// スリープ（FreeRTOS ulTaskNotifyTake ベース）
 //
-// RTC1 は FreeRTOS カーネル用のためアプリでは触らない。
-// 起床は RTC2 の COMPARE0 のみ使用。
+// 【経緯】以前は独自にRTC2レジスタを操作し while(!flag){__WFI();} で待機していたが、
+// この方式ではFreeRTOSのスケジューラから見てタスクが「実行中」のままになるため
+// Tickless Idle が発動せず、システムティック割り込みにより頻繁にCPUが起こされ
+// 続けていた。PPK2実測でスリープ電流が期待値（約150µA）に対し実測約8〜10mAと
+// 数十倍高くなっていることが判明したため、ulTaskNotifyTake() によるブロッキング
+// 待機に置き換えた（Tickless Idle が正しく発動し、CPUが低消費電力状態に入る）。
 // ============================================================
-
-// LFCLK を 32768Hz 名義としたとき: 32768 / (4095+1) = 8 → 1秒あたり 8 ティック
-#define RTC2_PRESCALER 4095U
-#define RTC2_TICKS_PER_SECOND 8U
-// nRF RTC カウンタは実質 24bit（下位のみ有効）
-#define RTC2_COUNTER_MASK 0x00FFFFFFU
-
-// COMPARE0 ISR からメインループ側へ「起床した」ことを伝えるフラグ
-static volatile bool s_rtc2Compare0Wake;
 
 #ifdef COMM_MODE_LORA
 // ★2026-07-24追加: 複数台のLoRa子機を同時展開する際、E220の透過モードには
@@ -439,18 +454,6 @@ static int32_t loraSleepJitterSeconds(uint16_t jitterMaxSec) {
 }
 #endif
 
-// RTC2 割り込み: 指定ティック経過でここが走り、待機ループを抜ける
-extern "C" void RTC2_IRQHandler(void) {
-  if (NRF_RTC2->EVENTS_COMPARE[0]) {
-    // nRF ではイベントレジスタは 0 書き込みでクリア。読み戻しは誤割り込み対策として推奨パターン
-    NRF_RTC2->EVENTS_COMPARE[0] = 0;
-    (void)NRF_RTC2->EVENTS_COMPARE[0];
-    NRF_RTC2->INTENCLR = RTC_INTENCLR_COMPARE0_Msk;
-    NRF_RTC2->TASKS_STOP = 1;
-    s_rtc2Compare0Wake = true;
-  }
-}
-
 // ============================================================
 // ウォッチドッグタイマー（nRF52840 内蔵 WDT）
 // 無人運用中にファーム（HX711/I2C 読み取り等）がハングした場合、
@@ -475,8 +478,9 @@ static inline void wdtFeed() {
   NRF_WDT->RR[0] = WDT_RR_RR_Reload;
 }
 
-// 周辺（Sigfox/LoRa・HX711 電源レール 3V3_SW）をオフにし、RTC2 で minutes 分待ってから復帰する。
-// 待機中は __WFI で CPU を止める（他割り込みで一時起床し得るが、フラグが立つまでループ継続）。
+// 周辺（Sigfox/LoRa・HX711 電源レール 3V3_SW）をオフにし、minutes 分だけ
+// ulTaskNotifyTake() でブロッキング待機してから復帰する（Tickless Idle 発動のため）。
+// ボタンISR（btnISR）からの vTaskNotifyGiveFromISR() により早期起床できる。
 static void deepSleep(uint32_t minutes) {
   wdtFeed();  // これから始まる長時間スリープ区間の給餌
 
@@ -495,6 +499,30 @@ static void deepSleep(uint32_t minutes) {
   // スリープ中は LED オフ（消費電流削減）
   rgbOff();
 
+#if !USE_WS2812_STATUS_LED
+  // rgbOff() は analogWrite(pin, 255) でLEDを消灯しているが、これはデューティ比を
+  // 255（消灯相当）に書き込むだけで、内部で使われるPWMペリフェラル自体は停止しない。
+  // PWMペリフェラルが動作し続けると、その動作クロックにより周期的にCPUが起こされ、
+  // スリープ電流が数百µA〜mAオーダーまで上昇してしまう（実測で確認済み）。
+  // スリープ前に明示的に停止する（次回analogWrite()呼び出し時に自動的に再初期化される）。
+  NRF_PWM0->TASKS_STOP = 1;
+  NRF_PWM0->ENABLE = 0;
+  NRF_PWM1->TASKS_STOP = 1;
+  NRF_PWM1->ENABLE = 0;
+  NRF_PWM2->TASKS_STOP = 1;
+  NRF_PWM2->ENABLE = 0;
+
+  // PWMペリフェラルを無効化するとピンの出力制御はGPIOに戻るが、GPIO出力レジスタは
+  // analogWrite()経由でしか触れておらず digitalWrite() で明示的に書いたことがないため、
+  // リセット時のデフォルト値（LOW）のままになる。アクティブLOWのLEDのため、これだと
+  // 点灯してしまう（R/G/B同時点灯で白っぽく見える）。ここで明示的にHIGH（消灯）に固定する。
+#ifdef LED_RED
+  pinMode(LED_RED,   OUTPUT); digitalWrite(LED_RED,   HIGH);
+  pinMode(LED_GREEN, OUTPUT); digitalWrite(LED_GREEN, HIGH);
+  pinMode(LED_BLUE,  OUTPUT); digitalWrite(LED_BLUE,  HIGH);
+#endif
+#endif
+
   // スリープ中は周辺 IC 用レールをオフ（消費電流削減。正本の 3V3_SW 節）
   digitalWrite(SW_POWER_PIN, LOW);
 #if defined(COMM_MODE_SIGFOX) || defined(COMM_MODE_LORA)
@@ -502,14 +530,7 @@ static void deepSleep(uint32_t minutes) {
   Serial1.end();
 #endif
 
-#if DEBUG_MODE
-  Serial.print("[RTC2 sleep] ");
-  Serial.print(minutes);
-  Serial.println(" min");
-  Serial.flush();
-#endif
-
-  // 0 分指定は誤設定扱いで最低 1 分（CC=0 即時一致を避ける意味もある）
+  // 0 分指定は誤設定扱いで最低 1 分
   if (minutes == 0U) {
     minutes = 1U;
   }
@@ -530,105 +551,71 @@ static void deepSleep(uint32_t minutes) {
 #endif
 #endif
 
-  // スリープ時間を RTC ティック数に変換（秒 → 8tick/秒）
-  uint64_t ticks64 =
-      (uint64_t)sleepSeconds * (uint64_t)RTC2_TICKS_PER_SECOND;
-  // 24bit カウンタを超える長さは切り詰め（最大約 24 日相当）
-  if (ticks64 > RTC2_COUNTER_MASK) {
-    ticks64 = RTC2_COUNTER_MASK;
-  }
-  if (ticks64 < 1ULL) {
-    ticks64 = 1ULL;
-  }
-  const uint32_t ticks = (uint32_t)ticks64;
+#if DEBUG_MODE
+  Serial.print("[Sleep] ");
+  Serial.print((long)sleepSeconds);
+  Serial.println(" sec");
+  Serial.flush();
+#endif
 
-  s_rtc2Compare0Wake = false;
+  uint32_t sleepMs = (uint32_t)(sleepSeconds * 1000LL);
 
-  // RTC2 を一度止めてクリアし、今回のスリープ長だけ CC[0] に設定して再スタート
-  NRF_RTC2->TASKS_STOP = 1;
-  NRF_RTC2->TASKS_CLEAR = 1;
-  NRF_RTC2->PRESCALER = RTC2_PRESCALER;
-  // 他イベントが有効でも今回は使わないので一括クリア（比較のみ使用）
-  NRF_RTC2->EVTENCLR = 0xFFFFFFFFU;
-
-  NRF_RTC2->EVENTS_COMPARE[0] = 0;
-  (void)NRF_RTC2->EVENTS_COMPARE[0];
-
-  // COUNTER が 0 から ticks に達したら COMPARE0 イベント
-  NRF_RTC2->CC[0] = ticks;
-  NRF_RTC2->INTENCLR = 0xFFFFFFFFU;
-  NRF_RTC2->INTENSET = RTC_INTENSET_COMPARE0_Msk;
-
-  // 優先度は FreeRTOS API を ISR から呼ばない前提でアプリ側に寄せる（数値はコアの他 IRQ とバランス要確認）
-  NVIC_SetPriority(RTC2_IRQn, 7);
-  NVIC_ClearPendingIRQ(RTC2_IRQn);
-  NVIC_EnableIRQ(RTC2_IRQn);
-
-  NRF_RTC2->TASKS_START = 1;
-
-  // 計測・送信フェーズ中に発生したボタン押下の残りフラグをここで破棄する。
-  // スリープ中（WFI ループ内）の押下のみを有効とする。
+  // 計測・送信フェーズ中に発生したボタン通知の残りをここで破棄する。
+  // スリープ中に届いた通知のみを有効とするため。
+  ulTaskNotifyTake(pdTRUE, 0);
   s_btnFlag = false;
 
-  while (!s_rtc2Compare0Wake) {
-    __DSB();
-    __WFI();
+  // sleepMs だけブロッキング待機。ボタンISRからの通知があれば即座に返る
+  // （戻り値が非0）。この間、FreeRTOSのTickless Idleにより実際にCPUが
+  // 低消費電力状態へ落ちる（独自WFI busy-loopでは発動しなかった問題の対策）。
+  uint32_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(sleepMs));
 
-    if (s_btnFlag) {
-      s_btnFlag = false;
-      delay(20); // チャタリング除去
-      if (digitalRead(USER_BUTTON_PIN) == LOW) {
-        // ボタンがまだ押されている → 長押し判定
-        // millis() は FreeRTOS tickless idle の影響を受けるため、
-        // すでに動作中の RTC2 カウンタで計時する（確実に 8tick/秒で進む）。
-        uint32_t startTick = NRF_RTC2->COUNTER;
-        const uint32_t longPressTicks =
-            (BUTTON_LONG_PRESS_MS / 1000UL) * RTC2_TICKS_PER_SECOND;
-        bool longPress = false;
-        while (digitalRead(USER_BUTTON_PIN) == LOW) {
-          uint32_t elapsed = (NRF_RTC2->COUNTER - startTick) & RTC2_COUNTER_MASK;
-          if (elapsed >= longPressTicks) {
-            longPress = true;
-            break;
-          }
-        }
-        if (longPress) {
-          // 長押し: tare フラグを立てて早期リターン（loop() で実行）
-          s_pendingTare = true;
-          NRF_RTC2->TASKS_STOP = 1;
-          NRF_RTC2->INTENCLR = 0xFFFFFFFFU;
-          NVIC_DisableIRQ(RTC2_IRQn);
-#if DEBUG_MODE
-          Serial.println("[BTN] long press -> tare pending");
-          Serial.flush();
-#endif
-          return;
-        } else {
-          // 短押し: ソフトウェアリセット
-          logEvent("RESET_SHORT", 0);
-#if DEBUG_MODE
-          Serial.println("[BTN] short press -> reset");
-          Serial.flush();
-          delay(150);  // USB送信完了待ち（flush()だけではリセットで送信が打ち切られることがある）
-#endif
-          NVIC_SystemReset();
-        }
-      } else {
-        // ボタンはすでに離されている → 短押しとみなしてリセット
-        logEvent("RESET_SHORT", 0);
-#if DEBUG_MODE
-        Serial.println("[BTN] short press (released) -> reset");
-        Serial.flush();
-        delay(150);  // USB送信完了待ち
-#endif
-        NVIC_SystemReset();
-      }
-    }
+  if (notified == 0) {
+    // タイムアウト（通常のスリープ満了）。何もせず呼び出し元へ戻る。
+    return;
   }
 
-  NVIC_DisableIRQ(RTC2_IRQn);
-  NRF_RTC2->INTENCLR = RTC_INTENCLR_COMPARE0_Msk;
-  NRF_RTC2->TASKS_STOP = 1;
+  // ボタン割り込みによる早期起床 → デバウンス・長押し判定
+  s_btnFlag = false;
+  delay(20);  // チャタリング除去
+  if (digitalRead(USER_BUTTON_PIN) == LOW) {
+    // ボタンがまだ押されている → 長押し判定
+    unsigned long pressStart = millis();
+    bool longPress = false;
+    while (digitalRead(USER_BUTTON_PIN) == LOW) {
+      if (millis() - pressStart >= BUTTON_LONG_PRESS_MS) {
+        longPress = true;
+        break;
+      }
+    }
+    if (longPress) {
+      // 長押し: tare フラグを立てて早期リターン（loop() で実行）
+      s_pendingTare = true;
+#if DEBUG_MODE
+      Serial.println("[BTN] long press -> tare pending");
+      Serial.flush();
+#endif
+      return;
+    } else {
+      // 短押し: ソフトウェアリセット
+      logEvent("RESET_SHORT", 0);
+#if DEBUG_MODE
+      Serial.println("[BTN] short press -> reset");
+      Serial.flush();
+      delay(150);  // USB送信完了待ち（flush()だけではリセットで送信が打ち切られることがある）
+#endif
+      NVIC_SystemReset();
+    }
+  } else {
+    // ボタンはすでに離されている → 短押しとみなしてリセット
+    logEvent("RESET_SHORT", 0);
+#if DEBUG_MODE
+    Serial.println("[BTN] short press (released) -> reset");
+    Serial.flush();
+    delay(150);  // USB送信完了待ち
+#endif
+    NVIC_SystemReset();
+  }
 }
 
 // ============================================================
@@ -1063,6 +1050,10 @@ static void getCompileTime(uint8_t &yr2, uint8_t &mo, uint8_t &day,
 
 // DS3231 から現在時刻を読み出す。成功時 true、I²C 失敗時 false
 static bool ds3231GetTime(Ds3231Time &t) {
+#if !DS3231_PRESENT
+  (void)t;
+  return false;  // DS3231未実装: I2Cアクセスせず即座に失敗を返す（呼び出し側は既存のフォールバック処理に従う）
+#endif
   Wire.beginTransmission(DS3231_ADDR);
   Wire.write(0x00);
   if (Wire.endTransmission(false) != 0) return false;
@@ -1190,6 +1181,9 @@ static void printEventLog() {
 // ============================================================
 
 static int measureTemp() {
+#if !DS3231_PRESENT
+  return 0;  // DS3231未実装: I2Cアクセスせずエラーも立てない
+#endif
   Wire.beginTransmission(DS3231_ADDR);
   Wire.write(0x11);  // temp MSB レジスタ
   if (Wire.endTransmission(false) != 0) {
@@ -1466,7 +1460,9 @@ static void measureAll() {
 #if DEBUG_MODE
       Serial.println("[DS3231] time read error");
 #endif
+#if DS3231_PRESENT
       s_errors |= ERR_DS3231_I2C;
+#endif
     }
   }
 #endif  // USE_DS3231_TIMESTAMP
@@ -2024,6 +2020,10 @@ void setup() {
   pinMode(SW_POWER_PIN, OUTPUT);
   digitalWrite(SW_POWER_PIN, HIGH);  // 3V3_SW ON
 
+  // setup()/loop() を実行しているタスクのハンドルを保持しておく（deepSleep()の
+  // ulTaskNotifyTake()をボタンISRからvTaskNotifyGiveFromISR()で早期解除するため）。
+  s_loopTaskHandle = xTaskGetCurrentTaskHandle();
+
   pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
   pinMode(SPARE_GPIO_PIN,  INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(USER_BUTTON_PIN), btnISR, FALLING);
@@ -2067,6 +2067,7 @@ void setup() {
   // 時刻が無効な場合）のみ、コンパイル時刻を自動書き込みする。
   // 時刻が有効な場合は上書きしない（WDT リセット等で頻繁に再起動しても
   // 時刻が巻き戻らないようにするため）。
+#if DS3231_PRESENT
   {
     bool needsSet = DS3231_FORCE_SET_TIME || ds3231OscillatorStopped();
     if (needsSet) {
@@ -2081,6 +2082,11 @@ void setup() {
       if (!ok) s_errors |= ERR_DS3231_I2C;
     }
   }
+#else
+#if DEBUG_MODE
+  Serial.println("[DS3231] DS3231_PRESENT=0 のためスキップ");
+#endif
+#endif  // DS3231_PRESENT
 
   if (!tca9534Configure()) {
     s_errors |= ERR_TCA9534_I2C;
