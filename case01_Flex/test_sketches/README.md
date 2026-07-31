@@ -23,6 +23,7 @@ v3.02基板の動作確認用。**必ずステップ順に実施すること。*
 | 15 | `15_mcp9600/` | MCP9600 熱電対アンプ I2C 動作確認（K型・SDA=D4・SCL=D5） | XIAOのみ、MCP9600モジュール接続 |
 | 16 | `16_ADS1115/` | ADS1115 I2C ADC 動作確認（PGA±2.048V・単端＋差動読み取り） | XIAOのみ、ADS1115モジュール接続 |
 | 17 | `17_sigfox_id/` | Sigfox（BRKLSM100）Device ID / PAC 取得（AT$I=10 / AT$I=11） | v3.03基板、Sigfoxモジュール実装済み |
+| 24 | `24_sleep_current_baseline/` | スリープ電流ベースライン測定（最小構成）。TEST_STAGE を 0→6 に上げて残存スパイクの原因を二分探索する | XIAOのみ、PPK2（USBは外して測定） |
 | 18 | `18_lora_child/` | LoRa（E220-900T22S(JP)）透過モード送信（子機役） | XIAOのみ、E220を直結（M0/M1はGND固定） |
 | 19 | `19_lora_parent/` | LoRa（E220-900T22S(JP)）透過モード受信（親機役）。18と対で使う | XIAOのみ、E220を直結（M0/M1はGND固定） |
 | 20 | `20_lora_config_read/` | E220 設定値readback（診断用。18/19の疎通不良時に使う） | XIAOのみ、E220を直結（M0/M1は一時的に3V3固定） |

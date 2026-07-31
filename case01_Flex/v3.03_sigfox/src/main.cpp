@@ -64,6 +64,9 @@ using namespace Adafruit_LittleFS_Namespace;
 #include <DallasTemperature.h>
 // USB CDC（Serial）。DEBUG_MODE 時のログ出力に使用
 #include <Adafruit_TinyUSB.h>
+// VL53L4CD（ToF距離センサ、I2C）。CH_ASSIGN[i]=4 のスロットで使用
+// stm32duino/STM32duino VL53L4CD（STマイクロエレクトロニクス公式ライブラリ）
+#include <vl53l4cd_class.h>
 // BLE モード時のみ使用
 #ifdef COMM_MODE_BLE
 #include <bluefruit.h>
@@ -152,7 +155,9 @@ static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のとき
 //   2 = TCA9546A 経由 I2C センサ（LSM6DS 等の加速度センサなど）
 //       ※ DS3231 はオンボード U7（0x68）と競合するため CH 接続不可
 //   3 = DS18B20（1-Wire 温度センサ）※ 外部プルアップ 4.7kΩ（3V3_SW → CH pin3）必要
-const uint8_t CH_ASSIGN[4] = {3, 3, 1, 1};
+//   4 = VL53L4CD（ToF距離センサ、I2C）※ I2Cモジュール（MPU6050等と同一配線）を使用。
+//       TCA9546A 経由でチャンネル分離するためアドレス競合なし
+const uint8_t CH_ASSIGN[4] = {1, 1, 1, 1};
 
 // ── ひずみ補正係数（キャリブレーション） ──────────────────────────
 //
@@ -220,6 +225,7 @@ enum : uint32_t {
   ERR_SIGFOX_AT = 1u << 3,
   ERR_TCA9534_I2C = 1u << 4,
   ERR_DS3231_I2C = 1u << 5,   // DS3231 I²C 通信失敗（温度・時刻読み出し／書き込み）
+  ERR_VL53L4CD_I2C = 1u << 6, // VL53L4CD 初期化／測距失敗
 };
 
 static uint32_t s_errors;
@@ -1204,6 +1210,64 @@ static int measureMPU() {
 }
 
 // ============================================================
+// VL53L4CD（I2C ToF距離センサ）— 距離[mm]をそのまま返す
+//
+// I2Cモジュール（MPU6050/LSM6DS と同一配線、TCA9546A 経由）を使用。
+// 想定測距レンジ: 500〜800mm程度（VL53L4CDの最大測距範囲 約1.3m 以内）。
+// 3V3_SW サイクルごとに電源が切れるため、毎サイクル begin()〜StartRanging() から実行する。
+// ============================================================
+
+static int measureVL53L4CD() {
+  // XSHUT（シャットダウン制御ピン）は未配線のため -1 を指定（制御しない）。
+  // 3V3_SW サイクルごとに電源が切れて毎回パワーオンリセットされるため問題ない。
+  VL53L4CD vl53(&Wire, -1);
+
+  if (vl53.begin() != 0 || vl53.InitSensor() != 0) {
+    s_errors |= ERR_VL53L4CD_I2C;
+    statusErrorRed();
+#if DEBUG_MODE
+    Serial.println("[VL53L4CD] init failed");
+#endif
+    return 0;
+  }
+
+  // タイミングバジェット100ms・連続測定間隔0（都度手動トリガー相当）。
+  // 500〜800mm程度の近距離であれば十分な精度が得られる設定。
+  vl53.VL53L4CD_SetRangeTiming(100, 0);
+  vl53.VL53L4CD_StartRanging();
+
+  uint8_t dataReady = 0;
+  unsigned long t0 = millis();
+  while (!dataReady) {
+    vl53.VL53L4CD_CheckForDataReady(&dataReady);
+    if (millis() - t0 > 1000) {
+      s_errors |= ERR_VL53L4CD_I2C;
+      statusErrorRed();
+#if DEBUG_MODE
+      Serial.println("[VL53L4CD] timeout waiting for data");
+#endif
+      vl53.VL53L4CD_StopRanging();
+      return 0;
+    }
+    delay(5);
+  }
+
+  VL53L4CD_Result_t results;
+  vl53.VL53L4CD_GetResult(&results);
+  vl53.VL53L4CD_ClearInterrupt();
+  vl53.VL53L4CD_StopRanging();
+
+#if DEBUG_MODE
+  Serial.print("[VL53L4CD] distance=");
+  Serial.print(results.distance_mm);
+  Serial.print("mm status=");
+  Serial.println(results.range_status);
+#endif
+
+  return (int)results.distance_mm;
+}
+
+// ============================================================
 // 1 サイクル分の計測結果（グローバル: Sigfox 組み立てで参照）
 // ============================================================
 
@@ -1275,6 +1339,16 @@ static void measureAll() {
         ch[i] = 0;
       } else {
         ch[i] = measureMPU();
+      }
+      tcaDisable();
+    } else if (CH_ASSIGN[i] == 4) {
+      // TCA9546A のチャネル i（0 origin）を選択して VL53L4CD を読む
+      if (tcaSelect((uint8_t)i) != 0) {
+        s_errors |= ERR_TCA_I2C;
+        statusErrorRed();
+        ch[i] = 0;
+      } else {
+        ch[i] = measureVL53L4CD();
       }
       tcaDisable();
     } else {
