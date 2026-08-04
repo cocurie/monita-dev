@@ -68,6 +68,11 @@ function testMailPermission() {
 
 const SPREADSHEET_ID = '12VfgxPoRmpr9tkI1myzvIgvjqcDxERkVcQxXWzvYr0I';
 
+// ★2026-08-04追加: リモートコマンド（resetなど）用のトークン。
+// GatewayファームのGW_CMD_TOKENと同じ値にすること。set_cmdの認証にのみ使う
+// （check_cmdはGateway自身からの定期ポーリングなので認証不要）。
+const CMD_TOKEN = 'monita-gw-cmd-2026';
+
 // アラート設定が始まる行番号（各デバイスシートの何行目から読むか）
 const ALERT_START_ROW = 3;
 
@@ -278,6 +283,48 @@ function getDeviceSheetNameByMac(ss, mac) {
 // ================================
 function doGet(e) {
   var p = e.parameter;
+
+  // ★2026-08-04追加: リモートコマンド機能（MQTT代替、HTTPSポーリング方式）
+  // ------------------------------------------------------------
+  // 背景: MQTT(EMQX)経由のリモートリセットを実装したが、SIM7080Gのこのファームウェアでは
+  // 内蔵MQTTクライアント(AT+SM*)・生ソケットへのTLS適用(AT+CASSLCFG)の両方が
+  // "operation not allowed"で機能しないことが実機検証で判明した。EMQXはTLS必須(8883番のみ)
+  // のため代替不可。既に安定動作しているGASのHTTPS経由でコマンドをポーリングする方式に
+  // 変更した（詳細はcase02_Gateway/firmware/gateway_v1.1のcheckRemoteCmd()参照）。
+  //
+  // action=check_cmd: Gatewayが定期的に呼び、保留中のコマンドがあれば返す（認証不要、
+  //   Gateway自身からの定期ポーリングのため）。★2026-08-04修正: 以前はここで即座に
+  //   Script Propertiesから削除していたが、GAS Web Appの302リダイレクトをGateway側で
+  //   自前で追いかける都合上、1段階目（このcheck_cmd）は成功しても2段階目
+  //   （リダイレクト先googleusercontent.comへの再接続）がまれに失敗することがあり、
+  //   その場合コマンドが「消費済みなのに実行されない」まま失われていた。
+  //   「読む」と「消費する」を分離し、Gatewayが実際に受け取れて実行する直前にだけ
+  //   action=ack_cmdで明示的に消費するようにした（失敗時は次サイクルで再送される）。
+  if (p.action === 'check_cmd') {
+    var deviceId = p.device_id || 'default';
+    var cmd = PropertiesService.getScriptProperties().getProperty('pending_cmd_' + deviceId) || '';
+    return ContentService.createTextOutput(cmd || 'none');
+  }
+
+  // action=ack_cmd: Gatewayがコマンドを実際に受け取り、実行する直前に呼ぶ。ここで初めて
+  // Script Propertiesから削除する（認証不要、Gateway自身からの呼び出しのため）。
+  if (p.action === 'ack_cmd') {
+    var deviceId = p.device_id || 'default';
+    PropertiesService.getScriptProperties().deleteProperty('pending_cmd_' + deviceId);
+    return ContentService.createTextOutput('ok');
+  }
+
+  // action=set_cmd: 管理者がブラウザ等からURLを叩いてコマンドを予約する（token認証必須）。
+  // 例: .../exec?action=set_cmd&device_id=gateway_v11_test&cmd=reset&token=...
+  if (p.action === 'set_cmd') {
+    if (String(p.token || '') !== CMD_TOKEN) {
+      return ContentService.createTextOutput('unauthorized');
+    }
+    var deviceId = p.device_id || 'default';
+    var cmd = p.cmd || '';
+    PropertiesService.getScriptProperties().setProperty('pending_cmd_' + deviceId, cmd);
+    return ContentService.createTextOutput('ok: queued "' + cmd + '" for device_id=' + deviceId);
+  }
 
   // ★2026-07-25: 起動確認のinfo行もdataboxシートに記録するようにした（以前はログのみ）。
   // MACが実機アドレスでなくデバイス紐付けができないため、MAC/DeviceID/CH等は空欄にし、

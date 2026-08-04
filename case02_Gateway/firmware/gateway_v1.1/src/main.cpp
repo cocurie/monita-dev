@@ -73,6 +73,10 @@
 #include <SD.h>
 #include <SPI.h>
 
+#ifdef MQTT_CMD_ENABLED
+#include "../certs/emqxsl_ca_cert.h"
+#endif
+
 // ══════════════════════════════════════════════
 // シリアルログの二重化（USB Serial + SDカード）
 // ══════════════════════════════════════════════
@@ -128,7 +132,7 @@ void gLogPeriodicCommit() {
 // ══════════════════════════════════════════════
 
 // GAS スクリプトID（デプロイURLの "AKfycb..." 部分）
-const char* GAS_SCRIPT_ID = "AKfycbxt3oOSeaB88Ow2duUpeN3VIG4WqGtakJkUwAFrrH1V9PQf3C7gqj1FE09Fm4Uk45k3/exec";
+const char* GAS_SCRIPT_ID = "AKfycbzKVvW6vEUvJ28c_xJbHoS2ulvHiPD4OsNONdrTrf6u4kLebl4G7ADI6-YsAFSy2BBB/exec";
 
 // LTE-M送信のON/OFF切替（★2026-07-23追加）
 // false にすると SIM7080G の初期化・ネットワーク接続・GAS送信を一切行わず、
@@ -196,7 +200,7 @@ static uint8_t  const EXPECTED_PKT_TYPE  = 0x04;             // Flex v3.10 LoRa 
 
 // GAS 送信インターバル。LoRaビルドではコントローラーからBLE経由で変更可能（内蔵フラッシュに保存し
 // 再起動後も維持）。BLEビルドではこの既定値のまま（変更手段なし）。
-static uint32_t const SEND_INTERVAL_DEFAULT_MS = 300000;  // 既定 5 分
+static uint32_t const SEND_INTERVAL_DEFAULT_MS = 60000;  // 既定 5 分
 static uint32_t       sendIntervalMs           = SEND_INTERVAL_DEFAULT_MS;  // 実行時可変
 
 // Pkt type と併せて二重チェックする Device ID ホワイトリスト（BLE/LoRa共通）
@@ -208,7 +212,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 34;
+static uint8_t  const GATEWAY_FW_VERSION = 68;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -830,6 +834,179 @@ bool postToGAS(String queryParams) {
 }
 
 // ══════════════════════════════════════════════
+// リモートコマンド確認（HTTPS/GAS経由でポーリング、★2026-08-04追加）
+// ══════════════════════════════════════════════
+// MQTT(EMQX)経由のリモートリセットを実装したが、SIM7080Gのこのファームウェアでは
+// 内蔵MQTTクライアント(AT+SM*)・生ソケットへのTLS適用(AT+CASSLCFG)の両方が
+// "operation not allowed"で機能しないことが実機検証で判明した。EMQXはTLS必須(8883番のみ)
+// のため代替不可。既に安定動作しているGASのHTTPS経由（AT+SHREQ/SHREAD）でコマンドを
+// ポーリングする方式に変更した。GAS側の対応はcase02_Gateway/gas/project07_nexco/Code.gs
+// のdoGet()内 action=check_cmd / action=set_cmd を参照。
+static char const* GW_DEVICE_ID = "gateway_v11_test";
+
+// ★2026-08-04: 通常のsendAT()は応答に"OK\r\n"が現れた時点で早期終了する（AT応答の高速化のため）。
+// これはATコマンドの応答には向いているが、HTML本文のような自由文には向かない。
+// 本文中にたまたま"OK"という文字列が含まれると、そこで読み込みを打ち切ってしまい、
+// 本来もっと長いはずのレスポンスが途中で切れてしまう不具合があった（GASの302リダイレクト
+// ページ本文を読もうとした際に発生）。固定時間分は必ず読み切る専用の関数で対応する。
+static String sendATFull(String cmd, int waitMs) {
+  Serial1.print(cmd); Serial1.print("\r\n");
+  String res = "";
+  long start = millis();
+  while (millis() - start < waitMs) {
+    wdtFeed();
+    while (Serial1.available()) res += (char)Serial1.read();
+    yield();
+  }
+  return res;
+}
+
+// SHREADの応答（"+SHREAD: <長さ>\r\n<本文>\r\n\r\nOK"）から本文部分だけを取り出す
+static String extractShreadBody(const String& raw) {
+  int bi = raw.indexOf("+SHREAD: ");
+  if (bi < 0) return "";
+  int nlAfterLen = raw.indexOf('\n', bi);
+  if (nlAfterLen < 0) return "";
+  return raw.substring(nlAfterLen + 1);
+}
+
+// AT+SHREQの応答 "+SHREQ: <type string>,<StatusCode>,<DataLen>" からステータスコードと
+// データ長を取り出す。★2026-08-04: AT+SHREADは実際のデータ量より大きい<datalen>を
+// 指定するとERRORになる（マニュアル記載）ため、事前にここでDataLenを把握しておく必要がある。
+static void parseShreqResult(const String& result, int* outStatusCode, int* outDataLen) {
+  *outStatusCode = 0;
+  *outDataLen = 0;
+  int si = result.indexOf("+SHREQ: ");
+  if (si < 0) return;
+  String s = result.substring(si + 8);
+  int c1 = s.indexOf(",");
+  int c2 = s.indexOf(",", c1 + 1);
+  if (c1 < 0 || c2 < c1) return;
+  *outStatusCode = s.substring(c1 + 1, c2).toInt();
+  int c3 = c2 + 1;
+  while (c3 < (int)s.length() && isDigit(s[c3])) c3++;
+  *outDataLen = s.substring(c2 + 1, c3).toInt();
+}
+
+void checkRemoteCmd() {
+  if (!gasConnect()) return;
+
+  String path = "/macros/s/";
+  path += GAS_SCRIPT_ID;
+  path += "?action=check_cmd&device_id=";
+  path += GW_DEVICE_ID;
+
+  String result = sendAT("AT+SHREQ=\"" + path + "\",1", 30000, "+SHREQ:");
+  int statusCode = 0, dataLen = 0;
+  parseShreqResult(result, &statusCode, &dataLen);
+
+  if (statusCode != 200 && statusCode != 302) {
+    Serial.print(F("✗ [CMD] 確認失敗 ステータスコード=")); Serial.println(statusCode);
+    gasDisconnect();
+    return;
+  }
+  if (dataLen <= 0) {
+    Serial.println(F("✗ [CMD] 応答データ長が不正"));
+    gasDisconnect();
+    return;
+  }
+
+  String cmd;
+
+  if (statusCode == 302) {
+    // ★2026-08-04: GAS Web AppのdoGet()は必ず一度302で
+    // script.googleusercontent.com/macros/echo?... へリダイレクトされ、実際の応答本文は
+    // そちらにある。SIM7080GのAT+SHREQは3xxを自動で追わないため、リダイレクト先を
+    // HTML本文中の <A HREF="..."> から自前で取り出し、その先へ改めてGETする。
+    // ★AT+SHREADは実際のデータ量より大きい<datalen>を指定するとERRORになるため、
+    // SHREQの応答に含まれるDataLenを正確に使う。
+    String redirectBody = sendATFull("AT+SHREAD=0," + String(dataLen), 3000);
+    gasDisconnect();
+
+    String html = extractShreadBody(redirectBody);
+    int hi = html.indexOf("HREF=\"");
+    if (hi < 0) {
+      Serial.println(F("✗ [CMD] リダイレクト先URLが見つからない"));
+      return;
+    }
+    hi += 6;
+    int hEnd = html.indexOf("\"", hi);
+    if (hEnd < 0) {
+      Serial.println(F("✗ [CMD] リダイレクト先URLの終端が見つからない"));
+      return;
+    }
+    String redirectUrl = html.substring(hi, hEnd);
+    redirectUrl.replace("&amp;", "&");
+
+    // "https://script.googleusercontent.com" + "/macros/echo?..." に分解する
+    int hostStart = redirectUrl.indexOf("://") + 3;
+    int pathStart = redirectUrl.indexOf("/", hostStart);
+    if (pathStart < 0) {
+      Serial.println(F("✗ [CMD] リダイレクト先URLの形式が不正"));
+      return;
+    }
+    String redirectHost = redirectUrl.substring(hostStart, pathStart);
+    String redirectPath = redirectUrl.substring(pathStart);
+
+    // リダイレクト先ホストへ改めて接続する（GAS用(script.google.com)とはSNI/接続先が異なる）
+    sendAT("AT+CSSLCFG=\"ignorertctime\",1,1", 200);
+    sendAT("AT+CSSLCFG=\"sslversion\",1,3", 200);
+    sendAT("AT+CSSLCFG=\"sni\",1,\"" + redirectHost + "\"", 200);
+    sendAT("AT+SHSSL=1,\"\"", 200);
+    sendAT("AT+SHCONF=\"URL\",\"https://" + redirectHost + "\"", 200);
+
+    String conn2 = sendAT("AT+SHCONN", 15000);
+    if (conn2.indexOf("OK") < 0) {
+      Serial.println(F("✗ [CMD] リダイレクト先への接続に失敗"));
+      return;
+    }
+
+    String result2 = sendAT("AT+SHREQ=\"" + redirectPath + "\",1", 30000, "+SHREQ:");
+    int statusCode2 = 0, dataLen2 = 0;
+    parseShreqResult(result2, &statusCode2, &dataLen2);
+    if (statusCode2 != 200 || dataLen2 <= 0) {
+      Serial.print(F("✗ [CMD] リダイレクト先の応答が異常 ステータスコード="));
+      Serial.println(statusCode2);
+      gasDisconnect();
+      return;
+    }
+
+    String body2 = sendATFull("AT+SHREAD=0," + String(dataLen2), 3000);
+    gasDisconnect();
+    cmd = extractShreadBody(body2);
+  } else {
+    // 200が直接返ってきた場合（リダイレクトを挟まない場合）はそのまま本文を読む
+    String body = sendATFull("AT+SHREAD=0," + String(dataLen), 3000);
+    gasDisconnect();
+    cmd = extractShreadBody(body);
+  }
+
+  cmd.trim();
+
+  if (cmd.length() == 0 || cmd == "none") {
+    Serial.println(F("[CMD] 保留コマンドなし"));
+    return;
+  }
+
+  Serial.print(F("[CMD] 受信: ")); Serial.println(cmd);
+
+  // ★2026-08-04: ここまで到達できた（=コマンドを正しく受け取れた）ことが確定してから、
+  // 初めてGAS側に消費済みを通知する（ack_cmd）。リダイレクト追跡の失敗等で途中で
+  // return してしまった場合はack_cmdを呼ばないので、次サイクルで再送される。
+  String ackPath = "action=ack_cmd&device_id=";
+  ackPath += GW_DEVICE_ID;
+  postToGAS(ackPath);
+
+  if (cmd == "reset") {
+    Serial.println(F("[CMD] resetコマンドを受信。再起動します..."));
+    delay(200);
+    NVIC_SystemReset();
+  } else {
+    Serial.println(F("  （未対応のコマンドのため無視）"));
+  }
+}
+
+// ══════════════════════════════════════════════
 // SD カード操作
 // ══════════════════════════════════════════════
 static bool sdAvailable = false;
@@ -1333,6 +1510,459 @@ bool ensureNetworkReady() {
   Serial.println(F("⚠ ネットワーク切断を検知。再接続を試みます..."));
   return initNetwork();
 }
+
+#ifdef MQTT_CMD_ENABLED
+// ══════════════════════════════════════════════
+// MQTT経由のリモートコマンド受信（★2026-08-03追加、テスト段階）
+// ══════════════════════════════════════════════
+// SIM7080G内蔵MQTTクライアント（AT+SM*系コマンド）でEMQXブローカーに接続し、
+// cmdトピックを購読してコマンドを受け取る。既存の5分おきの送信サイクルに
+// 相乗りさせる形（毎回、短時間だけMQTT接続→cmd確認→切断）で、常時接続は行わない。
+// 今はペイロードが"reset"のときだけ対応（NVIC_SystemResetで再起動）。
+//
+// 接続情報は現状テスト用の共有アカウント（device_user）を使用。本運用時は
+// Gateway専用のEMQXユーザーを発行し、ここを差し替えること。
+//
+// ★2026-08-04: test.mosquitto.org:1883（平文）で自前MQTT実装（CONNECT/SUBSCRIBE/
+// PUBLISH受信）の正しさを検証済み。TLS対応も完了したので、本来の接続先であるEMQX（8883、
+// TLS必須）に戻す。切り分け用に平文ブローカーへ戻したい場合はここを1にする。
+#define MQTT_USE_PLAIN_TEST_BROKER 0
+
+#if MQTT_USE_PLAIN_TEST_BROKER
+static char const* MQTT_HOST      = "test.mosquitto.org";
+static int  const  MQTT_PORT      = 1883;
+static char const* MQTT_USERNAME  = "";   // 空文字なら認証情報を送らない
+static char const* MQTT_PASSWORD  = "";
+static char const* MQTT_CMD_TOPIC = "monita/gw/test/cmd";  // 公開ブローカー上の検証用トピック
+#else
+static char const* MQTT_HOST      = "l7921bd0.ala.asia-southeast1.emqxsl.com";
+static int  const  MQTT_PORT      = 8883;
+static char const* MQTT_USERNAME  = "device_user";
+static char const* MQTT_PASSWORD  = "123456789";
+static char const* MQTT_CMD_TOPIC = "v1/device_user/cmd";
+#endif
+// CLEANSS=0（永続セッション）でオフライン中に届いたコマンドも取りこぼさないようにするため、
+// 毎回同じClientIDで接続する必要がある（ClientIDが変わるとブローカー側で別セッション扱いになる）。
+static char const* MQTT_CLIENT_ID = "monita_gw_v11_test";
+
+// ★2026-08-04: モジュール内蔵MQTTスタック（AT+SM*系）は、このモジュール
+// （1951B17SIM7080 / SIM7080G_P1.03_20210823）では動作しないことを実機で確認済み。
+// 設定値の格納・PDP有効・セッション無し・TLS無し・公開ブローカー・認証無し・HTTP未使用と
+// あらゆる条件を潰してもAT+SMCONNが数秒かけて "+CME ERROR: operation not allowed" を返す一方、
+// 同じホスト・同じポートへの生TCP接続（AT+CAOPEN）は1秒未満で成功する（+CAOPEN: 0,0）。
+// そのため、生TCPソケットの上にMQTTプロトコルを自前で実装する方式に切り替えた。
+//
+// 実装しているのはMQTT 3.1.1のうち本用途に必要な最小限:
+//   CONNECT / CONNACK / SUBSCRIBE / SUBACK / PUBLISH(受信) / PINGREQ / DISCONNECT
+// QoSは0のみ（コマンド受信用途では再送より単純さを優先。取りこぼしは次サイクルで拾える）。
+
+// 生TCPソケットのID（AT+CACIDで選択する識別子）
+static int const MQTT_TCP_CID = 0;
+
+// ── MQTTパケット組み立てのヘルパ ──
+
+// 残り長（Remaining Length）を可変長バイト列でバッファへ書く。MQTTの可変長整数形式。
+static int mqttWriteRemainingLength(uint8_t* buf, int len) {
+  int i = 0;
+  do {
+    uint8_t b = len % 128;
+    len /= 128;
+    if (len > 0) b |= 0x80;
+    buf[i++] = b;
+  } while (len > 0);
+  return i;
+}
+
+// UTF-8文字列を「2バイトの長さ + 本体」の形式でバッファへ書く（MQTTの文字列表現）
+static int mqttWriteString(uint8_t* buf, const char* str) {
+  int len = strlen(str);
+  buf[0] = (uint8_t)(len >> 8);
+  buf[1] = (uint8_t)(len & 0xFF);
+  memcpy(buf + 2, str, len);
+  return len + 2;
+}
+
+// 生TCPソケットへ任意のバイト列を送信する（AT+CASEND）
+static bool mqttTcpSend(const uint8_t* data, int len) {
+  char cmd[48];
+  snprintf(cmd, sizeof(cmd), "AT+CASEND=%d,%d,5000", MQTT_TCP_CID, len);
+  Serial1.print(cmd); Serial1.print("\r\n");
+
+  // ">" プロンプトを待ってからデータ本体を送る
+  String res = "";
+  long start = millis();
+  while (millis() - start < 5000) {
+    wdtFeed();
+    while (Serial1.available()) res += (char)Serial1.read();
+    if (res.indexOf(">") >= 0) break;
+    yield();
+  }
+  if (res.indexOf(">") < 0) {
+    Serial.println(F("✗ [MQTT] CASEND: 入力プロンプトが返らない"));
+    return false;
+  }
+
+  Serial1.write(data, len);
+
+  res = "";
+  start = millis();
+  while (millis() - start < 5000) {
+    wdtFeed();
+    while (Serial1.available()) res += (char)Serial1.read();
+    if (res.indexOf("OK") >= 0 || res.indexOf("ERROR") >= 0) break;
+    yield();
+  }
+  return res.indexOf("OK") >= 0;
+}
+
+// AT+CARECVを1回だけ発行し、その時点でバッファにあるデータを取り出す（無ければ即0で返る）。
+// 応答は "+CARECV: <長さ>,<データ>" の形式で、データ部はバイナリのまま返る。
+static int mqttTcpRecvOnce(uint8_t* outBuf, int maxLen) {
+  char cmd[32];
+  snprintf(cmd, sizeof(cmd), "AT+CARECV=%d,%d", MQTT_TCP_CID, maxLen);
+  Serial1.print(cmd); Serial1.print("\r\n");
+
+  // 応答をバイト列として受け取る（バイナリを含むためStringではなく生バッファで扱う）
+  static uint8_t raw[600];
+  int rawLen = 0;
+  long start = millis();
+  bool sawTerminator = false;
+  while (millis() - start < 3000) {
+    wdtFeed();
+    while (Serial1.available() && rawLen < (int)sizeof(raw)) {
+      raw[rawLen++] = (uint8_t)Serial1.read();
+    }
+    // 末尾に "OK\r\n" か "ERROR" が来たら受信完了とみなす
+    if (rawLen >= 4) {
+      for (int i = 0; i <= rawLen - 4; i++) {
+        if (raw[i] == 'O' && raw[i+1] == 'K' && raw[i+2] == '\r' && raw[i+3] == '\n') { sawTerminator = true; break; }
+      }
+    }
+    if (sawTerminator) break;
+    yield();
+  }
+  if (rawLen == 0) return 0;
+
+  // "+CARECV: " を探し、その後ろの "<長さ>," を読んでデータ開始位置を求める
+  int hdr = -1;
+  for (int i = 0; i <= rawLen - 9; i++) {
+    if (memcmp(raw + i, "+CARECV: ", 9) == 0) { hdr = i + 9; break; }
+  }
+  if (hdr < 0) return 0;
+
+  int recvLen = 0;
+  int p = hdr;
+  while (p < rawLen && raw[p] >= '0' && raw[p] <= '9') {
+    recvLen = recvLen * 10 + (raw[p] - '0');
+    p++;
+  }
+  if (p >= rawLen || raw[p] != ',') return 0;
+  p++;  // カンマの次がデータ本体
+
+  if (recvLen <= 0) return 0;
+  if (recvLen > maxLen) recvLen = maxLen;
+  if (p + recvLen > rawLen) recvLen = rawLen - p;  // 取りこぼし時は取れた分だけ
+
+  memcpy(outBuf, raw + p, recvLen);
+  return recvLen;
+}
+
+// ★2026-08-04修正: AT+CARECVは「その時点でバッファにあるデータ」を即座に返すだけで、
+// データが届くまで待ってはくれない（ブローカー側の応答はネットワーク越しに数百ms〜数秒
+// かかるため、送信直後に1回呼ぶだけでは常に「受信0バイト」になっていた）。
+// 到着まで一定間隔でCARECVを再発行するポーリングループでラップする。
+static int mqttTcpRecv(uint8_t* outBuf, int maxLen, int waitMs) {
+  long start = millis();
+  while (millis() - start < waitMs) {
+    wdtFeed();
+    int n = mqttTcpRecvOnce(outBuf, maxLen);
+    if (n > 0) return n;
+    delay(300);
+  }
+  return 0;
+}
+
+// MQTT CONNECTパケットを送り、CONNACKで接続が受理されたかを確認する
+static bool mqttSendConnect() {
+  uint8_t pkt[256];
+  uint8_t payload[200];
+  int pl = 0;
+
+  // 可変ヘッダ: プロトコル名"MQTT" + レベル4(3.1.1) + 接続フラグ + KeepAlive
+  pl += mqttWriteString(payload + pl, "MQTT");
+  payload[pl++] = 0x04;  // Protocol Level 4 = MQTT 3.1.1
+
+  // 接続フラグ: CleanSession(0x02) + UserName(0x80) + Password(0x40)
+  uint8_t flags = 0x02;
+  bool useAuth = (strlen(MQTT_USERNAME) > 0);
+  if (useAuth) flags |= 0x80 | 0x40;
+  payload[pl++] = flags;
+
+  payload[pl++] = 0x00; payload[pl++] = 0x3C;  // KeepAlive = 60秒
+
+  // ペイロード: ClientID [+ UserName + Password]
+  pl += mqttWriteString(payload + pl, MQTT_CLIENT_ID);
+  if (useAuth) {
+    pl += mqttWriteString(payload + pl, MQTT_USERNAME);
+    pl += mqttWriteString(payload + pl, MQTT_PASSWORD);
+  }
+
+  int i = 0;
+  pkt[i++] = 0x10;  // CONNECT
+  i += mqttWriteRemainingLength(pkt + i, pl);
+  memcpy(pkt + i, payload, pl);
+  i += pl;
+
+  if (!mqttTcpSend(pkt, i)) return false;
+
+  uint8_t resp[16];
+  int n = mqttTcpRecv(resp, sizeof(resp), 10000);
+  if (n < 4 || resp[0] != 0x20) {
+    Serial.print(F("✗ [MQTT] CONNACKが返らない（受信"));
+    Serial.print(n); Serial.println(F("バイト）"));
+    return false;
+  }
+  // CONNACKの4バイト目が接続結果コード（0=受理）
+  if (resp[3] != 0x00) {
+    Serial.print(F("✗ [MQTT] ブローカーが接続を拒否 コード="));
+    Serial.println(resp[3]);
+    // 1=プロトコル版不可, 2=ClientID不可, 3=サーバ利用不可, 4=認証情報不正, 5=認可されていない
+    return false;
+  }
+  return true;
+}
+
+// 指定トピックをQoS0で購読する
+static bool mqttSendSubscribe(const char* topic) {
+  uint8_t pkt[192];
+  uint8_t payload[160];
+  int pl = 0;
+
+  payload[pl++] = 0x00; payload[pl++] = 0x01;  // Packet Identifier = 1
+  pl += mqttWriteString(payload + pl, topic);
+  payload[pl++] = 0x00;  // 要求QoS = 0
+
+  int i = 0;
+  pkt[i++] = 0x82;  // SUBSCRIBE（下位ビット0010は仕様で固定）
+  i += mqttWriteRemainingLength(pkt + i, pl);
+  memcpy(pkt + i, payload, pl);
+  i += pl;
+
+  if (!mqttTcpSend(pkt, i)) return false;
+
+  uint8_t resp[16];
+  int n = mqttTcpRecv(resp, sizeof(resp), 10000);
+  if (n < 4 || resp[0] != 0x90) {
+    Serial.println(F("✗ [MQTT] SUBACKが返らない"));
+    return false;
+  }
+  if (resp[4] == 0x80) {
+    Serial.println(F("✗ [MQTT] 購読が拒否された（ACLの権限を確認）"));
+    return false;
+  }
+  return true;
+}
+
+// 受信したPUBLISHパケットからペイロード（本文）を取り出す。
+// 取り出せた場合は true を返し、outPayload に文字列として格納する。
+static bool mqttParsePublish(const uint8_t* buf, int len, String& outPayload) {
+  if (len < 2 || (buf[0] & 0xF0) != 0x30) return false;  // 0x30 = PUBLISH
+
+  // 残り長（可変長整数）を読む
+  int p = 1;
+  int multiplier = 1;
+  int remainingLen = 0;
+  while (p < len) {
+    uint8_t b = buf[p++];
+    remainingLen += (b & 0x7F) * multiplier;
+    if ((b & 0x80) == 0) break;
+    multiplier *= 128;
+  }
+
+  if (p + 2 > len) return false;
+  int topicLen = (buf[p] << 8) | buf[p + 1];
+  p += 2 + topicLen;  // トピック名を読み飛ばす（QoS0なのでPacket Identifierは無い）
+  if (p > len) return false;
+
+  int payloadLen = remainingLen - (2 + topicLen);
+  if (payloadLen <= 0 || p + payloadLen > len) return false;
+
+  outPayload = "";
+  for (int i = 0; i < payloadLen; i++) outPayload += (char)buf[p + i];
+  return true;
+}
+
+#if !MQTT_USE_PLAIN_TEST_BROKER
+static bool s_mqttCaCertWritten = false;
+
+// EMQX用CA証明書（emqxsl_ca_cert.h、公開情報）をSIM7080Gのファイルシステムに書き込み、
+// SSL用形式に変換する。モジュール内蔵フラッシュに残るため、電源投入後1回だけでよい。
+static bool mqttWriteCaCert() {
+  if (s_mqttCaCertWritten) return true;
+
+  size_t certLen = strlen(EMQXSL_CA_CERT);
+
+  sendAT("AT+CFSINIT", 3000);
+
+  char cmd[64];
+  snprintf(cmd, sizeof(cmd), "AT+CFSWFILE=3,\"ca.crt\",0,%u,10000", (unsigned)certLen);
+  Serial1.print(cmd); Serial1.print("\r\n");
+
+  // "DOWNLOAD" プロンプトを待ってから、証明書本体を生データで送る
+  String res = "";
+  long start = millis();
+  while (millis() - start < 3000) {
+    wdtFeed();
+    while (Serial1.available()) res += (char)Serial1.read();
+    if (res.indexOf("DOWNLOAD") >= 0) break;
+    yield();
+  }
+  if (res.indexOf("DOWNLOAD") < 0) {
+    Serial.println(F("✗ [MQTT] CA証明書書き込み: DOWNLOADプロンプト待ちタイムアウト"));
+    sendAT("AT+CFSTERM", 3000);
+    return false;
+  }
+
+  Serial1.write((const uint8_t*)EMQXSL_CA_CERT, certLen);
+
+  res = "";
+  start = millis();
+  while (millis() - start < 5000) {
+    wdtFeed();
+    while (Serial1.available()) res += (char)Serial1.read();
+    if (res.indexOf("OK") >= 0) break;
+    yield();
+  }
+  if (res.indexOf("OK") < 0) {
+    Serial.println(F("✗ [MQTT] CA証明書の書き込みに失敗"));
+    sendAT("AT+CFSTERM", 3000);
+    return false;
+  }
+
+  // CFSTERM（フラッシュバッファ解放＝ファイル確定）を先に行ってから CONVERT する
+  sendAT("AT+CFSTERM", 3000);
+  sendAT("AT+CSSLCFG=\"CONVERT\",2,\"ca.crt\"", 5000);
+
+  s_mqttCaCertWritten = true;
+  Serial.println(F("✓ [MQTT] CA証明書をモジュールへ書き込み完了"));
+  return true;
+}
+
+// 生TCPソケット（AT+CACID/CAOPEN経由）にTLSを適用する設定を行う。
+// SSLコンテキストはctxindex=2を使う（GAS用HTTPS(ctxindex=1)とはSNIが異なるため分離必須。
+// 詳細はmqttCheckAndHandleCmd()導入時のコメント参照）。
+static bool mqttSetupTls() {
+  if (!mqttWriteCaCert()) return false;
+
+  sendAT("AT+CMEE=2", 3000);  // 詳細なエラーコードを返すようにする（デバッグ用）
+  sendAT("AT+CSSLCFG=\"sslversion\",2,3", 3000);       // TLS1.2
+  sendAT("AT+CSSLCFG=\"ignorertctime\",2,1", 3000);    // RTC未同期でも証明書の期限切れ扱いにしない
+  sendAT("AT+CSSLCFG=\"sni\",2,\"" + String(MQTT_HOST) + "\"", 3000);
+
+  // ★2026-08-04: AT+CACIDは「既に選択済みの値と同じcidを再度書き込む」とERRORになることを確認した
+  // （実機で AT+CACID? が "+CACID: 0" を返しているのに AT+CACID=0 がERRORになる事象）。
+  // 既定でcid=0が選択されているため、目的のcidと異なる場合のみ書き込む。
+  String curCid = sendAT("AT+CACID?", 3000);
+  Serial.print(F("[MQTT-DBG] CACID?: ")); Serial.println(curCid);
+  if (curCid.indexOf("+CACID: " + String(MQTT_TCP_CID)) < 0) {
+    Serial.print(F("[MQTT-DBG] CACID=: ")); Serial.println(sendAT("AT+CACID=" + String(MQTT_TCP_CID), 3000));
+  }
+
+  Serial.print(F("[MQTT-DBG] CASSLCFG=?: ")); Serial.println(sendAT("AT+CASSLCFG=?", 3000));
+  Serial.print(F("[MQTT-DBG] CASSLCFG?(前): ")); Serial.println(sendAT("AT+CASSLCFG?", 3000));
+
+  // ★2026-08-04: CACERT/CRINDEXがERRORになる事象の切り分けのため、先にSSLを有効化してから
+  // CACERT/CRINDEXを設定する順序に変更して試す。
+  Serial.print(F("[MQTT-DBG] SSL: ")); Serial.println(sendAT("AT+CASSLCFG=" + String(MQTT_TCP_CID) + ",\"SSL\",1", 3000));
+  Serial.print(F("[MQTT-DBG] CACERT: ")); Serial.println(sendAT("AT+CASSLCFG=" + String(MQTT_TCP_CID) + ",\"CACERT\",\"ca.crt\"", 3000));
+  String res = sendAT("AT+CASSLCFG=" + String(MQTT_TCP_CID) + ",\"CRINDEX\",2", 3000);
+  Serial.print(F("[MQTT-DBG] CRINDEX: ")); Serial.println(res);
+
+  Serial.print(F("[MQTT-DBG] CASSLCFG?(後): ")); Serial.println(sendAT("AT+CASSLCFG?", 3000));
+  return res.indexOf("OK") >= 0;
+}
+#endif  // !MQTT_USE_PLAIN_TEST_BROKER
+
+// EMQXへ生TCP+TLSで接続し、cmdトピックに届いているコマンドを確認・処理する。
+// ネットワーク接続済み（ensureNetworkReady()成功後）に呼ぶこと。
+void mqttCheckAndHandleCmd() {
+  Serial.println(F("--- [MQTT] コマンド確認 ---"));
+
+#if !MQTT_USE_PLAIN_TEST_BROKER
+  if (!mqttSetupTls()) {
+    Serial.println(F("✗ [MQTT] TLS設定に失敗"));
+    return;
+  }
+#endif
+
+  // 既に選択済みの値と同じcidを再度書き込むとERRORになるため、必要な場合のみ書き込む
+  // （TLS利用時はmqttSetupTls()内で既に選択済みのはず）
+  String curCid = sendAT("AT+CACID?", 3000);
+  if (curCid.indexOf("+CACID: " + String(MQTT_TCP_CID)) < 0) {
+    sendAT("AT+CACID=" + String(MQTT_TCP_CID), 3000);
+  }
+
+  // 前回の接続が残っている場合に備えて閉じておく（未接続ならエラーになるが無害）
+  sendAT("AT+CACLOSE=" + String(MQTT_TCP_CID), 5000);
+
+  String openRes = sendAT("AT+CAOPEN=" + String(MQTT_TCP_CID) + ",0,\"TCP\",\"" +
+                          String(MQTT_HOST) + "\"," + String(MQTT_PORT), 30000);
+  // 応答は "+CAOPEN: <cid>,<result>"。result=0 が成功
+  int ri = openRes.indexOf("+CAOPEN: ");
+  int result = -1;
+  if (ri >= 0) {
+    int comma = openRes.indexOf(",", ri);
+    if (comma > 0) result = openRes.substring(comma + 1).toInt();
+  }
+  if (result != 0) {
+    Serial.print(F("✗ [MQTT] TCP接続失敗 result="));
+    Serial.println(result);
+    // 20=名前解決失敗, 21=ネットワーク未有効, 23=接続拒否, 27=接続失敗
+    return;
+  }
+
+  if (!mqttSendConnect()) {
+    sendAT("AT+CACLOSE=" + String(MQTT_TCP_CID), 5000);
+    return;
+  }
+  Serial.println(F("✓ [MQTT] ブローカーへ接続"));
+
+  if (!mqttSendSubscribe(MQTT_CMD_TOPIC)) {
+    sendAT("AT+CACLOSE=" + String(MQTT_TCP_CID), 5000);
+    return;
+  }
+  Serial.println(F("✓ [MQTT] cmdトピックを購読"));
+
+  // 購読直後に届くメッセージ（retain済みのものを含む）を少し待って受信する
+  uint8_t buf[400];
+  int n = mqttTcpRecv(buf, sizeof(buf), 5000);
+
+  String payload;
+  bool hasCmd = (n > 0) && mqttParsePublish(buf, n, payload);
+
+  // DISCONNECTを送ってからソケットを閉じる（ブローカー側に正常終了を伝える）
+  uint8_t disc[2] = { 0xE0, 0x00 };
+  mqttTcpSend(disc, 2);
+  sendAT("AT+CACLOSE=" + String(MQTT_TCP_CID), 5000);
+
+  if (!hasCmd) {
+    Serial.println(F("  コマンドなし"));
+    return;
+  }
+
+  payload.trim();
+  Serial.print(F("[MQTT] cmd受信: ")); Serial.println(payload);
+
+  if (payload == "reset") {
+    Serial.println(F("[MQTT] resetコマンドを受信。再起動します..."));
+    delay(200);
+    NVIC_SystemReset();
+  } else {
+    Serial.println(F("  （未対応のコマンドのため無視）"));
+  }
+}
+
+#endif  // MQTT_CMD_ENABLED
 
 // モデムのソフトリセット（★2026-07-21）:
 // 送信が連続で全滅した際、CGATTがOKでも上位(SSL/HTTP/PDP)が固着している可能性があるため、
@@ -2113,6 +2743,9 @@ void setup() {
 
   Serial.println(F("=====================================\n"));
 
+// 起動直後にも一度コマンドを確認する（次の定期送信を待たずに動作確認できるようにするため）
+  if (netOk) checkRemoteCmd();
+
 #if BOOT_SCAN_SEND
   if (netOk) {
     Serial.println(F("===== 起動確認: 設定情報＋受信済み子機データを送信 ====="));
@@ -2187,6 +2820,11 @@ void loop() {
     // 送信中は BLE スキャンを停止（LTE-M 通信中の割り込み負荷を減らす）
     Bluefruit.Scanner.stop();
 #endif
+    // ★2026-08-04: 子機データの有無に関わらず、送信サイクルごとに必ずリモートコマンドを
+    // 確認する（flushRecords()内は子機データ0件だと早期returnするため、ここで独立して呼ぶ）。
+    if (ensureNetworkReady()) {
+      checkRemoteCmd();
+    }
     flushRecords();
 #ifdef COMM_MODE_BLE
     Bluefruit.Scanner.start(0);
