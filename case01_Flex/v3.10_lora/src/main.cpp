@@ -36,8 +36,7 @@
  *   プリスケーラ 4095 → LFCLK を 32768Hz 名義としたとき 8 tick/秒。
  *
  * 【ステータス LED】
- *   framework の Seeed_XIAO_nRF52840_Sense は LED_RED/GREEN/BLUE（離散 GPIO）。
- *   WS2812 の場合は USE_WS2812_STATUS_LED を有効にしピン・NeoPixel ライブラリを合わせる。
+ *   framework の Seeed_XIAO_nRF52840_Sense の LED_RED/GREEN/BLUE（離散 GPIO）を使用。
  */
 
 /*
@@ -55,7 +54,6 @@
  * | ERR_LORA_CFG           | LoRa設定モードでのREAD/WRITE応答異常       | 赤・点灯 | 送信スキップ→スリープ      |
  *
  * 共通ポリシー:
- *   - 本番・DEBUG_MODE とも LED ロジックは同一。
  *   - エラー発生後は **送信をスキップしてスリープ**（計測エラー時は送信関数を呼ばない）。
  *   - deepSleep 入場時は **常に青・最低輝度**（睡眠中表示を優先し赤は消す）。
  * =============================================================================
@@ -76,7 +74,7 @@ using namespace Adafruit_LittleFS_Namespace;
 // DS18B20（1-Wire 温度センサ）。CH_ASSIGN[i]=3 のスロットで使用
 #include <OneWire.h>
 #include <DallasTemperature.h>
-// USB CDC（Serial）。DEBUG_MODE 時のログ出力に使用
+// USB CDC（Serial）。ログ出力に使用（USB未接続時は書き込みが即座に破棄される）
 #include <Adafruit_TinyUSB.h>
 // VL53L4CD（ToF距離センサ、I2C）。CH_ASSIGN[i]=4 のスロットで使用
 // stm32duino/STM32duino VL53L4CD（STマイクロエレクトロニクス公式ライブラリ）
@@ -127,13 +125,8 @@ static const uint8_t  FW_VERSION = 7;     // 子機ファームのバージョ�
 // アプリ設定（ここを主に編集する）
 // ============================================================
 
-#define DEBUG_MODE           1        // 1: USB Serial デバッグログ有効。本番は 0 ★ボタン誤作動調査のため一時的に1にしている
-#define DEBUG_NO_SLEEP       0        // 1: deepSleep をスキップして即 loop() に戻る（DEBUG_MODE 1 時のみ有効）
-#define DEBUG_NO_SIGFOX      0        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
-#define DEBUG_NO_LORA        0        // 1: LoRa送信を行わずログだけ出す
-// 1: センサー計測（HX711/DS18B20/I2C等）を全てスキップし、ダミー値でLoRa送信のみ行う。
-//    COMM_MODE_LORA時のみ有効。PPK2でLoRa通信単体の電流を切り分けて測定する用途。
-#define DEBUG_LORA_ONLY      0
+// USB Serial デバッグログは常時有効（USB未接続時は write() が即座に破棄されるため
+// 消費電力への影響はない）。
 #define SLEEP_MINUTES        60       // 1サイクル後のスリープ時間（分）
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 // ── タレ（ゼロ点補正）操作 ─────────────────────────────────────
@@ -156,25 +149,14 @@ static const uint8_t  FW_VERSION = 7;     // 子機ファームのバージョ�
 // （バックアップ電池切れ・初回電源投入等）のみコンパイル時刻（__DATE__/__TIME__）
 // を自動書き込みする。時刻が有効な場合は上書きしない
 // （WDT リセット等で頻繁に再起動しても時刻が巻き戻らないようにするため）。
-// 手動で時刻を指定したい場合は DS3231_FORCE_SET_TIME を 1 にする（使用後は 0 に戻すこと）。
-#define DS3231_FORCE_SET_TIME 0
-
-// DS3231が未実装・取り外し済みの基板で動作確認する場合は 0 にする。
-// 0 のとき: DS3231へのI2Cアクセス（時刻書き込み・温度読み取り・時刻読み取り）を一切行わず、
-//   ERR_DS3231_I2C も立てない（他のセンサ・送信処理がエラーでスキップされるのを防ぐ）。
-// 温度は0固定、時刻は取得不可（BLE/LoRaのタイムスタンプ・アドバタイズ時間窓判定は無効化される）。
-// 本番基板（DS3231実装済み）に戻す際は必ず 1 に戻すこと。
-#define DS3231_PRESENT 1
+// これによりアップロード直後（初回電源投入）は自動的にビルド時刻が書き込まれる。
 
 // USE_DS3231_TIMESTAMP=1 にすると各サイクルで DS3231 の現在時刻を読み出し、
-// DEBUG_MODE=1 の場合はシリアルに出力する（BLE/LoRaモードではペイロードにも使用）。
+// シリアルに出力する（BLE/LoRaモードではペイロードにも使用）。
 #define USE_DS3231_TIMESTAMP 1        // 1: 各サイクルで時刻を読み出す
 
-// ── ボタンイベント履歴の手動クリア ──────────────────────────────
-// EVENTLOG_FORCE_CLEAR を 1 にして書き込むと、起動時にフラッシュ上の
-// ボタンイベント履歴（tare.bin とは別ファイル）を空にする。
-// クリア後は必ず 0 に戻してビルドし直すこと（毎起動で消去されてしまうため）。
-#define EVENTLOG_FORCE_CLEAR 0
+// ボタンイベント履歴（フラッシュ保存）は起動毎に消去する。
+// 履歴確認は Gateway 側の受信ログ CSV で行う。
 
 // ── Sigfox / LoRa 共用 UART 設定 ────────────────────────────────
 // D8/D9 は Sigfox・LoRa で共用ネット（ビルド時排他のため物理的に一方しか実装しない）
@@ -193,16 +175,6 @@ static const uint8_t  FW_VERSION = 7;     // 子機ファームのバージョ�
 //   SA0 = HIGH（3V3） → 0x6B ← スキャンで確認済み
 // ※ MPU6050 を使う場合: AD0=LOW→0x68（DS3231と競合）, AD0=HIGH→0x69
 #define MPU_ADDR 0x6B  // LSM6DS SA0=HIGH
-
-// ── ステータス LED ─────────────────────────────────────────────
-// WS2812 を使う場合は 1 にし、NeoPixel のデータピン・個数と lib_deps を設定する。
-#define USE_WS2812_STATUS_LED 0
-
-#if USE_WS2812_STATUS_LED
-#include <Adafruit_NeoPixel.h>
-#define NEOPIXEL_PIN 16    // 実機・データシートで確認して変更
-#define NEOPIXEL_COUNT 1
-#endif
 
 // 各スロット i（0〜3）が CH(i+1) に相当。
 //   1 = HX711（ひずみ・荷重）
@@ -342,26 +314,8 @@ static bool s_bootButtonHeld = false;
 static void logEvent(const char *type, int32_t extra);
 
 // ============================================================
-// ステータス LED（離散 RGB／または NeoPixel）
+// ステータス LED（離散 RGB）
 // ============================================================
-
-#if USE_WS2812_STATUS_LED
-static Adafruit_NeoPixel s_px(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_RGB + NEO_KHZ800);
-
-static void rgbHwBegin() {
-  s_px.begin();
-  s_px.setBrightness(255);
-  s_px.clear();
-  s_px.show();
-}
-
-static void rgbHwShow(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness8) {
-  s_px.setBrightness(brightness8);
-  s_px.setPixelColor(0, r, g, b);
-  s_px.show();
-}
-
-#else
 
 static void rgbHwBegin() {
 #ifdef LED_RED
@@ -385,21 +339,15 @@ static void rgbHwShow(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness8) {
 #endif
 }
 
-#endif
-
 #define RGB_BRIGHT_FULL 255
 #define RGB_BRIGHT_SLEEP_BLUE 16 // スリープ時の青（できるだけ低輝度）
 
 static void rgbOff() {
-#if USE_WS2812_STATUS_LED
-  rgbHwShow(0, 0, 0, 1);
-#else
 #ifdef LED_RED
   // アクティブ LOW: 255(HIGH) = 消灯
   analogWrite(LED_RED,   255);
   analogWrite(LED_GREEN, 255);
   analogWrite(LED_BLUE,  255);
-#endif
 #endif
 }
 
@@ -531,22 +479,11 @@ static inline void wdtFeed() {
 static void deepSleep(uint32_t minutes) {
   wdtFeed();  // これから始まる長時間スリープ区間の給餌
 
-#if DEBUG_MODE && DEBUG_NO_SLEEP
-  Serial.println("[Sleep SKIPPED (DEBUG_NO_SLEEP)]");
-  delay(3000);  // 次サイクルまでの最低待機
-  return;
-#endif
-
-#if DEBUG_MODE
-  // USB 接続でログを見る時間を確保（この間もスリープ表示の青デューム）
   Serial.println("[Sleep before wait]");
-  delay(5000);
-#endif
 
   // スリープ中は LED オフ（消費電流削減）
   rgbOff();
 
-#if !USE_WS2812_STATUS_LED
   // rgbOff() は analogWrite(pin, 255) でLEDを消灯しているが、これはデューティ比を
   // 255（消灯相当）に書き込むだけで、内部で使われるPWMペリフェラル自体は停止しない。
   // PWMペリフェラルが動作し続けると、その動作クロックにより周期的にCPUが起こされ、
@@ -567,7 +504,6 @@ static void deepSleep(uint32_t minutes) {
   pinMode(LED_RED,   OUTPUT); digitalWrite(LED_RED,   HIGH);
   pinMode(LED_GREEN, OUTPUT); digitalWrite(LED_GREEN, HIGH);
   pinMode(LED_BLUE,  OUTPUT); digitalWrite(LED_BLUE,  HIGH);
-#endif
 #endif
 
   // スリープ中は周辺 IC 用レールをオフ（消費電流削減。正本の 3V3_SW 節）
@@ -605,19 +541,15 @@ static void deepSleep(uint32_t minutes) {
   int32_t jitterSec = loraSleepJitterSeconds(LORA_SLEEP_JITTER_MAX_SEC);
   sleepSeconds += jitterSec;
   if (sleepSeconds < 1) sleepSeconds = 1;  // ジッターで0秒以下にならないよう下限を確保
-#if DEBUG_MODE
   Serial.print("[LORA] sleep jitter: ");
   Serial.print(jitterSec);
   Serial.println(" sec");
 #endif
-#endif
 
-#if DEBUG_MODE
   Serial.print("[Sleep] ");
   Serial.print((long)sleepSeconds);
   Serial.println(" sec");
   Serial.flush();
-#endif
 
   uint32_t sleepMs = (uint32_t)(sleepSeconds * 1000LL);
 
@@ -722,7 +654,6 @@ static void tcaDisable() {
   Wire.endTransmission();
 }
 
-#if DEBUG_MODE
 // 現在Wireが向いているI2Cバスをスキャンし、応答したアドレスをシリアルに出力する。
 // tcaSelect() で目的のチャネルへ切り替えた直後に呼べば、そのチャネル配下だけを見られる。
 static void scanI2CBus(const char *label) {
@@ -742,7 +673,6 @@ static void scanI2CBus(const char *label) {
   Serial.print("[I2C SCAN] 検出数: ");
   Serial.println(found);
 }
-#endif
 
 // ============================================================
 // DS18B20（1-Wire 温度センサ）— MUX 経由でピンを共用
@@ -778,12 +708,10 @@ static int measureDS18B20(uint8_t ch) {
   for (int retry = 0; retry < 3 && s_ds.getDeviceCount() == 0; retry++) {
     delay(500);
     s_ds.begin();
-#if DEBUG_MODE
     Serial.print("[DS18B20 CH");
     Serial.print(ch);
     Serial.print("] retry ");
     Serial.println(retry + 1);
-#endif
   }
 
   DeviceAddress addr;
@@ -799,21 +727,17 @@ static int measureDS18B20(uint8_t ch) {
 
   float t = s_ds.getTempCByIndex(0);
   if (t == DEVICE_DISCONNECTED_C) {
-#if DEBUG_MODE
     Serial.print("[DS18B20 CH");
     Serial.print(ch);
     Serial.println("] not found");
-#endif
     return 0;
   }
 
-#if DEBUG_MODE
   Serial.print("[DS18B20 CH");
   Serial.print(ch);
   Serial.print("] ");
   Serial.print(t, 1);
   Serial.println(" degC");
-#endif
 
   return (int)(t * 10.0f);
 }
@@ -842,9 +766,7 @@ static void saveTareOffsets() {
   if (f.open(TARE_FILE, FILE_O_WRITE)) {
     f.write((const uint8_t*)s_hx_tare_offset, sizeof(s_hx_tare_offset));
     f.close();
-#if DEBUG_MODE
     Serial.println("[TARE] offsets saved to flash");
-#endif
   }
 }
 
@@ -856,14 +778,12 @@ static void loadTareOffsets() {
   if (f.open(TARE_FILE, FILE_O_READ)) {
     if ((size_t)f.size() == sizeof(s_hx_tare_offset)) {
       f.read((uint8_t*)s_hx_tare_offset, sizeof(s_hx_tare_offset));
-#if DEBUG_MODE
       Serial.print("[TARE] offsets loaded: ");
       for (int i = 0; i < 4; i++) {
         Serial.print(s_hx_tare_offset[i]);
         if (i < 3) Serial.print(", ");
       }
       Serial.println();
-#endif
     }
     f.close();
   }
@@ -872,9 +792,7 @@ static void loadTareOffsets() {
 // HX711 全有効チャネルに tare を実行する（3V3_SW ON・Wire 初期化済みの状態で呼ぶこと）
 static void performTare() {
   if ((s_errors & ERR_TCA9534_I2C) != 0U) {
-#if DEBUG_MODE
     Serial.println("[TARE] skipped (TCA9534 error)");
-#endif
     return;
   }
   uint8_t successCount = 0;
@@ -891,19 +809,15 @@ static void performTare() {
       hx.tare();
       s_hx_tare_offset[i] = hx.get_offset();  // チャンネルごとに保存
       successCount++;
-#if DEBUG_MODE
       Serial.print("[TARE] CH");
       Serial.print(i + 1);
       Serial.print(" done (offset=");
       Serial.print(s_hx_tare_offset[i]);
       Serial.println(")");
-#endif
     } else {
-#if DEBUG_MODE
       Serial.print("[TARE] CH");
       Serial.print(i + 1);
       Serial.println(" timeout");
-#endif
     }
   }
   // タレ完了後にオフセットをフラッシュへ保存（リセット後も保持するため）
@@ -934,10 +848,8 @@ static void performTare() {
 static void handleBootTare() {
   if (!s_bootButtonHeld) return;
 
-#if DEBUG_MODE
   Serial.println("[TARE] 起動時ボタン押下を検出。離すのを待っています...");
   Serial.flush();
-#endif
 
   // ボタンが離されるのを待つ（押されている間は青点灯で「受付中」を示す）
   statusBootBlueStrong();
@@ -947,10 +859,8 @@ static void handleBootTare() {
       // 離されないままタイムアウト → ボタン固着の疑い。タレは実行しない。
       statusErrorRed();
       logEvent("TARE_STUCK", (int32_t)(millis() - t0));
-#if DEBUG_MODE
       Serial.println("[TARE] タイムアウト: ボタンが離されません（固着の疑い）。タレを中止します。");
       Serial.flush();
-#endif
       delay(2000);   // 赤点灯を現場で視認できる時間だけ保持
       rgbOff();
       return;
@@ -960,10 +870,8 @@ static void handleBootTare() {
 
   delay(50);  // 離す際のチャタリングが収まるのを待つ
 
-#if DEBUG_MODE
   Serial.println("[TARE] ボタンが離されました。タレを実行します。");
   Serial.flush();
-#endif
 
   performTare();
 }
@@ -999,11 +907,9 @@ static int medianInt(int *a, int n) {
 // 指定チャネル（1〜4）の HX711 に MUX を合わせてからライブラリ begin
 static void hxBegin(uint8_t ch) {
 
-#if DEBUG_MODE
   Serial.print("[HX BEGIN CH");
   Serial.print(ch);
   Serial.println("]");
-#endif
 
   muxSelect(ch);
   // MUX 切替直後の信号安定待ち（正本でも数十 ms 待機の例あり）
@@ -1024,9 +930,7 @@ static bool hxReadAvg(float *outAvg) {
   unsigned long start = millis();
   while (!hx.is_ready()) {
     if (millis() - start > 1000) {
-#if DEBUG_MODE
       Serial.println("[HX TIMEOUT]");
-#endif
       s_errors |= ERR_HX711_TIMEOUT;
       statusErrorRed();
       *outAvg = 0;
@@ -1148,10 +1052,6 @@ static void getCompileTime(uint8_t &yr2, uint8_t &mo, uint8_t &day,
 
 // DS3231 から現在時刻を読み出す。成功時 true、I²C 失敗時 false
 static bool ds3231GetTime(Ds3231Time &t) {
-#if !DS3231_PRESENT
-  (void)t;
-  return false;  // DS3231未実装: I2Cアクセスせず即座に失敗を返す（呼び出し側は既存のフォールバック処理に従う）
-#endif
   Wire.beginTransmission(DS3231_ADDR);
   Wire.write(0x00);
   if (Wire.endTransmission(false) != 0) return false;
@@ -1169,9 +1069,9 @@ static bool ds3231GetTime(Ds3231Time &t) {
 // ============================================================
 // ボタンイベント履歴（フラッシュ保存）
 //
-// タレ実行・短押しリセット等の発生時刻をフラッシュに記録する。
-// 現場でUSB接続できない状況でも、次回接続時に履歴を確認できるようにするため。
-// 循環バッファ形式（古いものから上書き）。
+// タレ実行・短押しリセット等の発生時刻をフラッシュに記録し、シリアルへ即時出力する。
+// 起動毎に消去するため世代をまたいだ履歴保持はしない（履歴は Gateway 側の受信ログ
+// CSV で確認する）。循環バッファ形式（古いものから上書き）。
 // ============================================================
 
 #define EVENT_LOG_CAPACITY 20
@@ -1187,23 +1087,6 @@ static EventLogEntry s_eventLog[EVENT_LOG_CAPACITY];
 static uint16_t s_eventLogCount = 0;  // 有効エントリ数（最大 EVENT_LOG_CAPACITY）
 static uint16_t s_eventLogNext  = 0;  // 次に書き込むスロット（循環）
 
-// 起動時に呼ぶ。フラッシュから過去のイベントログを読み出す。
-static void loadEventLog() {
-  if (!InternalFS.begin()) return;
-  File f(InternalFS);
-  if (f.open(EVENT_LOG_FILE, FILE_O_READ)) {
-    uint16_t hdr[2];
-    if (f.read((uint8_t *)hdr, sizeof(hdr)) == (int)sizeof(hdr)) {
-      s_eventLogCount = hdr[0];
-      s_eventLogNext  = hdr[1];
-      if (s_eventLogCount > EVENT_LOG_CAPACITY) s_eventLogCount = EVENT_LOG_CAPACITY;
-      if (s_eventLogNext  >= EVENT_LOG_CAPACITY) s_eventLogNext = 0;
-      f.read((uint8_t *)s_eventLog, sizeof(s_eventLog));
-    }
-    f.close();
-  }
-}
-
 // 現在の s_eventLog をフラッシュへ書き込む
 static void saveEventLog() {
   if (!InternalFS.begin()) return;
@@ -1217,7 +1100,7 @@ static void saveEventLog() {
   }
 }
 
-// イベントを1件追加してフラッシュに保存する（DEBUG_MODEの有無に関わらず常時記録）。
+// イベントを1件追加してフラッシュに保存する。
 // type は15文字以内。DS3231の時刻取得に失敗した場合は "????-..." で記録する。
 static void logEvent(const char *type, int32_t extra) {
   EventLogEntry &e = s_eventLog[s_eventLogNext];
@@ -1239,36 +1122,12 @@ static void logEvent(const char *type, int32_t extra) {
 
   saveEventLog();
 
-#if DEBUG_MODE
   Serial.print("[EVENTLOG] 記録: ");
   Serial.print(e.timestamp);
   Serial.print(" ");
   Serial.print(e.type);
   Serial.print(" extra=");
   Serial.println(e.extra);
-#endif
-}
-
-// 起動時（DEBUG_MODE時のみ）に過去のイベント履歴をシリアルへ出力する
-static void printEventLog() {
-#if DEBUG_MODE
-  if (s_eventLogCount == 0) {
-    Serial.println("[EVENTLOG] 記録なし");
-    return;
-  }
-  Serial.println("[EVENTLOG] ボタンイベント履歴（古い順）:");
-  uint16_t start = (s_eventLogCount < EVENT_LOG_CAPACITY) ? 0 : s_eventLogNext;
-  for (uint16_t i = 0; i < s_eventLogCount; i++) {
-    uint16_t idx = (uint16_t)((start + i) % EVENT_LOG_CAPACITY);
-    EventLogEntry &e = s_eventLog[idx];
-    Serial.print("  ");
-    Serial.print(e.timestamp);
-    Serial.print("  ");
-    Serial.print(e.type);
-    Serial.print("  extra=");
-    Serial.println(e.extra);
-  }
-#endif
 }
 
 // ============================================================
@@ -1279,16 +1138,11 @@ static void printEventLog() {
 // ============================================================
 
 static int measureTemp() {
-#if !DS3231_PRESENT
-  return 0;  // DS3231未実装: I2Cアクセスせずエラーも立てない
-#endif
   Wire.beginTransmission(DS3231_ADDR);
   Wire.write(0x11);  // temp MSB レジスタ
   if (Wire.endTransmission(false) != 0) {
     s_errors |= ERR_DS3231_I2C;
-#if DEBUG_MODE
     Serial.println("[DS3231] temp read error");
-#endif
     return 0;
   }
   if (Wire.requestFrom(DS3231_ADDR, (uint8_t)2) < 2) {
@@ -1343,11 +1197,9 @@ static int measureMPU() {
   if (!mpuWakeup()) {
     s_errors |= ERR_MPU_I2C;
     statusErrorRed();
-#if DEBUG_MODE
     Serial.print("[LSM6] init failed (addr=0x");
     Serial.print(MPU_ADDR, HEX);
     Serial.println(")");
-#endif
     return 0;
   }
   delay(20);  // ODR=104Hz → 初回変換完了まで約10ms、余裕を持って20ms
@@ -1372,11 +1224,9 @@ static int measureMPU() {
   int16_t ay = (int16_t)(Wire.read() | Wire.read() << 8);
   int16_t az = (int16_t)(Wire.read() | Wire.read() << 8);
 
-#if DEBUG_MODE
   Serial.print("[LSM6] ax="); Serial.print(ax);
   Serial.print(" ay="); Serial.print(ay);
   Serial.print(" az="); Serial.println(az);
-#endif
 
   float pitch =
       atan2f((float)ax, sqrtf((float)ay * (float)ay + (float)az * (float)az)) * 180.0f / (float)PI;
@@ -1405,9 +1255,7 @@ static int measureVL53L4CD() {
   if (vl53.begin() != 0 || vl53.InitSensor() != 0) {
     s_errors |= ERR_VL53L4CD_I2C;
     statusErrorRed();
-#if DEBUG_MODE
     Serial.println("[VL53L4CD] init failed");
-#endif
     return 0;
   }
 
@@ -1429,9 +1277,7 @@ static int measureVL53L4CD() {
         if (millis() - t0 > 1000) {
           s_errors |= ERR_VL53L4CD_I2C;
           statusErrorRed();
-#if DEBUG_MODE
           Serial.println("[VL53L4CD] timeout waiting for data");
-#endif
           failed = true;
           break;
         }
@@ -1447,13 +1293,11 @@ static int measureVL53L4CD() {
 
     if (failed) break;
     medians[m] = medianInt(samples, VL53_SAMPLES_PER_MEDIAN);
-#if DEBUG_MODE
     Serial.print("[VL53L4CD] median[");
     Serial.print(m);
     Serial.print("]=");
     Serial.print(medians[m]);
     Serial.println("mm (50サンプル分のメジアン)");
-#endif
   }
 
   vl53.VL53L4CD_StopRanging();
@@ -1464,7 +1308,6 @@ static int measureVL53L4CD() {
 
   int finalDistance = medianInt(medians, VL53_MEASURE_COUNT);
 
-#if DEBUG_MODE
   Serial.print("[VL53L4CD] distance(median of ");
   Serial.print(VL53_MEASURE_COUNT);
   Serial.print(" x ");
@@ -1472,7 +1315,6 @@ static int measureVL53L4CD() {
   Serial.print(")=");
   Serial.print(finalDistance);
   Serial.println("mm");
-#endif
 
   return finalDistance;
 }
@@ -1490,47 +1332,25 @@ int ch[4], tempV, battV;
 int chRange[4];
 #endif
 
-#if defined(COMM_MODE_LORA) && DEBUG_LORA_ONLY
-// センサー計測を一切行わず、ch/temp/batt/rangeにダミー値（0）をセットするだけの関数。
-// PPK2でLoRa通信単体の電流を切り分けて測定する用途（DEBUG_LORA_ONLY=1時のみ使用）。
-static void fillDummyMeasurements() {
-  for (int i = 0; i < 4; i++) {
-    ch[i] = 0;
-#if defined(COMM_MODE_BLE) || defined(COMM_MODE_LORA)
-    chRange[i] = 0;
-#endif
-  }
-  tempV = 0;
-  battV = 0;
-#if DEBUG_MODE
-  Serial.println("[DEBUG_LORA_ONLY] センサー計測をスキップし、ダミー値でLoRa送信します");
-#endif
-}
-#endif
-
 // CH_ASSIGN に従い 4 スロット分を順に計測し、温度・電池を末尾に追加
 static void measureAll() {
 
-#if DEBUG_MODE
   Serial.println("----- MEASURE START -----");
-#endif
 
   // 計測フェーズ: 緑点灯（電源 ON の強青 500 ms は setup で済ませ、その後〜計測開始は setup がディム青）
   statusMeasureGreen();
 
   // ── パス1: DS18B20（CH_ASSIGN=3）を最初に計測 ────────────────────
   // HX711 が D6 を OUTPUT に設定する前に 1-Wire 通信を完了させる。
-  // 本番モード（DEBUG_MODE=0）で HX711 → DS18B20 の順に処理すると
-  // D6 の状態干渉により DS18B20 が応答しない問題を根本回避する。
+  // HX711 → DS18B20 の順に処理すると D6 の状態干渉により
+  // DS18B20 が応答しない問題を根本回避する。
   for (int i = 0; i < 4; i++) {
     if (CH_ASSIGN[i] == 3) {
       ch[i] = measureDS18B20((uint8_t)(i + 1));
-#if DEBUG_MODE
       Serial.print("[CH");
       Serial.print(i + 1);
       Serial.print("] ");
       Serial.println(ch[i]);
-#endif
     }
   }
 
@@ -1575,19 +1395,15 @@ static void measureAll() {
         s_errors |= ERR_TCA_I2C;
         statusErrorRed();
         ch[i] = 0;
-#if DEBUG_MODE
         Serial.print("[CH");
         Serial.print(i + 1);
         Serial.println("] tcaSelect failed（TCA9546Aが応答していません）");
-#endif
       } else {
-#if DEBUG_MODE
         {
           char label[16];
           snprintf(label, sizeof(label), "CH%d (TCA ch%d)", i + 1, i);
           scanI2CBus(label);
         }
-#endif
         ch[i] = measureVL53L4CD();
       }
       tcaDisable();
@@ -1596,12 +1412,10 @@ static void measureAll() {
       continue;
     }
 
-#if DEBUG_MODE
     Serial.print("[CH");
     Serial.print(i + 1);
     Serial.print("] ");
     Serial.println(ch[i]);
-#endif
   }
 
   tempV = measureTemp();
@@ -1611,7 +1425,6 @@ static void measureAll() {
   {
     Ds3231Time ts;
     if (ds3231GetTime(ts)) {
-#if DEBUG_MODE
       // タイムスタンプをシリアルに出力（YYYY-MM-DD HH:MM:SS 形式）
       char tsbuf[20];
       snprintf(tsbuf, sizeof(tsbuf), "%04u-%02u-%02u %02u:%02u:%02u",
@@ -1619,19 +1432,13 @@ static void measureAll() {
                (unsigned)ts.hour, (unsigned)ts.min, (unsigned)ts.sec);
       Serial.print("[DS3231] ");
       Serial.println(tsbuf);
-#endif
     } else {
-#if DEBUG_MODE
       Serial.println("[DS3231] time read error");
-#endif
-#if DS3231_PRESENT
       s_errors |= ERR_DS3231_I2C;
-#endif
     }
   }
 #endif  // USE_DS3231_TIMESTAMP
 
-#if DEBUG_MODE
   Serial.print("[TEMP(DS3231)] ");
   Serial.print(tempV / 10);
   Serial.print(".");
@@ -1639,7 +1446,6 @@ static void measureAll() {
   Serial.println(" degC");
   Serial.print("[BATT] ");
   Serial.println(battV);
-#endif
 }
 
 // ============================================================
@@ -1662,10 +1468,8 @@ String hx4(int v) {
 // Sigfox 送信中は緑点滅をこのループで更新する。
 static String sendAT(String cmd, int waitMs = 2000) {
 
-#if DEBUG_MODE
   Serial.print(">> ");
   Serial.println(cmd);
-#endif
 
   Serial1.print(cmd + "\r");
 
@@ -1682,9 +1486,7 @@ static String sendAT(String cmd, int waitMs = 2000) {
     yield();
   }
 
-#if DEBUG_MODE
   Serial.println(response);
-#endif
 
   return response;
 }
@@ -1693,24 +1495,9 @@ static String sendAT(String cmd, int waitMs = 2000) {
 static void sendSigfox() {
 
   if (s_errors != 0U) {
-#if DEBUG_MODE
     Serial.println("[SIGFOX] skipped (errors)");
-#endif
     return;
   }
-
-#if DEBUG_MODE && DEBUG_NO_SIGFOX
-  // デバッグ時のみ: ペイロードをログに出力して送信スキップ
-  {
-    String payload = "";
-    for (int i = 0; i < 4; i++) payload += hx4(ch[i]);
-    payload += hx4(tempV);
-    payload += hx4(battV);
-    Serial.print("[SIGFOX] TX SKIPPED (DEBUG_NO_SIGFOX): AT$SF=");
-    Serial.println(payload);
-  }
-  return;
-#endif
 
   // ── モジュール準備完了待ち（AT ping）────────────────────────
   // AT$SF= を投げる前にモジュールが応答できる状態か確認する。
@@ -1724,14 +1511,10 @@ static void sendSigfox() {
         ready = true;
         break;
       }
-#if DEBUG_MODE
       Serial.println("[SIGFOX] waiting for module ready...");
-#endif
     }
     if (!ready) {
-#if DEBUG_MODE
       Serial.println("[SIGFOX] module not ready: TX skipped (will retry next cycle)");
-#endif
       return;  // エラーフラグは立てない
     }
   }
@@ -1745,10 +1528,8 @@ static void sendSigfox() {
 
   String cmd = "AT$SF=" + payload;
 
-#if DEBUG_MODE
   Serial.print("[SIGFOX] ");
   Serial.println(cmd);
-#endif
 
   // Sigfox データ送信中: 緑点滅（sendAT 内で tick）
   statusSigfoxBlinkReset();
@@ -1756,15 +1537,11 @@ static void sendSigfox() {
   String result = sendAT(cmd, 10000);
 
   if (result.indexOf("OK") >= 0) {
-#if DEBUG_MODE
     Serial.println("[SIGFOX] 送信成功");
-#endif
   } else {
     s_errors |= ERR_SIGFOX_AT;
     statusErrorRed();
-#if DEBUG_MODE
     Serial.println("[SIGFOX] 送信失敗");
-#endif
   }
 }
 
@@ -1877,7 +1654,6 @@ static void loraWriteConfig() {
   while (millis() - t0 < 300UL) { while (Serial1.available()) Serial1.read(); }
 }
 
-#if DEBUG_MODE
 // デバッグ用: 6バイトをHEXで出力（期待値と実測値の突き合わせに使う。Gateway側の実装を移植）
 static void loraPrintRegs(const char* label, const uint8_t regs[LORA_CFG_REG_LEN]) {
   Serial.print("[LORA] "); Serial.print(label); Serial.print(": ");
@@ -1888,7 +1664,6 @@ static void loraPrintRegs(const char* label, const uint8_t regs[LORA_CFG_REG_LEN
   }
   Serial.println();
 }
-#endif
 
 // 起動（起床）毎に呼ぶ。現在の設定値を確認し、想定値と異なれば書き込む（選択肢A方式）。
 // 成功時 true。READ自体が失敗した場合は ERR_LORA_CFG をセットして false を返す。
@@ -1906,7 +1681,6 @@ static bool loraCheckAndConfigure() {
       cur[2] == LORA_CFG_REG0 && cur[3] == LORA_CFG_REG1 &&
       cur[4] == LORA_CFG_REG2 && cur[5] == LORA_CFG_REG3;
 
-#if DEBUG_MODE
   Serial.print("[LORA] config read ");
   Serial.println(!readOk ? "失敗" : (matches ? "一致" : "不一致→書込"));
   if (readOk) {
@@ -1915,7 +1689,6 @@ static bool loraCheckAndConfigure() {
                                            LORA_CFG_REG1, LORA_CFG_REG2, LORA_CFG_REG3};
     loraPrintRegs("期待値      ", expected);
   }
-#endif
 
   if (!readOk) {
     s_errors |= ERR_LORA_CFG;
@@ -1939,13 +1712,11 @@ static bool loraCheckAndConfigure() {
           verify[0] == LORA_CFG_ADDH && verify[1] == LORA_CFG_ADDL &&
           verify[2] == LORA_CFG_REG0 && verify[3] == LORA_CFG_REG1 &&
           verify[4] == LORA_CFG_REG2 && verify[5] == LORA_CFG_REG3;
-#if DEBUG_MODE
       Serial.print("[LORA] config write 確認(");
       Serial.print(attempt); Serial.print("/2): ");
       Serial.println(verifyOk ? "OK" : "NG");
       if (verifyReadOk) loraPrintRegs("書込後の実測値", verify);
       else              Serial.println("[LORA] 書込後の読込自体に失敗（応答なし）");
-#endif
     }
     if (!verifyOk) {
       // 2回とも確認NG → 設定が不確実なまま送信すると受信側で復号できない可能性が
@@ -1999,17 +1770,13 @@ static void loraSendFrame(const uint8_t *msd, uint8_t msdLen) {
 //   [15-18] CH1〜CH4 Range（uint8_t、0〜255にクランプ）
 static void sendLoRa() {
   if (s_errors != 0U) {
-#if DEBUG_MODE
     Serial.println("[LORA] skipped (errors)");
-#endif
     return;
   }
 
   if (!loraCheckAndConfigure()) {
     statusErrorRed();
-#if DEBUG_MODE
     Serial.println("[LORA] config check failed, TX skipped");
-#endif
     return;
   }
 
@@ -2037,14 +1804,6 @@ static void sendLoRa() {
     msd[15 + i] = (uint8_t)r;
   }
 
-#if DEBUG_MODE && DEBUG_NO_LORA
-  Serial.print("[LORA] TX SKIPPED (DEBUG_NO_LORA): FW=");
-  Serial.print(FW_VERSION);
-  Serial.print(" CH="); for (int i=0;i<4;i++){Serial.print(ch[i]); Serial.print(" ");}
-  Serial.print("BATT="); Serial.println(battV);
-  return;
-#endif
-
   statusSigfoxBlinkReset();
   for (uint8_t rep = 0; rep < LORA_TX_REPEAT; rep++) {
     loraSendFrame(msd, sizeof(msd));
@@ -2052,13 +1811,11 @@ static void sendLoRa() {
     if (rep + 1 < LORA_TX_REPEAT) delay(LORA_TX_REPEAT_GAP_MS);
   }
 
-#if DEBUG_MODE
   Serial.print("[LORA] TX FW="); Serial.print(FW_VERSION);
   Serial.print(" CH="); for (int i=0;i<4;i++){Serial.print(ch[i]); Serial.print(" ");}
   Serial.print("RANGE="); for (int i=0;i<4;i++){Serial.print(chRange[i]); Serial.print(" ");}
   Serial.print("BATT="); Serial.print(battV);
   Serial.print(" TIME="); Serial.print(msd[13]); Serial.print(":"); Serial.println(msd[14]);
-#endif
 }
 #endif  // COMM_MODE_LORA
 
@@ -2117,7 +1874,6 @@ static void bleAdvertise(uint8_t hour, uint8_t min_val) {
   Bluefruit.Advertising.setFastTimeout(0);
   Bluefruit.Advertising.start(0);
 
-#if DEBUG_MODE
   Serial.print("[BLE] アドバタイズ開始 ID=0x");
   Serial.print(DEVICE_ID, HEX);
   Serial.print(" FW=");
@@ -2128,7 +1884,6 @@ static void bleAdvertise(uint8_t hour, uint8_t min_val) {
   for (int i = 0; i < 4; i++) { Serial.print(chRange[i]); Serial.print(" "); }
   Serial.print("BATT="); Serial.print(battV);
   Serial.print(" TIME="); Serial.print(hour); Serial.print(":"); Serial.println(min_val);
-#endif
 }
 #endif  // COMM_MODE_BLE
 
@@ -2138,43 +1893,35 @@ static void bleAdvertise(uint8_t hour, uint8_t min_val) {
 
 void setup() {
 
-#if DEBUG_MODE
-  // ── デバッグ用: 起動理由の確認（RESETREAS） ─────────────────────
+  // ── 起動理由の確認（RESETREAS） ─────────────────────
   // ボタン誤作動・ウォッチドッグ・ブラウンアウト等、リセットの原因切り分けのため
   // 他の初期化より先に読み取る（他コードがRESETREASに触れる前に読むこと）。
-  // USB再列挙・モニタ再接続のタイミングによっては起動直後の出力を1回で
-  // 取りこぼすことがあるため、値は先に読み切ってから複数回リピート出力する。
   {
     uint32_t reason = NRF_POWER->RESETREAS;
     NRF_POWER->RESETREAS = 0xFFFFFFFFUL;  // 読み取り後すぐクリア（次回リセット時に前回分と混ざらないように）
 
     Serial.begin(115200);
-    // monitor_dtr=0 では !Serial が解除されないため while(!Serial) は使わない。
-    for (int rep = 0; rep < 5; rep++) {
-      delay(1000);  // USB CDC 安定待ち・モニタ再接続待ち（1秒間隔で5回リピート）
-      Serial.println("=== DEBUG START ===");
+    Serial.println("=== DEBUG START ===");
 #if defined(COMM_MODE_BLE) || defined(COMM_MODE_LORA)
-      Serial.print("[FW] Version=");
-      Serial.println(FW_VERSION);
+    Serial.print("[FW] Version=");
+    Serial.println(FW_VERSION);
 #endif
-      Serial.print("[RESETREAS] 0x");
-      Serial.println(reason, HEX);
-      if (reason == 0) {
-        Serial.println("  - (フラグなし。パワーオン起動、または前回リセット時に未クリア)");
-      }
-      if (reason & POWER_RESETREAS_RESETPIN_Msk) Serial.println("  - RESETPIN: 外部リセットピン");
-      if (reason & POWER_RESETREAS_DOG_Msk)      Serial.println("  - DOG: ウォッチドッグタイマー満了");
-      if (reason & POWER_RESETREAS_SREQ_Msk)     Serial.println("  - SREQ: ソフトウェアリセット（NVIC_SystemReset。ボタン短押し等）");
-      if (reason & POWER_RESETREAS_LOCKUP_Msk)   Serial.println("  - LOCKUP: CPUロックアップ");
-      if (reason & POWER_RESETREAS_OFF_Msk)      Serial.println("  - OFF: GPIOによるOFF状態からの復帰");
-      if (reason & POWER_RESETREAS_LPCOMP_Msk)   Serial.println("  - LPCOMP");
-      if (reason & POWER_RESETREAS_DIF_Msk)      Serial.println("  - DIF: デバッグ割り込み");
-      if (reason & POWER_RESETREAS_NFC_Msk)      Serial.println("  - NFC");
-      if (reason & POWER_RESETREAS_VBUS_Msk)     Serial.println("  - VBUS: USB接続によるリセット");
-      Serial.flush();
+    Serial.print("[RESETREAS] 0x");
+    Serial.println(reason, HEX);
+    if (reason == 0) {
+      Serial.println("  - (フラグなし。パワーオン起動、または前回リセット時に未クリア)");
     }
+    if (reason & POWER_RESETREAS_RESETPIN_Msk) Serial.println("  - RESETPIN: 外部リセットピン");
+    if (reason & POWER_RESETREAS_DOG_Msk)      Serial.println("  - DOG: ウォッチドッグタイマー満了");
+    if (reason & POWER_RESETREAS_SREQ_Msk)     Serial.println("  - SREQ: ソフトウェアリセット（NVIC_SystemReset。ボタン短押し等）");
+    if (reason & POWER_RESETREAS_LOCKUP_Msk)   Serial.println("  - LOCKUP: CPUロックアップ");
+    if (reason & POWER_RESETREAS_OFF_Msk)      Serial.println("  - OFF: GPIOによるOFF状態からの復帰");
+    if (reason & POWER_RESETREAS_LPCOMP_Msk)   Serial.println("  - LPCOMP");
+    if (reason & POWER_RESETREAS_DIF_Msk)      Serial.println("  - DIF: デバッグ割り込み");
+    if (reason & POWER_RESETREAS_NFC_Msk)      Serial.println("  - NFC");
+    if (reason & POWER_RESETREAS_VBUS_Msk)     Serial.println("  - VBUS: USB接続によるリセット");
+    Serial.flush();
   }
-#endif
 
   wdtInit(WDT_TIMEOUT_MS);  // 無人運用の安全網。以降 65 分キックが無ければ自動リセット
 
@@ -2217,9 +1964,7 @@ void setup() {
   char bleName[16];
   snprintf(bleName, sizeof(bleName), "Monita-%02X", DEVICE_ID);
   Bluefruit.setName(bleName);
-#if DEBUG_MODE
   Serial.println("[BLE] init OK");
-#endif
 #endif
 
   Wire.begin();
@@ -2228,66 +1973,44 @@ void setup() {
 
   s_errors = ERR_NONE;
 
-  // ── DS3231 時刻自動設定 ──────────────────────────────────────
+  // ── DS3231 時刻自動設定（アップロード時／初回電源投入時）──────────────
   // OSF（発振停止フラグ）が立っている場合（バックアップ電池切れ・初回電源投入等で
   // 時刻が無効な場合）のみ、コンパイル時刻を自動書き込みする。
   // 時刻が有効な場合は上書きしない（WDT リセット等で頻繁に再起動しても
   // 時刻が巻き戻らないようにするため）。
-#if DS3231_PRESENT
   {
-    bool needsSet = DS3231_FORCE_SET_TIME || ds3231OscillatorStopped();
+    bool needsSet = ds3231OscillatorStopped();
     if (needsSet) {
       uint8_t yr2, mo, day, hr, mn, sc;
       getCompileTime(yr2, mo, day, hr, mn, sc);
       bool ok = ds3231SetTime(yr2, mo, day, hr, mn, sc);
       if (ok) ds3231ClearOscillatorStopFlag();
-#if DEBUG_MODE
       Serial.print("[DS3231] 時刻が無効だったためビルド時刻を書き込み: ");
       Serial.println(ok ? "OK" : "FAILED");
-#endif
       if (!ok) s_errors |= ERR_DS3231_I2C;
     }
   }
-#else
-#if DEBUG_MODE
-  Serial.println("[DS3231] DS3231_PRESENT=0 のためスキップ");
-#endif
-#endif  // DS3231_PRESENT
 
   if (!tca9534Configure()) {
     s_errors |= ERR_TCA9534_I2C;
     statusErrorRed();
-#if DEBUG_MODE
     Serial.println("[TCA9534] init failed");
-#endif
   }
 
   // フラッシュから前回のタレオフセットを復元（リセット後も継続して有効にするため）
   loadTareOffsets();
 
-  // フラッシュからボタンイベント履歴を復元し、USB接続時に確認できるよう表示
-#if EVENTLOG_FORCE_CLEAR
+  // ボタンイベント履歴は起動毎に消去する（履歴確認は Gateway 側の受信ログ CSV で行う）
   s_eventLogCount = 0;
   s_eventLogNext  = 0;
   saveEventLog();
-#if DEBUG_MODE
-  Serial.println("[EVENTLOG] EVENTLOG_FORCE_CLEAR=1 のため履歴を消去しました");
-#endif
-#else
-  loadEventLog();
-#endif
-  printEventLog();
 
   // 起動時にボタンが押されていたらタレを実行する（離されるのを待ってから実行）。
   // loadTareOffsets() の後に置くこと（復元したオフセットを上書きする形になるため）。
   // measureAll() の前に置くことで、直後の計測値に新しいタレが反映される。
   handleBootTare();
 
-#if defined(COMM_MODE_LORA) && DEBUG_LORA_ONLY
-  fillDummyMeasurements();
-#else
   measureAll();
-#endif
 
 #ifdef COMM_MODE_SIGFOX
   sendSigfox();
@@ -2314,7 +2037,6 @@ void setup() {
       while (millis() - t0 < advMs) { delay(1000); yield(); }
       Bluefruit.Advertising.stop();
     } else {
-#if DEBUG_MODE
       // アドバタイズ時間窓（毎時 :00〜:02）外のサイクル。
       // 計測ログはこの上ですでに出ているが、このサイクルではBLE送信をスキップしたことを明示する。
       Serial.print("[BLE] アドバタイズ時間窓外のためスキップ TIME=");
@@ -2323,7 +2045,6 @@ void setup() {
       Serial.print(rtcOk ? rtcT.min : 0);
       Serial.print(rtcOk ? "" : "（DS3231読み取り失敗）");
       Serial.println();
-#endif
     }
     deepSleep(MEASURE_INTERVAL_MIN);
 #endif
@@ -2356,28 +2077,20 @@ void loop() {
 
   Wire.begin();
 
-#if DEBUG_MODE
   Serial.println("[WAKE]");
-#endif
 
   s_errors = ERR_NONE;
   if (!tca9534Configure()) {
     s_errors |= ERR_TCA9534_I2C;
     statusErrorRed();
-#if DEBUG_MODE
     Serial.println("[TCA9534] re-init failed");
-#endif
   }
   // ボタン処理は loop() では行わない。
   // タレはボタンを押しながら電源ONする方式（setup() の handleBootTare()）に変更し、
   // 短押しリセットは電源スイッチ(S1)で代替するため廃止した。
   // これによりスリープ中の割り込み（GPIOTE）が不要になり、約14µA削減できる。
 
-#if defined(COMM_MODE_LORA) && DEBUG_LORA_ONLY
-  fillDummyMeasurements();
-#else
   measureAll();
-#endif
 
 #ifdef COMM_MODE_SIGFOX
   sendSigfox();
@@ -2404,7 +2117,6 @@ void loop() {
       while (millis() - t0 < advMs) { delay(1000); yield(); }
       Bluefruit.Advertising.stop();
     } else {
-#if DEBUG_MODE
       // アドバタイズ時間窓（毎時 :00〜:02）外のサイクル。
       // 計測ログはこの上ですでに出ているが、このサイクルではBLE送信をスキップしたことを明示する。
       Serial.print("[BLE] アドバタイズ時間窓外のためスキップ TIME=");
@@ -2413,7 +2125,6 @@ void loop() {
       Serial.print(rtcOk ? rtcT.min : 0);
       Serial.print(rtcOk ? "" : "（DS3231読み取り失敗）");
       Serial.println();
-#endif
     }
     deepSleep(MEASURE_INTERVAL_MIN);
 #endif
