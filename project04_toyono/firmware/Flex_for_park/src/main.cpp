@@ -129,8 +129,8 @@ static bool     const ENABLE_PIR      = true;    // false で PIR 機能を完�
 static uint32_t const PIR_DEBOUNCE_MS = 2000;    // 再検出抑止時間 (ms)
 
 // ── PDM / 音声 ───────────────────────
-static bool     const ENABLE_AUDIO     = true;   // false で音声解析を完全無効化
-static uint8_t  const PDM_GAIN         = 30;      // 0〜80（クリップなら下げる）
+static bool     const ENABLE_AUDIO     = false;   // false で音声解析を完全無効化
+static uint8_t  const PDM_GAIN         = 80;      // 0〜80（クリップなら下げる）
 static uint32_t const SENSOR_REPORT_MS = 1000;    // 音声値のシリアル出力間隔
 
 static uint16_t const FFT_SIZE       = 256;       // FFT 点数（2 のべき乗）
@@ -214,10 +214,14 @@ static uint32_t rmsAccumN  = 0;
 static double   bandAccum[NUM_BANDS] = {};
 static uint32_t bandWindows = 0;
 
-// スキャン窓（30秒）集計
+// スキャン窓（30秒）集計（平均用）
 static double scanRmsSum             = 0.0;
 static double scanBandSum[NUM_BANDS] = {};
 static int    scanSnapCount          = 0;
+
+// スキャン窓（30秒）内のピーク（最大値）— 会話等の瞬間的な音量上昇を検知する用
+static double scanRmsPeak             = -120.0;
+static double scanBandPeak[NUM_BANDS] = { -120.0, -120.0, -120.0, -120.0 };
 
 static uint32_t lastSensorMs = 0;
 
@@ -439,7 +443,7 @@ static bool initSd() {
   if (ENABLE_LOGGING && !sd.exists(LOG_FILE)) {
     FsFile f = sd.open(LOG_FILE, O_WRITE | O_CREAT);
     if (f) {
-      f.println("datetime,people,devices,pir,rms_dbfs,L,ML,MH,H");
+      f.println("datetime,people,devices,pir,rms_dbfs,L,ML,MH,H,rms_peak,L_peak,ML_peak,MH_peak,H_peak");
       f.close();
       Serial.println("[SD] /log.csv created");
     }
@@ -450,9 +454,12 @@ static bool initSd() {
 /**
  * 1 サイクル分のデータを /log.csv に追記する
  * ENABLE_PIR/ENABLE_AUDIO=false の場合、該当引数は 0 / -120.0 のプレースホルダを渡す
+ * rmsDb/bandDb はスキャン窓(30秒)の平均値、rmsPeakDb/bandPeakDb は同窓内の最大値
+ * （会話等の瞬間的な音量上昇は平均より最大値の方が検知しやすいため両方記録する）
  */
 static void logRecord(int people, int devCount, uint32_t pirCount,
-                       double rmsDb, double bandDb[]) {
+                       double rmsDb, double bandDb[],
+                       double rmsPeakDb, double bandPeakDb[]) {
   if (!ENABLE_LOGGING || !s_sdReady) return;
 
   FsFile f = sd.open(LOG_FILE, O_WRITE | O_APPEND);
@@ -465,6 +472,8 @@ static void logRecord(int people, int devCount, uint32_t pirCount,
   f.print(","); f.print(pirCount);
   f.print(","); f.print(rmsDb, 1);
   for (int b = 0; b < NUM_BANDS; b++) { f.print(","); f.print(bandDb[b], 1); }
+  f.print(","); f.print(rmsPeakDb, 1);
+  for (int b = 0; b < NUM_BANDS; b++) { f.print(","); f.print(bandPeakDb[b], 1); }
   f.println();
   f.close();
 }
@@ -649,6 +658,10 @@ static void sensorTick(bool isScan) {
     scanRmsSum += dbfs;
     for (int b = 0; b < NUM_BANDS; b++) scanBandSum[b] += bDb[b];
     scanSnapCount++;
+
+    if (dbfs > scanRmsPeak) scanRmsPeak = dbfs;
+    for (int b = 0; b < NUM_BANDS; b++)
+      if (bDb[b] > scanBandPeak[b]) scanBandPeak[b] = bDb[b];
   }
 
   rmsAccumSq = 0.0; rmsAccumN = 0;
@@ -887,7 +900,8 @@ void loop() {
   pirScanCount  = 0;
   scanRmsSum    = 0.0;
   scanSnapCount = 0;
-  for (int b = 0; b < NUM_BANDS; b++) scanBandSum[b] = 0.0;
+  scanRmsPeak   = -120.0;
+  for (int b = 0; b < NUM_BANDS; b++) { scanBandSum[b] = 0.0; scanBandPeak[b] = -120.0; }
 
   // 音声: マイクはスキャン中だけ ON にする（BLEと同じデューティで省電力化）
   if (ENABLE_AUDIO) {
@@ -950,10 +964,14 @@ void loop() {
     for (int b = 0; b < NUM_BANDS; b++) {
       Serial.print("  "); Serial.print(BAND_NAME[b]); Serial.print("="); Serial.print(avgBand[b], 1);
     }
+    Serial.print("  |peak rms="); Serial.print(scanRmsPeak, 1);
+    for (int b = 0; b < NUM_BANDS; b++) {
+      Serial.print("  "); Serial.print(BAND_NAME[b]); Serial.print("="); Serial.print(scanBandPeak[b], 1);
+    }
   }
   Serial.println();
 
-  logRecord(people, deviceCount, pirScanCount, avgRms, avgBand);
+  logRecord(people, deviceCount, pirScanCount, avgRms, avgBand, scanRmsPeak, scanBandPeak);
 
   // ④ キャリブレーション
   if (calibMode) {

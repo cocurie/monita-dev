@@ -47,7 +47,7 @@
 // ▼ 設定（台ごとに変更するのは基本的に DEVICE_ID のみ）
 // ============================================================
 // ★★★ 書き込み前に必ず変更: 13台テストなら 0x01〜0x0D のように重複しない値にする ★★★
-static const uint8_t DEVICE_ID = 0x0B;
+static const uint8_t DEVICE_ID = 0x08;
 static const uint8_t FW_VERSION = 2;
 
 #define DEBUG_MODE          1     // 1: USB Serialデバッグログ有効
