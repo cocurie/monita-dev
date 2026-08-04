@@ -159,6 +159,13 @@ const char* GAS_SCRIPT_ID = "AKfycbzKVvW6vEUvJ28c_xJbHoS2ulvHiPD4OsNONdrTrf6u4kL
 // 0 = 無効（通常運用時は必ず 0 に戻すこと）。
 #define TEST_INJECT_FAKE_DEVICE_COUNT 0  // 0=無効（通常運用）。バッチ分割検証時のみ一時的に台数を入れる
 
+// ★2026-08-04追加: スプレッドシート側の動作確認用。1にすると、送信サイクルごと
+// （sendIntervalMs間隔、既定5分）に1台分のダミーCH値をrecordsへ注入し続ける。
+// 上のTEST_INJECT_FAKE_DEVICE_COUNTは起動時に1回だけ注入するのに対し、こちらは
+// 送信のたびに値を変えながら継続的に注入するため、スプレッドシートに定期的に
+// 新しい行が増えていくのを確認できる。検証後は必ず0に戻すこと。
+#define TEST_PERIODIC_FAKE_DATA 1
+
 // SIM 切り替え — 使う方のブロックだけ有効にする
 // ── 1NCE SIM ──────────────────────────────────
 #define SIM_1NCE
@@ -212,7 +219,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 68;
+static uint8_t  const GATEWAY_FW_VERSION = 72;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -844,6 +851,17 @@ bool postToGAS(String queryParams) {
 // のdoGet()内 action=check_cmd / action=set_cmd を参照。
 static char const* GW_DEVICE_ID = "gateway_v11_test";
 
+// ★2026-08-04追加: stop/start/send_nowコマンド用の状態フラグ。
+// s_gasSendPausedはBLE/LoRa受信・check_cmdの確認自体は止めず、GASへのデータ送信
+// （flushRecords()）だけをスキップする（受信も含めて全部止めると、次のstartコマンドを
+// 受け取る手段が無くなり、リモートで再開できなくなるため）。
+static bool s_gasSendPaused  = false;
+static bool s_forceSendOnce  = false;  // send_nowで次回1回だけ一時停止中でも強制送信する
+
+#ifdef COMM_MODE_LORA
+static void saveConfig();  // 後方で定義（送信間隔の永続化。LoRaビルドのみ内蔵フラッシュ保存機構あり）
+#endif
+
 // ★2026-08-04: 通常のsendAT()は応答に"OK\r\n"が現れた時点で早期終了する（AT応答の高速化のため）。
 // これはATコマンドの応答には向いているが、HTML本文のような自由文には向かない。
 // 本文中にたまたま"OK"という文字列が含まれると、そこで読み込みを打ち切ってしまい、
@@ -886,6 +904,69 @@ static void parseShreqResult(const String& result, int* outStatusCode, int* outD
   int c3 = c2 + 1;
   while (c3 < (int)s.length() && isDigit(s[c3])) c3++;
   *outDataLen = s.substring(c2 + 1, c3).toInt();
+}
+
+// ★2026-08-04追加: ステータス確認コマンド用。CSQ・稼働時間・空きヒープをGASへ即時報告する。
+void sendStatusReport() {
+  int csq = getSimCsq();
+  uint32_t uptimeMin = millis() / 60000UL;
+  int freeHeap = dbgHeapFree();  // Adafruit nRF52コア標準の空きヒープ取得（bootloader utility/debug.h）
+
+  String path = "action=status_report&device_id=";
+  path += GW_DEVICE_ID;
+  path += "&csq="; path += String(csq);
+  path += "&uptime_min="; path += String(uptimeMin);
+  path += "&free_heap="; path += String(freeHeap);
+
+  bool ok = postToGAS(path);
+  Serial.print(F("[CMD] ステータス報告 csq=")); Serial.print(csq);
+  Serial.print(F(" uptime_min=")); Serial.print(uptimeMin);
+  Serial.print(F(" free_heap=")); Serial.print(freeHeap);
+  Serial.println(ok ? F(" → GASへ送信成功") : F(" → GASへ送信失敗"));
+}
+
+// ★2026-08-04追加: RTC再同期コマンド用。網時刻(AT+CCLK)での強制補正を今すぐ実行する。
+void triggerRtcResync() {
+  if (!rtcAvailable) {
+    Serial.println(F("[CMD] RTCが利用できないため再同期できません"));
+    return;
+  }
+  bool ok = syncRtcFromNetworkTime();
+  Serial.println(ok ? F("[CMD] RTC再同期成功") : F("[CMD] RTC再同期失敗（網時刻の取得に失敗）"));
+}
+
+// ★2026-08-04追加: 診断ログ吸い上げコマンド用。gwlog.csvの末尾（直近ログ）を
+// hexエンコードしてGASへ送る。AT+SHREQの512バイト上限に収めるため、送れるのは
+// 末尾の一部（目安180バイト程度）のみ。現場に行かずに直近の状況を確認する用途。
+void sendLogDumpToGAS() {
+  File f = SD.open("gwlog.csv", FILE_READ);
+  if (!f) {
+    Serial.println(F("[CMD] gwlog.csvを開けないためログ送信不可（SDカード未挿入等）"));
+    return;
+  }
+
+  uint32_t const TAIL_BYTES = 180;
+  uint32_t fileSize = f.size();
+  uint32_t start = (fileSize > TAIL_BYTES) ? (fileSize - TAIL_BYTES) : 0;
+  f.seek(start);
+
+  String hex = "";
+  while (f.available()) {
+    uint8_t b = (uint8_t)f.read();
+    if (b < 0x10) hex += '0';
+    hex += String(b, HEX);
+  }
+  f.close();
+
+  String path = "action=log_dump&device_id=";
+  path += GW_DEVICE_ID;
+  path += "&log=";
+  path += hex;
+
+  bool ok = postToGAS(path);
+  Serial.print(F("[CMD] ログ吸い上げ（末尾")); Serial.print(hex.length() / 2);
+  Serial.print(F("バイト）"));
+  Serial.println(ok ? F(" → GASへ送信成功") : F(" → GASへ送信失敗"));
 }
 
 void checkRemoteCmd() {
@@ -1001,6 +1082,37 @@ void checkRemoteCmd() {
     Serial.println(F("[CMD] resetコマンドを受信。再起動します..."));
     delay(200);
     NVIC_SystemReset();
+  } else if (cmd == "stop") {
+    // ★2026-08-04: GASへのデータ送信のみ停止。BLE/LoRa受信・check_cmdの確認は継続する
+    // （継続しないと次のstartコマンドを受け取れず、リモートで再開できなくなるため）。
+    s_gasSendPaused = true;
+    Serial.println(F("[CMD] stopコマンドを受信。GASへのデータ送信を一時停止します"));
+  } else if (cmd == "start") {
+    s_gasSendPaused = false;
+    Serial.println(F("[CMD] startコマンドを受信。GASへのデータ送信を再開します"));
+  } else if (cmd == "send_now") {
+    // 次の flushRecords() 呼び出しを、一時停止中でも強制的に実行させる
+    s_forceSendOnce = true;
+    Serial.println(F("[CMD] send_nowコマンドを受信。今回のサイクルで送信します"));
+  } else if (cmd.startsWith("interval:")) {
+    // 例: "interval:10" → 送信間隔を10分に変更する
+    int minutes = cmd.substring(9).toInt();
+    if (minutes < 1 || minutes > 1440) {
+      Serial.print(F("[CMD] intervalの値が不正（1〜1440分の範囲で指定）: "));
+      Serial.println(cmd);
+    } else {
+      sendIntervalMs = (uint32_t)minutes * 60000UL;
+#ifdef COMM_MODE_LORA
+      saveConfig();  // 再起動後も維持されるよう内蔵フラッシュへ保存（LoRaビルドのみ）
+#endif
+      Serial.print(F("[CMD] 送信間隔を変更: ")); Serial.print(minutes); Serial.println(F("分"));
+    }
+  } else if (cmd == "status_now") {
+    sendStatusReport();
+  } else if (cmd == "rtc_resync") {
+    triggerRtcResync();
+  } else if (cmd == "log_dump") {
+    sendLogDumpToGAS();
   } else {
     Serial.println(F("  （未対応のコマンドのため無視）"));
   }
@@ -2814,6 +2926,37 @@ void loop() {
     lastSend = now;
     Serial.println(F("\n=== 定期送信 ==="));
     Serial.print(F("時刻: ")); Serial.println(getTimestamp());
+
+#if TEST_PERIODIC_FAKE_DATA
+    // ★2026-08-04追加: スプレッドシート側の動作確認用に、送信サイクルごとに
+    // ダミーCH値（時刻に応じて変化）を1台分注入する。実機のFlex子機がなくても
+    // 定期的にデータが増えていくのを確認できる。既存のupdateRecordFromPayload()
+    // （BLE/LoRa受信時と同じ、ミューテックス保護済みの反映処理）をそのまま使う。
+    {
+      static int s_fakeSeq = 0;
+      s_fakeSeq++;
+      uint8_t fakeMac[6] = {0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0x90};
+      int16_t ch1 = 100 + (s_fakeSeq % 20);
+      int16_t ch2 = 200 + (s_fakeSeq % 30);
+      int16_t ch3 = 300 - (s_fakeSeq % 15);
+      int16_t ch4 = 400 + (s_fakeSeq % 10);
+      uint8_t fakePayload[19] = {
+        0x04, 0x90, 1,
+        (uint8_t)(ch1 & 0xFF), (uint8_t)((ch1 >> 8) & 0xFF),
+        (uint8_t)(ch2 & 0xFF), (uint8_t)((ch2 >> 8) & 0xFF),
+        (uint8_t)(ch3 & 0xFF), (uint8_t)((ch3 >> 8) & 0xFF),
+        (uint8_t)(ch4 & 0xFF), (uint8_t)((ch4 >> 8) & 0xFF),
+        0, 0, 0, 0, 0, 0, 0, 0
+      };
+      updateRecordFromPayload(fakeMac, fakePayload, sizeof(fakePayload), -50);
+      Serial.print(F("[TEST] ダミーデータ注入 seq=")); Serial.print(s_fakeSeq);
+      Serial.print(F(" CH1=")); Serial.print(ch1);
+      Serial.print(F(" CH2=")); Serial.print(ch2);
+      Serial.print(F(" CH3=")); Serial.print(ch3);
+      Serial.print(F(" CH4=")); Serial.println(ch4);
+    }
+#endif
+
     Serial.print(F("受信済み Flex 台数: ")); Serial.println(recordCount);
 
 #ifdef COMM_MODE_BLE
@@ -2825,7 +2968,15 @@ void loop() {
     if (ensureNetworkReady()) {
       checkRemoteCmd();
     }
-    flushRecords();
+    // ★2026-08-04: stopコマンドで一時停止中はGASへの送信をスキップする（BLE/LoRa受信・
+    // check_cmdの確認は上で既に実行済みなので、再開/送信コマンドはこの後も受け取れる）。
+    // send_nowコマンドを受けていれば、一時停止中でも今回だけ強制的に送信する。
+    if (!s_gasSendPaused || s_forceSendOnce) {
+      s_forceSendOnce = false;
+      flushRecords();
+    } else {
+      Serial.println(F("[STOP] データ送信を一時停止中のためスキップします"));
+    }
 #ifdef COMM_MODE_BLE
     Bluefruit.Scanner.start(0);
 #endif

@@ -51,6 +51,114 @@ function resetAlertCooldown() {
 
 
 // ================================
+// Gatewayリモートリセット（★2026-08-04追加、スプレッドシートのボタン用）
+// ================================
+// doGet()のaction=set_cmdと同じ処理を、HTTP経由ではなく直接呼び出す版。
+// スプレッドシート上に図形（ボタン）を挿入し、この関数を割り当てて使う
+// （挿入方法: 挿入 → 図形描画 でボタンを作成 → 右上の「⋮」→ スクリプトを割り当て →
+//  "triggerGatewayReset" と入力）。
+// 複数Gatewayを扱うようになったら、deviceIdをプロンプトで選ばせる形に拡張すること。
+function triggerGatewayReset() {
+  var ui = SpreadsheetApp.getUi();
+  var response = ui.alert(
+    'Gatewayをリセットしますか？',
+    '次の送信サイクル（最大5分後）でGatewayが再起動します。',
+    ui.ButtonSet.YES_NO
+  );
+  if (response !== ui.Button.YES) return;
+
+  var deviceId = 'gateway_v11_test';
+  PropertiesService.getScriptProperties().setProperty('pending_cmd_' + deviceId, 'reset');
+  ui.alert('予約しました。Gatewayが次にオンラインになったタイミング（最大5分後）で再起動します。');
+}
+
+
+// ================================
+// Gateway送信制御（★2026-08-04追加、スプレッドシートのボタン用）
+// ================================
+// stop: BLE/LoRa受信・コマンド確認は継続したまま、GASへのデータ送信のみ一時停止する。
+// start: 停止していた送信を再開する。
+// send_now: 一時停止中でも、今持っているデータを次のサイクルで強制送信する。
+function triggerGatewayStop() {
+  var deviceId = 'gateway_v11_test';
+  PropertiesService.getScriptProperties().setProperty('pending_cmd_' + deviceId, 'stop');
+  SpreadsheetApp.getUi().alert('予約しました。次にGatewayがオンラインになったタイミング（最大5分後）でデータ送信を停止します。');
+}
+
+function triggerGatewayStart() {
+  var deviceId = 'gateway_v11_test';
+  PropertiesService.getScriptProperties().setProperty('pending_cmd_' + deviceId, 'start');
+  SpreadsheetApp.getUi().alert('予約しました。次にGatewayがオンラインになったタイミング（最大5分後）でデータ送信を再開します。');
+}
+
+function triggerGatewaySendNow() {
+  var deviceId = 'gateway_v11_test';
+  PropertiesService.getScriptProperties().setProperty('pending_cmd_' + deviceId, 'send_now');
+  SpreadsheetApp.getUi().alert('予約しました。次にGatewayがオンラインになったタイミング（最大5分後）で今持っているデータを送信します。');
+}
+
+// 送信間隔を変更する（1〜1440分の範囲。プロンプトで分数を入力させる）
+function triggerGatewaySetInterval() {
+  var ui = SpreadsheetApp.getUi();
+  var response = ui.prompt(
+    '送信間隔の変更',
+    '新しい送信間隔を分単位で入力してください（1〜1440分）:',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  var minutes = parseInt(response.getResponseText(), 10);
+  if (isNaN(minutes) || minutes < 1 || minutes > 1440) {
+    ui.alert('1〜1440の整数を入力してください。');
+    return;
+  }
+
+  var deviceId = 'gateway_v11_test';
+  PropertiesService.getScriptProperties().setProperty('pending_cmd_' + deviceId, 'interval:' + minutes);
+  ui.alert('予約しました。次にGatewayがオンラインになったタイミング（最大5分後）で送信間隔を' + minutes + '分に変更します。');
+}
+
+// ステータス確認（電波強度・稼働時間・空きヒープをdataboxシートへ次サイクルで報告させる）
+function triggerGatewayStatusNow() {
+  var deviceId = 'gateway_v11_test';
+  PropertiesService.getScriptProperties().setProperty('pending_cmd_' + deviceId, 'status_now');
+  SpreadsheetApp.getUi().alert('予約しました。次にGatewayがオンラインになったタイミング（最大5分後）でステータスをdataboxシートへ報告します。');
+}
+
+// RTC再同期（網時刻(AT+CCLK)での強制補正を今すぐ実行させる）
+function triggerGatewayRtcResync() {
+  var deviceId = 'gateway_v11_test';
+  PropertiesService.getScriptProperties().setProperty('pending_cmd_' + deviceId, 'rtc_resync');
+  SpreadsheetApp.getUi().alert('予約しました。次にGatewayがオンラインになったタイミング（最大5分後）でRTCを網時刻に再同期します。');
+}
+
+// 診断ログ吸い上げ（gwlog.csv末尾を次サイクルでgwlogシートへ送らせる）
+function triggerGatewayLogDump() {
+  var deviceId = 'gateway_v11_test';
+  PropertiesService.getScriptProperties().setProperty('pending_cmd_' + deviceId, 'log_dump');
+  SpreadsheetApp.getUi().alert('予約しました。次にGatewayがオンラインになったタイミング（最大5分後）で直近のログを"gwlog"シートへ送信します。');
+}
+
+
+// ================================
+// カスタムメニュー（スプレッドシートを開いた時に自動実行）
+// ================================
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Gateway操作')
+    .addItem('リモートリセット', 'triggerGatewayReset')
+    .addItem('データ送信を停止', 'triggerGatewayStop')
+    .addItem('データ送信を再開', 'triggerGatewayStart')
+    .addItem('今すぐ送信', 'triggerGatewaySendNow')
+    .addItem('送信間隔を変更', 'triggerGatewaySetInterval')
+    .addItem('ステータス確認', 'triggerGatewayStatusNow')
+    .addItem('RTC再同期', 'triggerGatewayRtcResync')
+    .addItem('診断ログを吸い上げ', 'triggerGatewayLogDump')
+    .addToUi();
+}
+
+
+// ================================
 // 【動作確認用・一時】メール送信権限テスト
 // ================================
 // エディタの関数選択プルダウンでこれを選んで「実行」を押す。
@@ -263,6 +371,43 @@ function parseNEXCORecord(hex52) {
 
 
 // ================================
+// gateway_v1.1 現行フォーマットデコード（13バイト/台 = 26 hex文字）
+// ================================
+// ★2026-08-04追加: project07_NEXCO用フォーマット(52 hex文字)とgateway_v1.1の実際の
+// 送信フォーマット(26 hex文字)が食い違っていたため、doGet側をgateway_v1.1に合わせた。
+// レイアウト:
+//   [0-3]  Epoch (uint32 LE, Gateway RTCのUNIX時刻。実測タイミングの識別用)
+//   [4]    DeviceID
+//   [5-6]  CH1 (int16 LE)
+//   [7-8]  CH2 (int16 LE)
+//   [9-10] CH3 (int16 LE)
+//   [11-12] CH4 (int16 LE)
+// 温度・CH Max/Minはgateway_v1.1側で送っていないため空欄になる。
+function parseGatewayV11Record(hex26) {
+  var bytes = [];
+  for (var i = 0; i < hex26.length; i += 2) {
+    bytes.push(parseInt(hex26.substr(i, 2), 16));
+  }
+  function int16le(lo, hi) {
+    var val = lo | (hi << 8);
+    if (val > 32767) val -= 65536;
+    return val;
+  }
+  var epoch = bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24);
+  return {
+    epoch:    epoch >>> 0,
+    deviceId: bytes[4],
+    ch: [
+      int16le(bytes[5], bytes[6]),
+      int16le(bytes[7], bytes[8]),
+      int16le(bytes[9], bytes[10]),
+      int16le(bytes[11], bytes[12]),
+    ],
+  };
+}
+
+
+// ================================
 // MACアドレス → シート名 取得（「シート名編集」シート参照）
 // ================================
 function getDeviceSheetNameByMac(ss, mac) {
@@ -326,6 +471,40 @@ function doGet(e) {
     return ContentService.createTextOutput('ok: queued "' + cmd + '" for device_id=' + deviceId);
   }
 
+  // action=status_report: status_nowコマンドを受けたGatewayが即時報告してくる
+  // ステータス（電波強度・稼働時間・空きヒープ）。databoxシートにinfo行と同じ形式で記録する。
+  if (p.action === 'status_report') {
+    var statusSheet = getSpreadsheet().getSheetByName('databox');
+    if (statusSheet) {
+      statusSheet.appendRow([
+        new Date(),                                              // A: 受信日時
+        'GW',                                                    // B: DeviceID欄にGW識別子
+        '',                                                      // C: 温度
+        '', '', '', '',                                          // D-G: CH med
+        '', '', '', '', '', '', '', '',                          // H-O: Max/Min
+        p.csq || '',                                             // P: CSQ
+        'STATUS uptime=' + (p.uptime_min || '?') + 'min free_heap=' + (p.free_heap || '?') + 'B',
+      ]);
+    }
+    return ContentService.createTextOutput('OK');
+  }
+
+  // action=log_dump: log_dumpコマンドを受けたGatewayが送ってくる、gwlog.csv末尾の
+  // hexエンコード済みログ。デコードして'gwlog'シート（無ければ自動作成）に記録する。
+  // 現場に行かずに直近の起動シーケンス等を確認できる（送れるのは末尾180バイト程度のみ）。
+  if (p.action === 'log_dump') {
+    var deviceId = p.device_id || 'default';
+    var hex = p.log || '';
+    var text = '';
+    for (var li = 0; li < hex.length; li += 2) {
+      text += String.fromCharCode(parseInt(hex.substr(li, 2), 16));
+    }
+    var ss2 = getSpreadsheet();
+    var logSheet = ss2.getSheetByName('gwlog') || ss2.insertSheet('gwlog');
+    logSheet.appendRow([new Date(), deviceId, text]);
+    return ContentService.createTextOutput('ok');
+  }
+
   // ★2026-07-25: 起動確認のinfo行もdataboxシートに記録するようにした（以前はログのみ）。
   // MACが実機アドレスでなくデバイス紐付けができないため、MAC/DeviceID/CH等は空欄にし、
   // XIAO_ID/SIM_IMEI/SD記録/送信間隔(分)/受信台数と、Gatewayの機種名+ファームバージョンを
@@ -371,9 +550,9 @@ function doGet(e) {
     var dBlob = p.d || '';
 
     for (var i = 0; i < n; i++) {
-      var chunk = dBlob.substr(i * 52, 52);
-      if (chunk.length < 52) continue;
-      var d = parseNEXCORecord(chunk);
+      var chunk = dBlob.substr(i * 26, 26);
+      if (chunk.length < 26) continue;
+      var d = parseGatewayV11Record(chunk);
 
       // DeviceID → 内部識別キー（クールダウン用）
       var macHex = ('0' + d.deviceId.toString(16)).slice(-2).toUpperCase();
@@ -387,31 +566,23 @@ function doGet(e) {
         continue;
       }
 
-      // 列構成（16列）:
-      // A:受信日時 B:DeviceID C:温度(℃)
-      // D:CH1med E:CH2med F:CH3med G:CH4med
-      // H:CH1Max I:CH1Min J:CH2Max K:CH2Min L:CH3Max M:CH3Min N:CH4Max O:CH4Min
+      // 列構成（16列）。gateway_v1.1は温度・CH Max/Minを送っていないため空欄:
+      // A:受信日時 B:DeviceID C:温度(℃、空欄)
+      // D:CH1 E:CH2 F:CH3 G:CH4
+      // H〜O: Max/Min（空欄）
       // P:LTE-M RSSI
       sheet.appendRow([
         new Date(),                                            // A: 受信日時
         d.deviceId,                                            // B: DeviceID
-        d.temp,                                                // C: 温度(℃)
-        d.chMed[0], d.chMed[1], d.chMed[2], d.chMed[3],      // D-G: CH1-4 メジアン
-        d.chMax[0], d.chMin[0],                               // H-I: CH1 Max/Min
-        d.chMax[1], d.chMin[1],                               // J-K: CH2 Max/Min
-        d.chMax[2], d.chMin[2],                               // L-M: CH3 Max/Min
-        d.chMax[3], d.chMin[3],                               // N-O: CH4 Max/Min
+        '',                                                    // C: 温度(未送信)
+        d.ch[0], d.ch[1], d.ch[2], d.ch[3],                    // D-G: CH1-4
+        '', '', '', '', '', '', '', '',                        // H-O: Max/Min(未送信)
         csq,                                                   // P: LTE-M RSSI
       ]);
 
-      // アラート判定（メジアン値を使用）
+      // アラート判定（gateway_v1.1はCH1-4の実測値のみ。Max/Min/温度は未送信）
       var dataObj = {
-        CH1: d.chMed[0], CH2: d.chMed[1], CH3: d.chMed[2], CH4: d.chMed[3],
-        CH1_MAX: d.chMax[0], CH1_MIN: d.chMin[0],
-        CH2_MAX: d.chMax[1], CH2_MIN: d.chMin[1],
-        CH3_MAX: d.chMax[2], CH3_MIN: d.chMin[2],
-        CH4_MAX: d.chMax[3], CH4_MIN: d.chMin[3],
-        TEMP: d.temp,
+        CH1: d.ch[0], CH2: d.ch[1], CH3: d.ch[2], CH4: d.ch[3],
       };
 
       checkAlertsForDeviceSheet(sheet, dataObj, mac);
