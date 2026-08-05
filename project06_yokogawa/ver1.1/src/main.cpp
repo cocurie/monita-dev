@@ -44,7 +44,7 @@
 // ============================================================================
 
 // ---- 計測間隔 ----
-static const uint32_t MEASURE_INTERVAL_SEC = 3600;   // 計測間隔（秒）
+static const uint32_t MEASURE_INTERVAL_SEC = 60;   // 計測間隔（秒）
 
 // ---- RTC時刻設定 ----
 // 本基板には専用RTCチップ（DS3231等）は搭載されていない（netlist確認済み・2026/08時点）。
@@ -122,8 +122,11 @@ static const uint32_t NTP_SYNC_TIMEOUT_MS     = 10000;
 // CompanyID 0xFFFF はBluetooth SIG未割当のテスト用領域（Gateway側は自前でフィルタする前提）。
 static const uint8_t  BLE_COMPANY_ID_LO = 0xFF;
 static const uint8_t  BLE_COMPANY_ID_HI = 0xFF;
-static const uint8_t  BLE_PKT_TYPE      = 0x11;  // Monita 横河ver1.1用パケット種別（暫定、要確認）
-static const uint32_t BLE_ADV_INTERVAL_MS = 1000;
+// 横河専用Gateway（project06_yokogawa/gateway_v1.1、EXPECTED_PKT_TYPE=0x11）向け。
+// 汎用gateway_v1.1のv3.03互換フィルタ（PktType=0x03、CH1-4固定オフセット）とは非互換のため、
+// 0x03を間借りせず横河専用の値に戻した（2026-08-05、8CH対応Gateway新設に伴う変更）。
+static const uint8_t  BLE_PKT_TYPE      = 0x11;
+static const uint32_t BLE_ADV_INTERVAL_MS = 3000;
 #endif
 
 // ============================================================================
@@ -334,6 +337,16 @@ static void commInit() {
     char bleName[24];
     snprintf(bleName, sizeof(bleName), "Monita-%02X", DEVICE_ID_NUM);
     NimBLEDevice::init(bleName);
+
+    // 主アドバタイズパケット（31バイト上限）はManufacturer Data(20B)でほぼ埋まるため、
+    // デバイス名はスキャンレスポンス（別枠31バイト）に載せる。
+    // nRF Connect等のアクティブスキャナーはスキャンレスポンスも受信するため、
+    // ここで一度設定しておけば bleAdvertiseMeasurement() 内の
+    // setAdvertisementData()（主パケットのみ更新）に上書きされず維持される。
+    NimBLEAdvertisementData scanResponseData;
+    scanResponseData.setName(bleName);
+    NimBLEDevice::getAdvertising()->setScanResponseData(scanResponseData);
+
     Serial.printf("[BLE] 初期化完了: %s\n", bleName);
 }
 static void commSendPayload(const uint8_t* data, size_t len) { (void)data; (void)len; }
@@ -455,7 +468,7 @@ static void logToSD(const Measurement& m) {
 //
 // MSD フォーマット（20バイト、project07_NEXCO/firmware_child と同じ考え方を8ch分に拡張）:
 //   [0-1]   Company ID  : 0xFF 0xFF（Bluetooth SIG未割当のテスト用領域）
-//   [2]     Pkt type    : BLE_PKT_TYPE（0x11 = Monita 横河ver1.1、暫定）
+//   [2]     Pkt type    : BLE_PKT_TYPE（0x11 = project06_yokogawa/gateway_v1.1のEXPECTED_PKT_TYPEに合わせる）
 //   [3]     Device ID   : DEVICE_ID_NUM
 //   [4-5]   CH1 ひずみ/変位 : int16 LE（µε相当、NaN時は0x7FFF）
 //   [6-7]   CH2             : int16 LE
