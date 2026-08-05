@@ -367,11 +367,14 @@ extern "C" void ble_scan_and_populate(void) {
 
     char options[512] = "";
     for (size_t i = 0; i < foundDevices.size(); i++) {
-        std::string addr = foundDevices[i]->getAddress().toString();
-        strncat(options, addr.c_str(), sizeof(options) - strlen(options) - 1);
+        std::string name = foundDevices[i]->getName();
+        if (name.empty()) name = foundDevices[i]->getAddress().toString();
+        strncat(options, name.c_str(), sizeof(options) - strlen(options) - 1);
         if (i + 1 < foundDevices.size()) {
             strncat(options, "\n", sizeof(options) - strlen(options) - 1);
         }
+        Serial.printf("[BLE] %u: %s (%s)\n", (unsigned)i, name.c_str(),
+                      foundDevices[i]->getAddress().toString().c_str());
     }
     lv_dropdown_set_options(ui_Dropdown1, options);
     Serial.printf("[BLE] Found %u device(s)\n", (unsigned)foundDevices.size());
@@ -390,24 +393,22 @@ extern "C" void ble_connect_selected(void) {
         return;
     }
 
-    char selected[64];
-    lv_dropdown_get_selected_str(ui_Dropdown1, selected, sizeof(selected));
-
-    NimBLEAdvertisedDevice* target = nullptr;
-    for (auto* d : foundDevices) {
-        if (d->getAddress().toString() == selected) { target = d; break; }
-    }
-    if (target == nullptr) {
-        Serial.printf("[BLE] Selected device not found: %s\n", selected);
+    uint16_t idx = lv_dropdown_get_selected(ui_Dropdown1);
+    if (idx >= foundDevices.size()) {
+        Serial.println("[BLE] Invalid selection index");
         return;
     }
+    NimBLEAdvertisedDevice* target = foundDevices[idx];
 
     if (pBleClient == nullptr) {
         pBleClient = NimBLEDevice::createClient();
         pBleClient->setClientCallbacks(new MonitaClientCallbacks(), false);
     }
 
-    Serial.printf("[BLE] Connecting to %s ...\n", selected);
+    std::string devName = target->getName();
+    if (devName.empty()) devName = target->getAddress().toString();
+    Serial.printf("[BLE] Connecting to %s (%s) ...\n",
+                  devName.c_str(), target->getAddress().toString().c_str());
     if (!pBleClient->connect(target)) {
         Serial.println("[BLE] Connection failed");
         return;
