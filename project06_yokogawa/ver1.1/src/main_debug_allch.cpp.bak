@@ -1,0 +1,529 @@
+/**
+ * Monita Flex 横河基板 ver1.1 — 全CH実測テスト
+ *
+ * 【チャンネル構成】
+ *   CH1〜5 : ひずみ／変位    HX711 / MUX 0〜4
+ *   CH6    : 熱電対 K型      MCP9600
+ *   CH7〜8 : 電圧入力 ±10V  ADS1115 差動
+ *
+ * 【操作】
+ *   Enter     → 全CH 1回計測
+ *   r + Enter → 連続計測 ON/OFF
+ *   s + Enter → I2C スキャン
+ *
+ * 【ピン割当】（ver1.1 netlist 確定値）
+ *   HX711 PD_SCK : D1 (GPIO3)  ← 全HX711共通
+ *   HX711 DOUT   : D2 (GPIO4)  ← 74HC4051 MUX共通出力
+ *   I2C SDA      : D4 (GPIO6)
+ *   I2C SCL      : D5 (GPIO7)
+ *   SD SCK       : D8 (GPIO8)
+ *   SD MISO      : D9 (GPIO9)
+ *   SD MOSI      : D10 (GPIO10)
+ *   SD CS        : D7 (GPIO20)
+ *
+ * 【復元手順】
+ *   cp main_allch_test.cpp.bak main.cpp
+ */
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <SD.h>
+#include "soft_i2c.h"
+
+// ============================================================
+// ピン定義
+// ============================================================
+#define HX711_PD_SCK  D1   // GPIO3
+#define HX711_DOUT    D2   // GPIO4
+#define PIN_SDA       D4   // GPIO6
+#define PIN_SCL       D5   // GPIO7
+#define SD_SCK        D8   // GPIO8  ← ストラッピングピン注意
+#define SD_MISO       D9   // GPIO9
+#define SD_MOSI       D10  // GPIO10
+#define SD_CS         D7   // GPIO20
+
+// MUX切替後、HX711読み出し開始までの待ち時間（接触不良/信号なまり対策で調整）
+static const uint16_t MUX_SETTLE_MS = 50;
+
+// ============================================================
+// MCP23008 — 74HC4051 MUX チャンネル選択
+// ============================================================
+static constexpr uint8_t MCP23008_ADDR = 0x20;
+static constexpr uint8_t MCP_IODIR     = 0x00;
+static constexpr uint8_t MCP_GPIO      = 0x09;
+
+static bool mcpWrite(uint8_t reg, uint8_t val) {
+    return softI2CWriteReg(MCP23008_ADDR, reg, val);
+}
+
+static uint8_t mcpRead(uint8_t reg) {
+    uint8_t buf[1] = {0xFF};
+    softI2CReadReg(MCP23008_ADDR, reg, buf, 1);
+    return buf[0];
+}
+
+static bool mcpInit() {
+    // GP0=S0(A), GP1=S1(B), GP2=S2(C) = MUX選択出力
+    if (!mcpWrite(MCP_IODIR, 0xF8)) return false;  // 0xF8 = 0b11111000
+    return mcpWrite(MCP_GPIO, 0x00);  // MUX選択リセット
+}
+
+// MUX ch(0〜4) 選択（回路図: GP2→S0, GP1→S1, GP0→S2）
+static bool muxSelect(uint8_t ch) {
+    uint8_t val = ((ch & 0x01) << 2)  // S0(bit0) → GP2(bit2)
+                | ((ch & 0x02) << 0)  // S1(bit1) → GP1(bit1)
+                | ((ch & 0x04) >> 2); // S2(bit2) → GP0(bit0)
+    return mcpWrite(MCP_GPIO, val);
+}
+
+static void mcpDiag() {
+    Serial.println("[MCP診断]");
+    uint8_t iodir = mcpRead(MCP_IODIR);
+    uint8_t gpio  = mcpRead(MCP_GPIO);
+    Serial.printf("  IODIR = 0x%02X (期待:0xF8 → GP0/1/2=出力)\n", iodir);
+    Serial.printf("  GPIO  = 0x%02X\n", gpio);
+
+    Serial.println("  [MUX切替テスト] DOUT レベル(LOW=HX711準備完了)");
+    for (uint8_t ch = 0; ch < 5; ch++) {
+        muxSelect(ch);
+        delay(MUX_SETTLE_MS);
+        int lv = digitalRead(HX711_DOUT);
+        uint8_t g = mcpRead(MCP_GPIO);
+        Serial.printf("    ch%u: GPIO=0x%02X  DOUT=%s\n",
+                      ch + 1, g, lv == LOW ? "LOW(準備完了)" : "HIGH(未応答/未接続)");
+    }
+    muxSelect(0);
+}
+
+// ============================================================
+// HX711 — ビットバング読み出し（全CH共通 PD_SCK/DOUT）
+// ============================================================
+// MUX選択済み前提。戻り値: 24bit符号付き raw値 / タイムアウト時 INT32_MIN
+static int32_t hx711Read() {
+    uint32_t deadline = millis() + 200;
+    while (digitalRead(HX711_DOUT) == HIGH) {
+        if (millis() > deadline) return INT32_MIN;
+        delay(1);
+    }
+
+    uint32_t raw = 0;
+    for (int i = 0; i < 24; i++) {
+        digitalWrite(HX711_PD_SCK, HIGH);
+        delayMicroseconds(1);
+        raw = (raw << 1) | digitalRead(HX711_DOUT);
+        digitalWrite(HX711_PD_SCK, LOW);
+        delayMicroseconds(1);
+    }
+    // チャンネルA ゲイン128 → 追加クロック 1発
+    digitalWrite(HX711_PD_SCK, HIGH);
+    delayMicroseconds(1);
+    digitalWrite(HX711_PD_SCK, LOW);
+
+    if (raw & 0x800000) raw |= 0xFF000000;  // 符号拡張
+    return (int32_t)raw;
+}
+
+// ============================================================
+// ADS1115 — シングルショット差動計測（CH4: A0-A1 / CH5: A2-A3）
+// ============================================================
+static constexpr uint8_t  ADS_ADDR     = 0x48;
+static constexpr uint8_t  ADS_REG_CONV = 0x00;
+static constexpr uint8_t  ADS_REG_CFG  = 0x01;
+
+
+// MUX[14:12] 000=A0-A1, 011=A2-A3 / PGA=±2.048V / MODE=single / DR=128SPS
+static constexpr uint16_t ADS_CFG_CH4 = 0x8583;
+static constexpr uint16_t ADS_CFG_CH5 = 0xB583;
+
+// キャリブレーション済みゲイン逆数（ブレッドボード計測値）
+static const float GAIN_INV = 7.527f;
+
+static int16_t adsReadSingle(uint16_t config) {
+    if (!softI2CWriteReg16(ADS_ADDR, ADS_REG_CFG, config)) return INT16_MIN;
+    delay(15);
+    uint32_t deadline = millis() + 50;
+    while (millis() < deadline) {
+        uint8_t buf[2];
+        if (softI2CReadReg(ADS_ADDR, ADS_REG_CFG, buf, 2) && (buf[0] & 0x80)) break;
+        delay(2);
+    }
+    uint8_t buf[2];
+    if (!softI2CReadReg(ADS_ADDR, ADS_REG_CONV, buf, 2)) return INT16_MIN;
+    return (int16_t)((buf[0] << 8) | buf[1]);
+}
+
+// ============================================================
+// MCP9600 — K型熱電対（CH8）
+// ============================================================
+static constexpr uint8_t MCP9600_HOTJUNCTION  = 0x00;
+static constexpr uint8_t MCP9600_STATUS       = 0x04;
+static constexpr uint8_t MCP9600_SENSORCONFIG = 0x05;
+static constexpr uint8_t MCP9600_DEVICECONFIG = 0x06;
+static constexpr uint8_t MCP9600_DEVICEID     = 0x20;
+
+static uint8_t g_mcp9600_addr = 0;
+
+static uint8_t mcp9600Scan() {
+    for (uint8_t a = 0x60; a <= 0x67; a++) {
+        if (softI2CProbe(a)) return a;
+    }
+    return 0;
+}
+
+static bool mcp9600Init(uint8_t addr) {
+    uint8_t id[2] = {};
+    if (!softI2CReadReg(addr, MCP9600_DEVICEID, id, 2)) return false;
+    if (id[0] != 0x40) return false;
+    softI2CWriteReg(addr, MCP9600_SENSORCONFIG, 0x03);  // K型 / フィルタ3
+    softI2CWriteReg(addr, MCP9600_DEVICECONFIG, 0x80);  // 18bit / 通常動作
+    return true;
+}
+
+static float mcp9600ReadTemp(uint8_t addr) {
+    uint8_t buf[2];
+    if (!softI2CReadReg(addr, MCP9600_HOTJUNCTION, buf, 2)) return NAN;
+    return (int16_t)((buf[0] << 8) | buf[1]) * 0.0625f;
+}
+
+// ============================================================
+// 全CH計測
+// ============================================================
+struct HxCh { uint8_t mux; const char* label; };
+// MUX ch → 74HC4051物理ピン: ch0=pin13(Y0), ch1=pin14(Y1), ch2=pin15(Y2), ch3=pin12(Y3), ch4=pin1(Y4)
+static const HxCh HX_CH[] = {
+    { 0, "CH1" },
+    { 1, "CH2" },
+    { 2, "CH3" },
+    { 3, "CH4" },
+    { 4, "CH5" },
+};
+
+static void measureAll() {
+    Serial.println("--- 全CH計測 ---");
+
+    // CH1〜3, CH6〜7: HX711（MUX切替）
+    for (auto& hx : HX_CH) {
+        muxSelect(hx.mux);
+        delay(MUX_SETTLE_MS);  // MUX切替後の信号安定待ち
+        int32_t raw = hx711Read();
+        Serial.print(hx.label);
+        Serial.print(": ");
+        if (raw == INT32_MIN) {
+            Serial.println("[タイムアウト] HX711未応答");
+        } else {
+            Serial.print("raw="); Serial.print(raw);
+            // FS比率（±8388608 = ±100%FS）
+            Serial.print("  ("); Serial.print(raw / 83886.08f, 2); Serial.println("%FS)");
+        }
+    }
+
+    // CH6: MCP9600（熱電対）
+    Serial.print("CH6 熱電対  : ");
+    if (g_mcp9600_addr == 0) {
+        Serial.println("[MCP9600未検出]");
+    } else {
+        float t = mcp9600ReadTemp(g_mcp9600_addr);
+        Serial.print(isnan(t) ? NAN : t, 2);
+        Serial.println(" °C");
+    }
+
+    // CH7〜8: ADS1115（電圧）
+    struct { const char* label; uint16_t cfg; } ads_ch[] = {
+        { "CH7 ±10V   ", ADS_CFG_CH4 },
+        { "CH8 ±10V   ", ADS_CFG_CH5 },
+    };
+    bool ads_ok = softI2CProbe(ADS_ADDR);
+    for (auto& ch : ads_ch) {
+        Serial.print(ch.label); Serial.print(": ");
+        if (!ads_ok) { Serial.println("[ADS1115未検出]"); continue; }
+        int16_t raw = adsReadSingle(ch.cfg);
+        if (raw == INT16_MIN) { Serial.println("[通信エラー]"); continue; }
+        float v_ads = raw * (2.048f / 32768.0f);
+        float v_in  = v_ads * GAIN_INV;
+        Serial.print("raw="); Serial.print(raw);
+        Serial.print("  ADS="); Serial.print(v_ads, 4); Serial.print("V");
+        Serial.print("  Vin="); Serial.print(v_in, 3); Serial.println("V");
+    }
+
+    Serial.println();
+}
+
+// ============================================================
+// I2C スキャン
+// ============================================================
+static void i2cScan() {
+    Serial.println("[I2C スキャン]");
+    uint8_t found = 0;
+    for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+        if (softI2CProbe(addr)) {
+            Serial.print("  0x"); if (addr < 0x10) Serial.print("0");
+            Serial.print(addr, HEX);
+            if (addr == 0x20)                        Serial.print("  ← MCP23008");
+            else if (addr == ADS_ADDR)               Serial.print("  ← ADS1115");
+            else if (addr >= 0x60 && addr <= 0x67)  Serial.print("  ← MCP9600");
+            Serial.println();
+            found++;
+        }
+    }
+    Serial.print("  合計 "); Serial.print(found); Serial.println(" 台\n");
+}
+
+// ============================================================
+// SD カード — 書き込みテスト
+// ============================================================
+static bool g_sd_ok = false;
+
+static bool sdInit() {
+    SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+    return SD.begin(SD_CS);
+}
+
+static void sdTest() {
+    Serial.println("[SD] テスト開始");
+
+    if (!g_sd_ok) {
+        Serial.println("[SD] 未初期化 — スキップ");
+        return;
+    }
+
+    // カード情報
+    uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+    Serial.print("[SD] カードサイズ: "); Serial.print((uint32_t)cardSize); Serial.println(" MB");
+    Serial.print("[SD] 使用済み: ");
+    Serial.print((uint32_t)(SD.usedBytes() / 1024)); Serial.println(" KB");
+
+    // 書き込みテスト
+    const char* path = "/test_ver11.txt";
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) {
+        Serial.println("[SD] ファイルオープン失敗");
+        return;
+    }
+    f.printf("ver1.1 SD test — millis=%lu\r\n", millis());
+    f.close();
+    Serial.print("[SD] 書き込みOK: "); Serial.println(path);
+
+    // 読み戻し確認
+    f = SD.open(path, FILE_READ);
+    if (!f) {
+        Serial.println("[SD] 読み戻し失敗");
+        return;
+    }
+    Serial.print("[SD] 読み戻し: ");
+    while (f.available()) Serial.write(f.read());
+    f.close();
+
+    Serial.println("[SD] テスト完了");
+}
+
+// ============================================================
+// MUX バイパステスト
+// ============================================================
+static void hx711BypassTest() {
+    Serial.println("[バイパステスト] MUX を経由せず D2 直読み");
+    int level = digitalRead(HX711_DOUT);
+    Serial.println(level == HIGH ? "  DOUT: HIGH（HX711未準備 or 未接続）" : "  DOUT: LOW（準備完了）");
+    int32_t raw = hx711Read();
+    if (raw == INT32_MIN) {
+        Serial.println("  結果: [タイムアウト]");
+    } else {
+        Serial.printf("  結果: raw=%ld\n", raw);
+    }
+}
+
+// ============================================================
+// CHごと切り分けデバッグ（chNum: 表示用CH番号 / muxCh: MUXセレクト値0-4 / physPin: 74HC4051物理ピン）
+// ============================================================
+static void chDebug(uint8_t chNum, uint8_t muxCh, uint8_t physPin) {
+    Serial.printf("========== CH%u 切り分けデバッグ（MUX ch=%u, 74HC4051 pin%u）==========\n",
+                  chNum, muxCh, physPin);
+
+    // STEP 1: MCP23008 IODIR 確認
+    uint8_t iodir = mcpRead(MCP_IODIR);
+    Serial.printf("[1] IODIR = 0x%02X  (期待: 0xF8 = b11111000)\n", iodir);
+    if (iodir != 0xF8) {
+        Serial.println("    !! 不一致 → mcpInit() の書き込み失敗またはI2C問題");
+    } else {
+        Serial.println("    OK: GP0/GP1/GP2 が出力に設定されている");
+    }
+
+    // STEP 2: 該当CHのMUXセレクト値を書いて読み返す
+    uint8_t sel = ((muxCh & 0x01) << 2) | ((muxCh & 0x02) << 0) | ((muxCh & 0x04) >> 2);
+    Serial.printf("[2] MCP GPIO <- 0x%02X (CH%u選択: S0=%d S1=%d S2=%d)\n",
+                  sel, chNum, muxCh & 1, (muxCh >> 1) & 1, (muxCh >> 2) & 1);
+    bool ok = mcpWrite(MCP_GPIO, sel);
+    Serial.printf("    書き込み: %s\n", ok ? "OK" : "FAIL");
+    delay(MUX_SETTLE_MS);
+    uint8_t gpio_rb = mcpRead(MCP_GPIO);
+    Serial.printf("    読み返し: 0x%02X  (下位3bit = 0b%d%d%d → GP2,GP1,GP0)\n",
+                  gpio_rb,
+                  (gpio_rb >> 2) & 1,
+                  (gpio_rb >> 1) & 1,
+                  (gpio_rb >> 0) & 1);
+    if ((gpio_rb & 0x07) == (sel & 0x07)) {
+        Serial.printf("    OK: 書いた値と読み返しが一致 → Y%u=CH%u 選択中\n", muxCh, chNum);
+    } else {
+        Serial.printf("    !! 書いた値と読み返しが不一致 (期待=0x%01X 実測=0x%01X)\n", sel & 0x07, gpio_rb & 0x07);
+    }
+
+    // STEP 3: DOUT レベル確認
+    delay(10);
+    int dout1 = digitalRead(HX711_DOUT);
+    Serial.printf("[3] DOUT レベル: %s\n",
+                  dout1 == LOW ? "LOW  → HX711 変換完了・読み出し可能" : "HIGH → HX711 未準備（タイムアウトになる）");
+
+    // STEP 4: DOUT HIGH の場合は 500ms 待って再確認
+    if (dout1 == HIGH) {
+        Serial.println("    500ms 待って再確認...");
+        uint32_t t = millis();
+        while (digitalRead(HX711_DOUT) == HIGH && millis() - t < 500) delay(10);
+        int dout2 = digitalRead(HX711_DOUT);
+        Serial.printf("    再確認: %s\n",
+                      dout2 == LOW ? "LOW に変化した → HX711は生きている" : "まだ HIGH → HX711 VCC/SCKラインを確認");
+    }
+
+    // STEP 5: HX711 読み出し（タイムアウト 1秒）
+    Serial.println("[4] HX711 読み出し試行（タイムアウト1秒）...");
+    uint32_t deadline = millis() + 1000;
+    while (digitalRead(HX711_DOUT) == HIGH) {
+        if (millis() > deadline) {
+            Serial.println("    結果: [タイムアウト 1000ms]");
+            Serial.println("    -----------------------------------------------");
+            Serial.println("    考えられる原因:");
+            Serial.printf("    A) MUX Z(pin3) → D2 の配線が繋がっていない\n");
+            Serial.printf("    B) HX711 DOUT(CH%u) → MUX Y%u(pin%u) の配線が繋がっていない\n", chNum, muxCh, physPin);
+            Serial.println("    C) HX711 の VCC(3V) が来ていない");
+            Serial.println("    D) HX711 の SCK(D1) が来ていない");
+            Serial.println("    → まず b + Enter でバイパステストを実行して HX711 単体確認");
+            Serial.println("===========================================");
+            return;
+        }
+        delay(1);
+    }
+
+    uint32_t raw = 0;
+    for (int i = 0; i < 24; i++) {
+        digitalWrite(HX711_PD_SCK, HIGH); delayMicroseconds(1);
+        raw = (raw << 1) | digitalRead(HX711_DOUT);
+        digitalWrite(HX711_PD_SCK, LOW);  delayMicroseconds(1);
+    }
+    digitalWrite(HX711_PD_SCK, HIGH); delayMicroseconds(1);
+    digitalWrite(HX711_PD_SCK, LOW);
+    if (raw & 0x800000) raw |= 0xFF000000;
+    int32_t val = (int32_t)raw;
+
+    Serial.printf("    結果: raw=%ld  (%.2f %%FS)\n", val, val / 83886.08f);
+    Serial.println("    !! HX711 読み出し成功 → MUX 経由で正常動作");
+    Serial.println("===========================================");
+}
+
+// ============================================================
+// MUX選択を固定してテスターで実測できるようにする（chNum: 表示用CH番号 / muxCh: 0-4 / physPin: Y端子の物理pin）
+// ============================================================
+static void muxHoldAndMonitor(uint8_t chNum, uint8_t muxCh, uint8_t physPin) {
+    uint8_t sel = ((muxCh & 0x01) << 2) | ((muxCh & 0x02) << 0) | ((muxCh & 0x04) >> 2);
+    mcpWrite(MCP_GPIO, sel);
+
+    Serial.printf("[固定] CH%u選択（MUX ch=%u, Y%u=pin%u）  S0=%d S1=%d S2=%d  → GPIO=0x%02X\n",
+                  chNum, muxCh, muxCh, physPin, muxCh & 1, (muxCh >> 1) & 1, (muxCh >> 2) & 1, sel);
+    Serial.println("  この状態を維持したままテスターで実測してください:");
+    Serial.println("    74HC4051 pin11 (S0) / pin10 (S1) / pin9 (S2)");
+    Serial.printf("    74HC4051 pin%u (Y%u, CH%u側入力) / pin3 (Z, D2への出力)\n", physPin, muxCh, chNum);
+    Serial.println("  10秒間 D2(Z)のアナログ電圧を1秒おきに表示します（何かキーを押すと停止・固定は維持）");
+
+    uint32_t end = millis() + 10000;
+    while (millis() < end && !Serial.available()) {
+        int raw = analogRead(HX711_DOUT);
+        float v  = raw * 3.3f / 4095.0f;
+        int dig  = digitalRead(HX711_DOUT);
+        Serial.printf("  D2: analog=%4d  %.3fV  digital=%s\n",
+                      raw, v, dig == LOW ? "LOW" : "HIGH");
+        delay(1000);
+    }
+    while (Serial.available()) Serial.read();
+    pinMode(HX711_DOUT, INPUT_PULLUP);  // analogRead後はINPUT_PULLUPに戻す
+    Serial.println("  [表示終了] ※MUX選択はCHのまま維持されています（他のコマンドを打つまで）");
+}
+
+// ============================================================
+// setup / loop
+// ============================================================
+static bool continuousMode = false;
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println("=== ver1.1 全CH実測テスト ===");
+    Serial.println("  Enter     : 全CH 1回計測");
+    Serial.println("  r + Enter : 連続計測 ON/OFF");
+    Serial.println("  s + Enter : I2C スキャン");
+    Serial.println("  d + Enter : SD カードテスト");
+    Serial.println("  b + Enter : HX711 MUX バイパステスト（D2直結用）");
+    Serial.println("  m + Enter : MCP23008 診断（レジスタ読み返し＋MUX切替確認）");
+    Serial.println("  1 + Enter : CH1 切り分けデバッグ（MCP→MUX→HX711 各ステップ確認）");
+    Serial.println("  4 + Enter : CH4 切り分けデバッグ（MCP→MUX→HX711 各ステップ確認）");
+    Serial.println("  0 + Enter : CH1選択を固定（テスター実測用）");
+    Serial.println("  9 + Enter : CH4選択を固定（テスター実測用）");
+    Serial.println();
+
+    softI2CInit(PIN_SDA, PIN_SCL);
+    delay(50);
+
+    pinMode(HX711_PD_SCK, OUTPUT);
+    pinMode(HX711_DOUT, INPUT_PULLUP);  // 未接続時の浮きを防ぐ
+    digitalWrite(HX711_PD_SCK, LOW);
+
+    if (mcpInit()) Serial.println("[OK] MCP23008（GP0=S0, GP1=S1, GP2=S2 出力）");
+    else           Serial.println("[ERROR] MCP23008 初期化失敗");
+
+    g_mcp9600_addr = mcp9600Scan();
+    if (g_mcp9600_addr && mcp9600Init(g_mcp9600_addr)) {
+        Serial.print("[OK] MCP9600（0x"); Serial.print(g_mcp9600_addr, HEX); Serial.println("）");
+    } else {
+        Serial.println("[WARN] MCP9600 未検出");
+    }
+
+    if (softI2CProbe(ADS_ADDR)) Serial.println("[OK] ADS1115（0x48）");
+    else                        Serial.println("[WARN] ADS1115 未検出");
+
+    g_sd_ok = sdInit();
+    if (g_sd_ok) Serial.println("[OK] SD カード");
+    else         Serial.println("[WARN] SD カード 未検出（未挿入 or 配線確認）");
+
+    Serial.println();
+}
+
+void loop() {
+    if (Serial.available()) {
+        char c = Serial.read();
+        while (Serial.available()) Serial.read();
+
+        if      (c == 'r' || c == 'R') {
+            continuousMode = !continuousMode;
+            Serial.println(continuousMode ? "[連続計測 ON]" : "[連続計測 OFF]");
+        } else if (c == 's' || c == 'S') {
+            i2cScan();
+        } else if (c == 'd' || c == 'D') {
+            sdTest();
+        } else if (c == 'b' || c == 'B') {
+            hx711BypassTest();
+        } else if (c == 'm' || c == 'M') {
+            mcpDiag();
+        } else if (c == '1') {
+            chDebug(1, 0, 13);  // CH1: MUX ch0 → 74HC4051 pin13(Y0)
+        } else if (c == '4') {
+            chDebug(4, 3, 12);  // CH4: MUX ch3 → 74HC4051 pin12(Y3)
+        } else if (c == '0') {
+            muxHoldAndMonitor(1, 0, 13);  // CH1固定
+        } else if (c == '9') {
+            muxHoldAndMonitor(4, 3, 12);  // CH4固定
+        } else {
+            measureAll();
+        }
+    }
+
+    if (continuousMode) {
+        measureAll();
+        delay(200);
+    }
+}
