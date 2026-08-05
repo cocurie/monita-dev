@@ -127,11 +127,14 @@ static const uint8_t  FW_VERSION = 7;     // 子機ファームのバージョ�
 // アプリ設定（ここを主に編集する）
 // ============================================================
 
-#define DEBUG_MODE           0        // 1: USB Serial デバッグログ有効。本番は 0 ★ボタン誤作動調査のため一時的に1にしている
+#define DEBUG_MODE           1        // 1: USB Serial デバッグログ有効。本番は 0 ★ボタン誤作動調査のため一時的に1にしている
 #define DEBUG_NO_SLEEP       0        // 1: deepSleep をスキップして即 loop() に戻る（DEBUG_MODE 1 時のみ有効）
 #define DEBUG_NO_SIGFOX      0        // 1: AT$SF= を送らずログだけ出す（デューティサイクル節約）
 #define DEBUG_NO_LORA        0        // 1: LoRa送信を行わずログだけ出す
-#define SLEEP_MINUTES        15       // 1サイクル後のスリープ時間（分）
+// 1: センサー計測（HX711/DS18B20/I2C等）を全てスキップし、ダミー値でLoRa送信のみ行う。
+//    COMM_MODE_LORA時のみ有効。PPK2でLoRa通信単体の電流を切り分けて測定する用途。
+#define DEBUG_LORA_ONLY      0
+#define SLEEP_MINUTES        60       // 1サイクル後のスリープ時間（分）
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 // ── タレ（ゼロ点補正）操作 ─────────────────────────────────────
 // 【操作方法】D0 のタクトスイッチを押しながら電源スイッチ(S1)を ON にし、
@@ -161,7 +164,7 @@ static const uint8_t  FW_VERSION = 7;     // 子機ファームのバージョ�
 //   ERR_DS3231_I2C も立てない（他のセンサ・送信処理がエラーでスキップされるのを防ぐ）。
 // 温度は0固定、時刻は取得不可（BLE/LoRaのタイムスタンプ・アドバタイズ時間窓判定は無効化される）。
 // 本番基板（DS3231実装済み）に戻す際は必ず 1 に戻すこと。
-#define DS3231_PRESENT 0
+#define DS3231_PRESENT 1
 
 // USE_DS3231_TIMESTAMP=1 にすると各サイクルで DS3231 の現在時刻を読み出し、
 // DEBUG_MODE=1 の場合はシリアルに出力する（BLE/LoRaモードではペイロードにも使用）。
@@ -208,7 +211,7 @@ static const uint8_t  FW_VERSION = 7;     // 子機ファームのバージョ�
 //   3 = DS18B20（1-Wire 温度センサ）※ 外部プルアップ 4.7kΩ（3V3_SW → CH pin3）必要
 //   4 = VL53L4CD（ToF距離センサ、I2C）※ I2Cモジュール（MPU6050等と同一配線）を使用。
 //       TCA9546A 経由でチャンネル分離するためアドレス競合なし
-const uint8_t CH_ASSIGN[4] = {1, 1, 1, 1};
+const uint8_t CH_ASSIGN[4] = {3, 3, 1, 1};
 
 // ── ひずみ補正係数（キャリブレーション） ──────────────────────────
 //
@@ -227,10 +230,19 @@ const uint8_t CH_ASSIGN[4] = {1, 1, 1, 1};
 // ★ まず生値確認 → キャリブレーション後にこの値を更新する ★
 static const float STRAIN_SCALE = 1110.0f;  // 1.0f = 生値そのまま出力（未キャリブレーション）
 
-// HX711 1ch あたりの生サンプル数（中央値をとる前の個数）
-#define DATA_NUM 5
-// 将来の「同一 ch 複数回平均」等用。現状コードでは未使用。
-#define REPEAT_NUM 3
+// HX711 1回の平均を求めるための生サンプル数（有野川子基板と同じ2段方式）
+#define SAMPLES_PER_AVG 5
+// 平均値を何回取得してメジアンを求めるか（最大・最小はペイロードに含めない）
+#define MEASURE_COUNT   5
+
+// ── VL53L4CD（ToF距離センサ）測定パラメータ ─────────────────────────
+// タイミングバジェット（積分時間）[ms]。VL53L4CD_SetRangeTiming() の第1引数。
+// 長くするほど精度が上がるがサンプル取得に時間がかかる（10〜200ms程度が目安）。
+#define VL53_TIMING_BUDGET_MS   100
+// 1回のメジアンを求めるための生サンプル数
+#define VL53_SAMPLES_PER_MEDIAN 50
+// 上記メジアンを何回取得し、最終メジアンを求めるか
+#define VL53_MEASURE_COUNT      50
 
 #ifndef PI
 #define PI 3.14159265358979323846
@@ -500,7 +512,7 @@ static int32_t loraSleepJitterSeconds(uint16_t jitterMaxSec) {
 // これによりタイムアウトは「スリープ時間」「活動時間」の長い方だけを
 // 超える値であればよい（合計値をカバーする必要はない）。
 // ============================================================
-static uint32_t const WDT_TIMEOUT_MS = 25UL * 60UL * 1000UL;  // 25分（MEASURE_INTERVAL_MIN=20分, ADV_DURATION_MIN=10分に余裕を持たせた値）
+static uint32_t const WDT_TIMEOUT_MS = 65UL * 60UL * 1000UL;  // 65分（VL53L4CD 2段メジアン化で計測時間が最大約10分に伸びたため余裕を持たせた値）
 
 static void wdtInit(uint32_t timeoutMs) {
   NRF_WDT->CONFIG  = (WDT_CONFIG_SLEEP_Run << WDT_CONFIG_SLEEP_Pos);  // スリープ中も継続動作
@@ -709,6 +721,28 @@ static void tcaDisable() {
   Wire.write(0x00);
   Wire.endTransmission();
 }
+
+#if DEBUG_MODE
+// 現在Wireが向いているI2Cバスをスキャンし、応答したアドレスをシリアルに出力する。
+// tcaSelect() で目的のチャネルへ切り替えた直後に呼べば、そのチャネル配下だけを見られる。
+static void scanI2CBus(const char *label) {
+  Serial.print("[I2C SCAN] ");
+  Serial.print(label);
+  Serial.println(" 開始");
+  uint8_t found = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("[I2C SCAN]   検出: 0x");
+      if (addr < 16) Serial.print("0");
+      Serial.println(addr, HEX);
+      found++;
+    }
+  }
+  Serial.print("[I2C SCAN] 検出数: ");
+  Serial.println(found);
+}
+#endif
 
 // ============================================================
 // DS18B20（1-Wire 温度センサ）— MUX 経由でピンを共用
@@ -937,8 +971,9 @@ static void handleBootTare() {
 // 小さな配列のバブルソートで中央値（外れ値に強い簡易ロバスト化）を求める。
 // outRange が非NULLの場合、ソート済み配列の最大-最小（そのサイクル内のブレ幅）も返す。
 // ※ レンジは BLE/LoRaモードのみペイロードに使用する（Sigfoxモードでは未使用）。
+// ※ 最大・最小の値自体はペイロードに含めない（rangeのみ使用）。
 static float medianWithRange(float *a, int n, float *outRange) {
-  float t[5];
+  float t[MEASURE_COUNT];
   memcpy(t, a, sizeof(float) * (size_t)n);
   for (int i = 0; i < n - 1; i++)
     for (int j = 0; j < n - i - 1; j++)
@@ -951,6 +986,14 @@ static float medianWithRange(float *a, int n, float *outRange) {
     *outRange = t[n - 1] - t[0];
   }
   return t[n / 2];
+}
+
+// n個のint配列を昇順ソートしてメジアンを返す（配列はソートされる。VL53L4CDで使用）
+static int medianInt(int *a, int n) {
+  for (int i = 0; i < n - 1; i++)
+    for (int j = 0; j < n - i - 1; j++)
+      if (a[j] > a[j + 1]) { int x = a[j]; a[j] = a[j + 1]; a[j + 1] = x; }
+  return a[n / 2];
 }
 
 // 指定チャネル（1〜4）の HX711 に MUX を合わせてからライブラリ begin
@@ -975,12 +1018,10 @@ static void hxBegin(uint8_t ch) {
   hx.set_offset(s_hx_tare_offset[ch - 1]);
 }
 
-// true=正常、false=タイムアウト（ERR_HX711_TIMEOUT をセット）
-// outRange が非NULLの場合、DATA_NUM回サンプリング中の最大-最小（生値ベース）を返す。
-static bool hxRead(int *out, float *outRange = nullptr) {
-
+// HX711 から SAMPLES_PER_AVG サンプルの平均を1回取得する。
+// 戻り値: true=正常、false=タイムアウト（ERR_HX711_TIMEOUT をセット）
+static bool hxReadAvg(float *outAvg) {
   unsigned long start = millis();
-
   while (!hx.is_ready()) {
     if (millis() - start > 1000) {
 #if DEBUG_MODE
@@ -988,6 +1029,27 @@ static bool hxRead(int *out, float *outRange = nullptr) {
 #endif
       s_errors |= ERR_HX711_TIMEOUT;
       statusErrorRed();
+      *outAvg = 0;
+      return false;
+    }
+  }
+  float sum = 0;
+  for (int i = 0; i < SAMPLES_PER_AVG; i++) {
+    // get_value() = read() - tare_offset（タレ補正済み生値）
+    // read() だとタレ値が反映されないため get_value() を使う
+    sum += hx.get_value();
+  }
+  *outAvg = sum / SAMPLES_PER_AVG;
+  return true;
+}
+
+// MEASURE_COUNT 回の平均値を取得し、そのメジアンを返す（有野川子基板と同じ2段方式）。
+// outRange が非NULLの場合、MEASURE_COUNT回の平均値群の最大-最小（ブレ幅）も返す。
+// 最大・最小はペイロードには含めない（rangeのみBLE/LoRaモードで使用）。
+static bool hxRead(int *out, float *outRange = nullptr) {
+  float avgs[MEASURE_COUNT];
+  for (int i = 0; i < MEASURE_COUNT; i++) {
+    if (!hxReadAvg(&avgs[i])) {
       *out = 0;
       if (outRange != nullptr) {
         *outRange = 0;
@@ -996,15 +1058,8 @@ static bool hxRead(int *out, float *outRange = nullptr) {
     }
   }
 
-  float b[DATA_NUM];
-  for (int i = 0; i < DATA_NUM; i++) {
-    // get_value() = read() - tare_offset（タレ補正済み生値）
-    // read() だとタレ値が反映されないため get_value() を使う
-    b[i] = hx.get_value();
-  }
-
   float range = 0;
-  *out = (int)medianWithRange(b, DATA_NUM, &range);
+  *out = (int)medianWithRange(avgs, MEASURE_COUNT, &range);
   if (outRange != nullptr) {
     *outRange = range;
   }
@@ -1329,11 +1384,17 @@ static int measureMPU() {
 }
 
 // ============================================================
-// VL53L4CD（I2C ToF距離センサ）— 距離[mm]をそのまま返す
+// VL53L4CD（I2C ToF距離センサ）— 距離[mm]を返す
 //
 // I2Cモジュール（MPU6050/LSM6DS と同一配線、TCA9546A 経由）を使用。
 // 想定測距レンジ: 500〜800mm程度（VL53L4CDの最大測距範囲 約1.3m 以内）。
 // 3V3_SW サイクルごとに電源が切れるため、毎サイクル begin()〜StartRanging() から実行する。
+//
+// 計測方式: HX711と同じ2段メジアン方式。
+//   VL53_SAMPLES_PER_MEDIAN 回の生サンプルからメジアンを1回求め、
+//   それを VL53_MEASURE_COUNT 回繰り返して、その最終メジアンを返す。
+// ※ サンプル数・回数を大きくするほど1CHあたりの計測時間が延びる点に注意
+//   （タイミングバジェット VL53_TIMING_BUDGET_MS × サンプル総数が概算所要時間）。
 // ============================================================
 
 static int measureVL53L4CD() {
@@ -1350,40 +1411,70 @@ static int measureVL53L4CD() {
     return 0;
   }
 
-  // タイミングバジェット100ms・連続測定間隔0（都度手動トリガー相当）。
-  // 500〜800mm程度の近距離であれば十分な精度が得られる設定。
-  vl53.VL53L4CD_SetRangeTiming(100, 0);
+  // タイミングバジェット（積分時間）・連続測定間隔0（都度手動トリガー相当）。
+  vl53.VL53L4CD_SetRangeTiming(VL53_TIMING_BUDGET_MS, 0);
   vl53.VL53L4CD_StartRanging();
 
-  uint8_t dataReady = 0;
-  unsigned long t0 = millis();
-  while (!dataReady) {
-    vl53.VL53L4CD_CheckForDataReady(&dataReady);
-    if (millis() - t0 > 1000) {
-      s_errors |= ERR_VL53L4CD_I2C;
-      statusErrorRed();
+  int medians[VL53_MEASURE_COUNT];
+  bool failed = false;
+
+  for (int m = 0; m < VL53_MEASURE_COUNT; m++) {
+    int samples[VL53_SAMPLES_PER_MEDIAN];
+
+    for (int s = 0; s < VL53_SAMPLES_PER_MEDIAN; s++) {
+      uint8_t dataReady = 0;
+      unsigned long t0 = millis();
+      while (!dataReady) {
+        vl53.VL53L4CD_CheckForDataReady(&dataReady);
+        if (millis() - t0 > 1000) {
+          s_errors |= ERR_VL53L4CD_I2C;
+          statusErrorRed();
 #if DEBUG_MODE
-      Serial.println("[VL53L4CD] timeout waiting for data");
+          Serial.println("[VL53L4CD] timeout waiting for data");
 #endif
-      vl53.VL53L4CD_StopRanging();
-      return 0;
+          failed = true;
+          break;
+        }
+        delay(5);
+      }
+      if (failed) break;
+
+      VL53L4CD_Result_t results;
+      vl53.VL53L4CD_GetResult(&results);
+      vl53.VL53L4CD_ClearInterrupt();
+      samples[s] = (int)results.distance_mm;
     }
-    delay(5);
+
+    if (failed) break;
+    medians[m] = medianInt(samples, VL53_SAMPLES_PER_MEDIAN);
+#if DEBUG_MODE
+    Serial.print("[VL53L4CD] median[");
+    Serial.print(m);
+    Serial.print("]=");
+    Serial.print(medians[m]);
+    Serial.println("mm (50サンプル分のメジアン)");
+#endif
   }
 
-  VL53L4CD_Result_t results;
-  vl53.VL53L4CD_GetResult(&results);
-  vl53.VL53L4CD_ClearInterrupt();
   vl53.VL53L4CD_StopRanging();
 
+  if (failed) {
+    return 0;
+  }
+
+  int finalDistance = medianInt(medians, VL53_MEASURE_COUNT);
+
 #if DEBUG_MODE
-  Serial.print("[VL53L4CD] distance=");
-  Serial.print(results.distance_mm);
-  Serial.print("mm status=");
-  Serial.println(results.range_status);
+  Serial.print("[VL53L4CD] distance(median of ");
+  Serial.print(VL53_MEASURE_COUNT);
+  Serial.print(" x ");
+  Serial.print(VL53_SAMPLES_PER_MEDIAN);
+  Serial.print(")=");
+  Serial.print(finalDistance);
+  Serial.println("mm");
 #endif
 
-  return (int)results.distance_mm;
+  return finalDistance;
 }
 
 // ============================================================
@@ -1394,9 +1485,27 @@ static int measureVL53L4CD() {
 int ch[4], tempV, battV;
 
 #if defined(COMM_MODE_BLE) || defined(COMM_MODE_LORA)
-// chRange[0..3]: HX711チャネルのDATA_NUM回サンプリング中の最大-最小（ブレ幅）。
+// chRange[0..3]: HX711チャネルのMEASURE_COUNT回（平均値群）の最大-最小（ブレ幅）。
 // BLE/LoRaのペイロードにのみ使用（Sigfoxモードでは送信しない）。
 int chRange[4];
+#endif
+
+#if defined(COMM_MODE_LORA) && DEBUG_LORA_ONLY
+// センサー計測を一切行わず、ch/temp/batt/rangeにダミー値（0）をセットするだけの関数。
+// PPK2でLoRa通信単体の電流を切り分けて測定する用途（DEBUG_LORA_ONLY=1時のみ使用）。
+static void fillDummyMeasurements() {
+  for (int i = 0; i < 4; i++) {
+    ch[i] = 0;
+#if defined(COMM_MODE_BLE) || defined(COMM_MODE_LORA)
+    chRange[i] = 0;
+#endif
+  }
+  tempV = 0;
+  battV = 0;
+#if DEBUG_MODE
+  Serial.println("[DEBUG_LORA_ONLY] センサー計測をスキップし、ダミー値でLoRa送信します");
+#endif
+}
 #endif
 
 // CH_ASSIGN に従い 4 スロット分を順に計測し、温度・電池を末尾に追加
@@ -1466,7 +1575,19 @@ static void measureAll() {
         s_errors |= ERR_TCA_I2C;
         statusErrorRed();
         ch[i] = 0;
+#if DEBUG_MODE
+        Serial.print("[CH");
+        Serial.print(i + 1);
+        Serial.println("] tcaSelect failed（TCA9546Aが応答していません）");
+#endif
       } else {
+#if DEBUG_MODE
+        {
+          char label[16];
+          snprintf(label, sizeof(label), "CH%d (TCA ch%d)", i + 1, i);
+          scanI2CBus(label);
+        }
+#endif
         ch[i] = measureVL53L4CD();
       }
       tcaDisable();
@@ -1956,7 +2077,7 @@ static void sendLoRa() {
 //   [13-14] BATT      : uint16_t LE（mV）
 //   [15]   Hour       : uint8_t
 //   [16]   Minute     : uint8_t
-//   [17]   CH1 Range  : uint8_t（DATA_NUM回サンプリング中の最大-最小。0〜255にクランプ）
+//   [17]   CH1 Range  : uint8_t（MEASURE_COUNT回の平均値群の最大-最小。0〜255にクランプ）
 //   [18]   CH2 Range  : uint8_t
 //   [19]   CH3 Range  : uint8_t
 //   [20]   CH4 Range  : uint8_t
@@ -2055,7 +2176,7 @@ void setup() {
   }
 #endif
 
-  wdtInit(WDT_TIMEOUT_MS);  // 無人運用の安全網。以降 25 分キックが無ければ自動リセット
+  wdtInit(WDT_TIMEOUT_MS);  // 無人運用の安全網。以降 65 分キックが無ければ自動リセット
 
   rgbHwBegin();
   rgbOff();
@@ -2162,7 +2283,11 @@ void setup() {
   // measureAll() の前に置くことで、直後の計測値に新しいタレが反映される。
   handleBootTare();
 
+#if defined(COMM_MODE_LORA) && DEBUG_LORA_ONLY
+  fillDummyMeasurements();
+#else
   measureAll();
+#endif
 
 #ifdef COMM_MODE_SIGFOX
   sendSigfox();
@@ -2248,7 +2373,11 @@ void loop() {
   // 短押しリセットは電源スイッチ(S1)で代替するため廃止した。
   // これによりスリープ中の割り込み（GPIOTE）が不要になり、約14µA削減できる。
 
+#if defined(COMM_MODE_LORA) && DEBUG_LORA_ONLY
+  fillDummyMeasurements();
+#else
   measureAll();
+#endif
 
 #ifdef COMM_MODE_SIGFOX
   sendSigfox();

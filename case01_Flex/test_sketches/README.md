@@ -29,6 +29,8 @@ v3.02基板の動作確認用。**必ずステップ順に実施すること。*
 | 20 | `20_lora_config_read/` | E220 設定値readback（診断用。18/19の疎通不良時に使う） | XIAOのみ、E220を直結（M0/M1は一時的に3V3固定） |
 | 21 | `21_lora_fix_config/` | E220 設定修正（REG1送信出力・REG3送信方式を正しい値に書込） | Step20で異常値を確認した後 |
 | 22 | `22_lora_multi_child/` | LoRa複数台テスト用 子機（ダミーデータ送信、ブレッドボード版） | XIAOのみ、E220を直結（M0=D1・M1=D2を独立制御）。受信はGateway実機(gateway_v1.1, LoRaビルド)を使用 |
+| 25 | `25_lora_downlink_child/` | Gateway→子機ダウンリンク受信テスト（時刻補正/送信頻度/平均・メジアン回数変更、Company ID+PktType+DeviceID検証、フラッシュ保存） | XIAOのみ、E220を直結（22と同一配線）。送信側はStep26を使用 |
+| 26 | `26_lora_downlink_sender/` | Step25宛てのダウンリンク送信テストツール（D0ボタン押下で1回送信） | XIAOのみ、E220を直結（22と同一配線）。Gateway実機には触れない |
 
 ## アップロード方法
 

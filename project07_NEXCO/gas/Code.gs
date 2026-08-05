@@ -5,23 +5,34 @@
 // ================================
 // バージョン対応表
 // ================================
-//   GASスクリプトバージョン: 4
+//   GASスクリプトバージョン: 6
 //     - v1〜3: 旧フォーマット（case02_Gateway/firmware/gateway_v1.1 対応）
 //     - v4: project07_NEXCO 専用フォーマットに対応（2026-07-25）
 //       ペイロード: 26B/台 = 52 hex文字
 //       DeviceID(1B) + Temp(1B) + CH1-4メジアン(8B) + CH1-4 Max/Min(16B, チャンネルごとに隣接)
+//     - v5: Gateway RTC(DS3231)受信時刻を追加（2026-07-25、GATEWAY_FW_VERSION=28対応）
+//       ペイロード: 30B/台 = 60 hex文字
+//       Epoch(4B, uint32 LE) + DeviceID(1B) + Temp(1B) + CH1-4メジアン(8B) + CH1-4 Max/Min(16B)
+//       ★受信日時(A列)はGAS側の受信タイミング（サーバnew Date()）であり実測時刻ではない。
+//         再送キューで複数回分がまとめて届くと同一時刻で複数行が並ぶことがあるため、
+//         実際の測定タイミングを区別できるようQ列にGateway実測時刻を追加した。
+//     - v6: 重複行の書き込みスキップを追加（2026-07-26）
+//       SIM7080GのAT応答読み取り不良でGateway側が「送信失敗」と誤判定し同一データを
+//       再送しても、GASには毎回届いてしまい同一内容の行が複数重複する事象を確認。
+//       DeviceIDごとに直前書き込み分のGateway実測時刻をキャッシュし、完全一致なら
+//       スキップするようにした（有野川連続動作テスト、2026-07-26確認）。
 //
 //   対応する子機ファーム:
-//     - project07_NEXCO/firmware/src/main.cpp（COMM_MODE_BLE）
+//     - project07_NEXCO/firmware_child/src/main.cpp（COMM_MODE_BLE）
 //       SAMPLES_PER_AVG=5, MEASURE_COUNT=10
 //
 //   対応するGatewayファーム:
-//     - project07_NEXCO/firmware_gateway/src/main.cpp
+//     - project07_NEXCO/firmware_gateway/src/main.cpp（GATEWAY_FW_VERSION=28〜）
 //
 // ================================
 // スプレッドシート列構成（databox シート）
 // ================================
-//   A: 受信日時
+//   A: 受信日時（サーバ受信時刻。実測時刻ではない）
 //   B: DeviceID
 //   C: 温度(℃)
 //   D: CH1 メジアン(με)
@@ -37,6 +48,7 @@
 //   N: CH4 Max(με)
 //   O: CH4 Min(με)
 //   P: LTE-M RSSI(CSQ)
+//   Q: Gateway実測時刻（DS3231 RTC、子機受信時刻）
 // ================================
 
 
@@ -66,7 +78,7 @@ function testMailPermission() {
 // 基本設定
 // ================================
 
-const SPREADSHEET_ID = '12VfgxPoRmpr9tkI1myzvIgvjqcDxERkVcQxXWzvYr0I';
+const SPREADSHEET_ID = '11qVg9cqcbn4FFPONVGZFsndizEQbPTeAnzKJzTJ-fHo';
 
 // アラート設定が始まる行番号（各デバイスシートの何行目から読むか）
 const ALERT_START_ROW = 3;
@@ -208,27 +220,28 @@ function parsePayloadV303(hex) {
 
 
 // ================================
-// project07_NEXCO 専用レコードデコード（26バイト/台 = 52 hex文字）
+// project07_NEXCO 専用レコードデコード（30バイト/台 = 60 hex文字、v5〜）
 // ================================
 // レイアウト:
-//   [0]    DeviceID
-//   [1]    温度(int8_t, 整数℃)
-//   [2-3]  CH1 メジアン(int16 LE)
-//   [4-5]  CH2 メジアン(int16 LE)
-//   [6-7]  CH3 メジアン(int16 LE)
-//   [8-9]  CH4 メジアン(int16 LE)
-//   [10-11] CH1 Max(int16 LE)
-//   [12-13] CH1 Min(int16 LE)
-//   [14-15] CH2 Max(int16 LE)
-//   [16-17] CH2 Min(int16 LE)
-//   [18-19] CH3 Max(int16 LE)
-//   [20-21] CH3 Min(int16 LE)
-//   [22-23] CH4 Max(int16 LE)
-//   [24-25] CH4 Min(int16 LE)
-function parseNEXCORecord(hex52) {
+//   [0-3]  Gateway RTC epoch(uint32 LE, UNIX時刻)
+//   [4]    DeviceID
+//   [5]    温度(int8_t, 整数℃)
+//   [6-7]  CH1 メジアン(int16 LE)
+//   [8-9]  CH2 メジアン(int16 LE)
+//   [10-11] CH3 メジアン(int16 LE)
+//   [12-13] CH4 メジアン(int16 LE)
+//   [14-15] CH1 Max(int16 LE)
+//   [16-17] CH1 Min(int16 LE)
+//   [18-19] CH2 Max(int16 LE)
+//   [20-21] CH2 Min(int16 LE)
+//   [22-23] CH3 Max(int16 LE)
+//   [24-25] CH3 Min(int16 LE)
+//   [26-27] CH4 Max(int16 LE)
+//   [28-29] CH4 Min(int16 LE)
+function parseNEXCORecord(hex60) {
   var bytes = [];
-  for (var i = 0; i < hex52.length; i += 2) {
-    bytes.push(parseInt(hex52.substr(i, 2), 16));
+  for (var i = 0; i < hex60.length; i += 2) {
+    bytes.push(parseInt(hex60.substr(i, 2), 16));
   }
   function int16le(lo, hi) {
     var val = lo | (hi << 8);
@@ -238,21 +251,27 @@ function parseNEXCORecord(hex52) {
   function int8(b) {
     return b > 127 ? b - 256 : b;
   }
+  function uint32le(b0, b1, b2, b3) {
+    return (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) >>> 0;
+  }
+  var epoch = uint32le(bytes[0], bytes[1], bytes[2], bytes[3]);
   return {
-    deviceId: bytes[0],
-    temp:     int8(bytes[1]),
-    chMed:  [ int16le(bytes[2],  bytes[3]),
-               int16le(bytes[4],  bytes[5]),
-               int16le(bytes[6],  bytes[7]),
-               int16le(bytes[8],  bytes[9])  ],
-    chMax:  [ int16le(bytes[10], bytes[11]),
-               int16le(bytes[14], bytes[15]),
+    // epoch=0 はGateway側でRTC未初期化だった場合（rtcAvailable=false）を示す
+    rtcTime:  epoch > 0 ? new Date(epoch * 1000) : '',
+    deviceId: bytes[4],
+    temp:     int8(bytes[5]),
+    chMed:  [ int16le(bytes[6],  bytes[7]),
+               int16le(bytes[8],  bytes[9]),
+               int16le(bytes[10], bytes[11]),
+               int16le(bytes[12], bytes[13]) ],
+    chMax:  [ int16le(bytes[14], bytes[15]),
                int16le(bytes[18], bytes[19]),
-               int16le(bytes[22], bytes[23]) ],
-    chMin:  [ int16le(bytes[12], bytes[13]),
-               int16le(bytes[16], bytes[17]),
+               int16le(bytes[22], bytes[23]),
+               int16le(bytes[26], bytes[27]) ],
+    chMin:  [ int16le(bytes[16], bytes[17]),
                int16le(bytes[20], bytes[21]),
-               int16le(bytes[24], bytes[25]) ],
+               int16le(bytes[24], bytes[25]),
+               int16le(bytes[28], bytes[29]) ],
   };
 }
 
@@ -294,8 +313,8 @@ function doGet(e) {
       // info行: 受信日時 + Gateway情報のみ。センサ列(D-O)は空欄
       infoSheet.appendRow([
         new Date(),                                              // A: 受信日時
-        'GW',                                                    // B: DeviceID欄にGW識別子
-        '',                                                      // C: 温度
+        'Monita Gateway',                                                    // B: DeviceID欄にGW識別子
+        'Initial communication',                                                      // C: 温度
         '', '', '', '',                                          // D-G: CH med
         '', '', '', '', '', '', '', '',                          // H-O: Max/Min
         p.csq || '',                                             // P: CSQ
@@ -324,8 +343,8 @@ function doGet(e) {
     var dBlob = p.d || '';
 
     for (var i = 0; i < n; i++) {
-      var chunk = dBlob.substr(i * 52, 52);
-      if (chunk.length < 52) continue;
+      var chunk = dBlob.substr(i * 60, 60);
+      if (chunk.length < 60) continue;
       var d = parseNEXCORecord(chunk);
 
       // DeviceID → 内部識別キー（クールダウン用）
@@ -340,13 +359,29 @@ function doGet(e) {
         continue;
       }
 
-      // 列構成（16列）:
-      // A:受信日時 B:DeviceID C:温度(℃)
+      // ★2026-07-26: SIM7080Gの応答読み取り不良により、Gateway側が「送信失敗」と誤判定して
+      // 同一データを再送すると、GASには実際には毎回届いてしまい同一内容の行が複数重複する
+      // 事象を確認した（例: 同一DeviceID・同一Gateway実測時刻の行が数秒間隔で3行連続）。
+      // 直前に書き込んだ(DeviceID, Gateway実測時刻)の組をキャッシュし、完全一致なら
+      // 重複として書き込みをスキップする（epoch=0＝RTC異常時は判定できないためスキップしない）。
+      if (d.rtcTime instanceof Date) {
+        var dedupProps = PropertiesService.getScriptProperties();
+        var dedupKey = 'lastWrite_' + d.deviceId;
+        var dedupVal = d.rtcTime.getTime().toString();
+        if (dedupProps.getProperty(dedupKey) === dedupVal) {
+          console.log('[DEDUP] DeviceID=' + d.deviceId + ' epoch=' + dedupVal + ' は直前と同一のため書き込みスキップ');
+          continue;
+        }
+        dedupProps.setProperty(dedupKey, dedupVal);
+      }
+
+      // 列構成（17列）:
+      // A:受信日時(サーバ) B:DeviceID C:温度(℃)
       // D:CH1med E:CH2med F:CH3med G:CH4med
       // H:CH1Max I:CH1Min J:CH2Max K:CH2Min L:CH3Max M:CH3Min N:CH4Max O:CH4Min
-      // P:LTE-M RSSI
+      // P:LTE-M RSSI Q:Gateway実測時刻(RTC)
       sheet.appendRow([
-        new Date(),                                            // A: 受信日時
+        new Date(),                                            // A: 受信日時(サーバ)
         d.deviceId,                                            // B: DeviceID
         d.temp,                                                // C: 温度(℃)
         d.chMed[0], d.chMed[1], d.chMed[2], d.chMed[3],      // D-G: CH1-4 メジアン
@@ -355,6 +390,7 @@ function doGet(e) {
         d.chMax[2], d.chMin[2],                               // L-M: CH3 Max/Min
         d.chMax[3], d.chMin[3],                               // N-O: CH4 Max/Min
         csq,                                                   // P: LTE-M RSSI
+        d.rtcTime,                                             // Q: Gateway実測時刻(RTC)
       ]);
 
       // アラート判定（メジアン値を使用）
