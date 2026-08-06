@@ -1,5 +1,5 @@
 /**
- * Monita Flex 横河基板 ver1.1 — 本番用スケッチ（スケルトン / 準備中）
+ * Monita Flex 横河基板 ver1.1 — 本番用スケッチ
  *
  * 【対象ハード】
  *   XIAO ESP32-C3 + ver1.1基板（HX711×5 / 74HC4051 MUX / MCP23008 / ADS1115 / MCP9600 / SD）
@@ -19,15 +19,19 @@
  *      cp main_production.cpp.bak main.cpp
  *   3. 下記「設定項目」を編集してビルド・書き込み
  *
- * 【現在の状態】
- *   骨組み（スケルトン）。HX711/ADS1115/MCP9600/SD計測とCSV保存は動作する想定だが、
- *   WiFi/BLE送信は TODO のスタブ。実装時は各 TODO を埋めること。
+ * 【通信方式が COMM_USE_BLE のとき】
+ *   常時: BLEアドバタイズ(Manufacturer Specific Data)でCH1〜8実測値をブロードキャスト配信。
+ *   追加: GATTサーバー(Nordic UART Service)を常設し、コントローラーからの設定変更・
+ *         Tare・時刻同期・ログダンプなどのコマンドを受け付ける（接続時のみ）。
+ *   コマンド一覧は下記 handleCommand() を参照。
  */
 
 #include <Arduino.h>
 #include <SPI.h>
 #include <SD.h>
 #include <time.h>
+#include <algorithm>
+#include <Preferences.h>
 #include "soft_i2c.h"
 
 #if defined(COMM_USE_BLE)
@@ -43,15 +47,24 @@
 // ■■■ 設定項目（本番運用でここだけ編集する想定） ■■■
 // ============================================================================
 
-// ---- 計測間隔 ----
-static const uint32_t MEASURE_INTERVAL_SEC = 60;   // 計測間隔（秒）
+// ---- 計測間隔・平均化のデフォルト値 ----
+// 実際に使う値は起動時にNVSから読み込む（NVSに保存が無い初回のみ、この値を使う）。
+// 計測間隔は分単位で管理する（秒単位の細かい制御は運用上不要なため）。
+static const uint32_t MEASURE_INTERVAL_MIN_DEFAULT = 1;  // 計測間隔（分）
+static const uint8_t  AVG_N_DEFAULT = 5;   // 1回の測定あたりの平均サンプル数
+static const uint8_t  AVG_M_DEFAULT = 5;   // 平均値をM回とり、その中央値(メジアン)を採用
+
+static const uint32_t INTERVAL_MIN_MIN = 1;      // 最短1分
+static const uint32_t INTERVAL_MIN_MAX = 1440;   // 最長24時間
+static const uint8_t  AVG_N_MIN = 1, AVG_N_MAX = 50;
+static const uint8_t  AVG_M_MIN = 1, AVG_M_MAX = 25;  // g_hxSamples[] のサイズと連動
 
 // ---- RTC時刻設定 ----
 // 本基板には専用RTCチップ（DS3231等）は搭載されていない（netlist確認済み・2026/08時点）。
 // ESP32内蔵RTC（time.h）をソフトウェアで運用する。
 //   - 工場出荷時 / 初回書き込み時はコンパイル時刻を初期値として設定する
-//   - 現場では BLE/WiFi 経由で時刻同期コマンドを受けて rtcSetTime() を呼ぶ運用を想定（TODO）
-//   - Deep Sleep をまたぐ場合は RTC_DATA_ATTR 変数で起床後も時刻を保持する
+//   - COMM_USE_BLEビルドはWiFiを持たずNTP同期できないため、現場ではコントローラーから
+//     SETTIME コマンドで時刻を設定する運用とする（電源を切るたびに再設定が必要）
 #define RTC_DEFAULT_YEAR   2026
 #define RTC_DEFAULT_MONTH  1     // 1-12
 #define RTC_DEFAULT_DAY    1
@@ -74,14 +87,13 @@ static const ChannelType CH_TYPE[5] = {
 };
 
 // ---- ひずみ・変位 変換係数 ----
-// raw(HX711 24bit符号付き) → 物理値(µε等) の変換係数。 physical = (raw - OFFSET) / COEFF
+// raw(HX711 24bit符号付き) → 物理値(µε等) の変換係数。 physical = (raw - offset[ch]) / COEFF
 //
 // HX711 VCC=3V（規定動作範囲2.6〜5.5V内）で運用。2Vはレギュレーターを介さず3Vに戻した
 // （2Vでは内部PGAのゲイン圧縮により不安定だったため。詳細: test_results/CH1_strain_test_2V_20260804.md）。
 // 係数1110は3V実測（印加200〜1000µε）でほぼ1:1・誤差1〜2%程度を確認済み（2026/08/04）。
-// OFFSET=0としているため、実運用ではセンサー個体差に応じたタレ（ゼロ点補正）を別途行うこと。
-static constexpr float STRAIN_DISP_COEFF  = 1110.0f;
-static constexpr float STRAIN_DISP_OFFSET = 0.0f;
+// offset[ch] はチャンネルごとのゼロ点補正値。デフォルト0、TAREコマンドで更新しNVSに保存する。
+static constexpr float STRAIN_DISP_COEFF = 1110.0f;
 
 // ---- SDカード ----
 #define SD_LOG_ENABLED_DEFAULT true   // 起動時デフォルトでSD保存を有効にする
@@ -96,7 +108,8 @@ static constexpr float STRAIN_DISP_OFFSET = 0.0f;
 #endif
 
 // ---- デバイス識別（WiFi/BLE共通） ----
-static const uint8_t DEVICE_ID_NUM = 0x01;  // 子機ID（複数台運用時はここを変える: 0x01〜0xFF）
+// 実際に使う値は起動時にNVSから読み込む（複数台運用時はコントローラーのDEVIDコマンドで変更する）。
+static const uint8_t DEVICE_ID_NUM_DEFAULT = 0x01;
 
 #if defined(COMM_USE_WIFI)
 static const char* WIFI_SSID     = "GlocalNet_0VWUPL";
@@ -127,6 +140,14 @@ static const uint8_t  BLE_COMPANY_ID_HI = 0xFF;
 // 0x03を間借りせず横河専用の値に戻した（2026-08-05、8CH対応Gateway新設に伴う変更）。
 static const uint8_t  BLE_PKT_TYPE      = 0x11;
 static const uint32_t BLE_ADV_INTERVAL_MS = 3000;
+
+// ---- GATT NUS (コントローラーからのコマンド受信用) ----
+// monita-controller (project06_yokogawa) 側と同一のUUIDを使用。
+static const char* NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+static const char* NUS_CHAR_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";  // コントローラー→本機
+static const char* NUS_CHAR_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";  // 本機→コントローラー
+static const uint16_t BLE_PREFERRED_MTU = 247;
+static const size_t   DUMP_CHUNK_SIZE   = 180;  // BLE_PREFERRED_MTU-3 以下に収める
 #endif
 
 // ============================================================================
@@ -143,6 +164,46 @@ static const uint32_t BLE_ADV_INTERVAL_MS = 3000;
 
 // MUX切替後、HX711読み出し開始までの待ち時間（接触不良/信号なまり対策で調整）
 static const uint16_t MUX_SETTLE_MS = 50;
+
+// ============================================================================
+// 実行時設定（NVS永続化） — 計測間隔・平均化回数・デバイスID・チャンネルオフセット
+// ============================================================================
+static Preferences g_prefs;
+
+static volatile uint32_t g_measure_interval_min = MEASURE_INTERVAL_MIN_DEFAULT;  // NVSに保存する正の値(分)
+static volatile uint8_t  g_avg_n = AVG_N_DEFAULT;
+static volatile uint8_t  g_avg_m = AVG_M_DEFAULT;
+static volatile uint8_t  g_device_id = DEVICE_ID_NUM_DEFAULT;
+static volatile bool     g_running = true;
+static float g_ch_offset[5] = {0, 0, 0, 0, 0};  // TAREで更新するチャンネルごとのゼロ点(raw単位)
+
+// loop()の間隔判定は内部的にミリ秒で行うため、分→ミリ秒に変換して返すヘルパー
+static inline uint32_t measureIntervalMs() { return g_measure_interval_min * 60UL * 1000UL; }
+
+static void settingsLoad() {
+    g_prefs.begin("monita", true);  // read-only open
+    g_measure_interval_min = g_prefs.getUInt("intervalMin", MEASURE_INTERVAL_MIN_DEFAULT);
+    g_avg_n      = g_prefs.getUChar("avgN", AVG_N_DEFAULT);
+    g_avg_m      = g_prefs.getUChar("avgM", AVG_M_DEFAULT);
+    g_device_id  = g_prefs.getUChar("devid", DEVICE_ID_NUM_DEFAULT);
+    for (int i = 0; i < 5; i++) {
+        char key[8];
+        snprintf(key, sizeof(key), "off%d", i);
+        g_ch_offset[i] = g_prefs.getFloat(key, 0.0f);
+    }
+    g_prefs.end();
+}
+static void settingsSaveInterval() { g_prefs.begin("monita", false); g_prefs.putUInt("intervalMin", g_measure_interval_min); g_prefs.end(); }
+static void settingsSaveAvgN()     { g_prefs.begin("monita", false); g_prefs.putUChar("avgN", g_avg_n); g_prefs.end(); }
+static void settingsSaveAvgM()     { g_prefs.begin("monita", false); g_prefs.putUChar("avgM", g_avg_m); g_prefs.end(); }
+static void settingsSaveDevId()    { g_prefs.begin("monita", false); g_prefs.putUChar("devid", g_device_id); g_prefs.end(); }
+static void settingsSaveOffset(int ch) {
+    char key[8];
+    snprintf(key, sizeof(key), "off%d", ch);
+    g_prefs.begin("monita", false);
+    g_prefs.putFloat(key, g_ch_offset[ch]);
+    g_prefs.end();
+}
 
 // ============================================================================
 // MCP23008 — 74HC4051 MUXチャンネル選択
@@ -193,8 +254,36 @@ static int32_t hx711Read() {
     return (int32_t)raw;
 }
 
-static float hx711ToPhysical(int32_t raw) {
-    return (raw - STRAIN_DISP_OFFSET) / STRAIN_DISP_COEFF;  // 暫定校正（上記コメント参照）
+// g_avg_n回サンプリングして単純平均した生値を返す（読み取り失敗が全て失敗ならINT32_MIN相当でNANを返す）
+static float hx711ReadAveraged() {
+    int64_t sum = 0;
+    int count = 0;
+    uint8_t n = g_avg_n;
+    for (uint8_t i = 0; i < n; i++) {
+        int32_t r = hx711Read();
+        if (r != INT32_MIN) { sum += r; count++; }
+    }
+    if (count == 0) return NAN;
+    return (float)((double)sum / count);
+}
+
+// hx711ReadAveraged() をg_avg_m回繰り返し、その中央値(メジアン)を最終raw値として返す。
+// 事前に muxSelect() 済みであること。
+static float hx711ReadMedianOfAverages() {
+    float vals[AVG_M_MAX];
+    int n = 0;
+    uint8_t m = g_avg_m;
+    for (uint8_t i = 0; i < m && n < AVG_M_MAX; i++) {
+        float v = hx711ReadAveraged();
+        if (!isnan(v)) vals[n++] = v;
+    }
+    if (n == 0) return NAN;
+    std::sort(vals, vals + n);
+    return vals[n / 2];
+}
+
+static float hx711ToPhysical(float rawMedian, uint8_t ch) {
+    return (rawMedian - g_ch_offset[ch]) / STRAIN_DISP_COEFF;
 }
 
 // ============================================================================
@@ -239,9 +328,19 @@ static float adsReadVoltage(uint16_t config, float gain, float offset) {
 // MCP9600 — CH6 熱電対 K型
 // ============================================================================
 static constexpr uint8_t MCP9600_HOTJUNCTION  = 0x00;
+static constexpr uint8_t MCP9600_STATUS       = 0x04;
 static constexpr uint8_t MCP9600_SENSORCONFIG = 0x05;
 static constexpr uint8_t MCP9600_DEVICECONFIG = 0x06;
 static constexpr uint8_t MCP9600_DEVICEID     = 0x20;
+
+// MCP9601のSTATUSレジスタ ビット位置（MCP9600とは異なる。
+// case01_Flex/test_sketches/15_mcp9600 のコメント参照）。
+static constexpr uint8_t MCP9601_STATUS_OPENCIRCUIT  = 0x10;  // bit4
+static constexpr uint8_t MCP9601_STATUS_SHORTCIRCUIT = 0x20;  // bit5
+
+// 断線・短絡フラグのデバウンス回数（VSENSEノードが高インピーダンスでノイズを拾いやすいため、
+// 単発フラグは誤報とみなし連続でこの回数立った時のみ確定させる。15_mcp9600での実測検証値を踏襲）。
+static constexpr uint8_t MCP9600_FAULT_DEBOUNCE_COUNT = 10;
 
 static uint8_t g_mcp9600_addr = 0;
 
@@ -252,7 +351,10 @@ static uint8_t mcp9600Scan() {
 static bool mcp9600Init(uint8_t addr) {
     uint8_t id[2] = {};
     if (!softI2CReadReg(addr, MCP9600_DEVICEID, id, 2)) return false;
-    if (id[0] != 0x40) return false;
+    // 0x40=MCP9600, 0x41=MCP9601（熱電対FlexモジュールはMCp9601採用に更新済み。
+    // case01_Flex/test_sketches/15_mcp9600 も Adafruit_MCP9601 に対応済み）。
+    // 0x40固定チェックだと実チップ(0x41)と不一致になり誤って未検出扱いになるため両対応する。
+    if (id[0] != 0x40 && id[0] != 0x41) return false;
     softI2CWriteReg(addr, MCP9600_SENSORCONFIG, 0x03);
     softI2CWriteReg(addr, MCP9600_DEVICECONFIG, 0x80);
     return true;
@@ -261,6 +363,28 @@ static float mcp9600ReadTemp(uint8_t addr) {
     uint8_t buf[2];
     if (!softI2CReadReg(addr, MCP9600_HOTJUNCTION, buf, 2)) return NAN;
     return (int16_t)((buf[0] << 8) | buf[1]) * 0.0625f;
+}
+static uint8_t mcp9600ReadStatus(uint8_t addr) {
+    uint8_t st = 0;
+    softI2CReadReg(addr, MCP9600_STATUS, &st, 1);
+    return st;
+}
+
+// STATUSレジスタをMCP9600_FAULT_DEBOUNCE_COUNT回、約1秒間隔でサンプリングし、
+// 全回連続でフラグが立っていた場合のみ断線/短絡を確定させる（15_mcp9600のデバウンス方式を踏襲）。
+// 1回でも立たなかった回があれば「連続で立った」ことにはならないため未確定のまま。
+static void mcp9600CheckFaults(uint8_t addr, bool& ocFault, bool& scFault,
+                                uint8_t& ocRaisedCount, uint8_t& scRaisedCount) {
+    ocRaisedCount = 0;
+    scRaisedCount = 0;
+    for (uint8_t i = 0; i < MCP9600_FAULT_DEBOUNCE_COUNT; i++) {
+        uint8_t st = mcp9600ReadStatus(addr);
+        if (st & MCP9601_STATUS_OPENCIRCUIT)  ocRaisedCount++;
+        if (st & MCP9601_STATUS_SHORTCIRCUIT) scRaisedCount++;
+        if (i < MCP9600_FAULT_DEBOUNCE_COUNT - 1) delay(1000);
+    }
+    ocFault = (ocRaisedCount >= MCP9600_FAULT_DEBOUNCE_COUNT);
+    scFault = (scRaisedCount >= MCP9600_FAULT_DEBOUNCE_COUNT);
 }
 
 // ============================================================================
@@ -281,7 +405,7 @@ static void rtcApplyDefault() {
     settimeofday(&tv, nullptr);
 }
 
-// BLE/WiFi経由の時刻同期コマンドから呼ぶ想定（TODO: 呼び出し元の実装）
+// BLE経由の SETTIME コマンドから呼ぶ
 static void rtcSetTime(uint16_t year, uint8_t mon, uint8_t day, uint8_t hh, uint8_t mm, uint8_t ss) {
     struct tm tm0 = {};
     tm0.tm_year = year - 1900;
@@ -310,6 +434,9 @@ static bool g_sd_ok = false;
 static bool g_sd_log_enabled = SD_LOG_ENABLED_DEFAULT;
 static const char* LOG_PATH = "/monita_log.csv";
 
+// loop()タスクとBLEタスク(DUMP読み出し)から同時にSDへアクセスされるのを防ぐミューテックス
+static SemaphoreHandle_t g_sdMutex = nullptr;
+
 static bool sdInit() {
     SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
     if (!SD.begin(SD_CS)) return false;
@@ -328,15 +455,298 @@ static const char* chTypeLabel(ChannelType t) {
 }
 
 // ============================================================================
+// 全CH計測 → SD保存 → 送信
+// ============================================================================
+struct Measurement {
+    float    hx_raw[5];   // hx711ReadMedianOfAverages() の結果（オフセット適用前）
+    float    hx_phys[5];
+    bool     hx_ok[5];
+    float    ch6_tempC;
+    bool     ch6_ok;
+    bool     ch6_openCircuit;   // デバウンス確定した断線
+    bool     ch6_shortCircuit;  // デバウンス確定した短絡
+    float    ch7_V, ch8_V;
+    bool     ch7_ok, ch8_ok;
+};
+
+static Measurement measureAll() {
+    Measurement m = {};
+
+    for (uint8_t ch = 0; ch < 5; ch++) {
+        muxSelect(CH_TO_MUX[ch]);
+        delay(MUX_SETTLE_MS);
+        float raw = hx711ReadMedianOfAverages();
+        m.hx_ok[ch]   = !isnan(raw);
+        m.hx_raw[ch]  = raw;
+        m.hx_phys[ch] = m.hx_ok[ch] ? hx711ToPhysical(raw, ch) : NAN;
+    }
+
+    if (g_mcp9600_addr) {
+        float t = mcp9600ReadTemp(g_mcp9600_addr);
+        m.ch6_ok = !isnan(t);
+        m.ch6_tempC = t;
+
+        uint8_t ocN = 0, scN = 0;
+        mcp9600CheckFaults(g_mcp9600_addr, m.ch6_openCircuit, m.ch6_shortCircuit, ocN, scN);
+        if (ocN && !m.ch6_openCircuit) {
+            Serial.printf("[NOISE] CH6 オープン回路フラグを %u/%u 回検出（デバウンス未確定のため棄却）\n",
+                          ocN, MCP9600_FAULT_DEBOUNCE_COUNT);
+        }
+        if (scN && !m.ch6_shortCircuit) {
+            Serial.printf("[NOISE] CH6 ショートフラグを %u/%u 回検出（デバウンス未確定のため棄却）\n",
+                          scN, MCP9600_FAULT_DEBOUNCE_COUNT);
+        }
+    }
+
+    m.ch7_V = adsReadVoltage(ADS_CFG_CH7, GAIN_CH7, OFFSET_CH7);
+    m.ch7_ok = !isnan(m.ch7_V);
+    m.ch8_V = adsReadVoltage(ADS_CFG_CH8, GAIN_CH8, OFFSET_CH8);
+    m.ch8_ok = !isnan(m.ch8_V);
+
+    return m;
+}
+
+// 現在のMUX位置のままチャンネルchを再計測し、その生値をゼロ点として記録する（TAREコマンド用）
+static float tareChannel(uint8_t ch) {
+    muxSelect(CH_TO_MUX[ch]);
+    delay(MUX_SETTLE_MS);
+    float raw = hx711ReadAveraged();
+    if (isnan(raw)) return NAN;
+    g_ch_offset[ch] = raw;
+    settingsSaveOffset(ch);
+    return raw;
+}
+
+static void logToSD(const Measurement& m) {
+    if (!g_sd_log_enabled || !g_sd_ok) return;
+    if (xSemaphoreTake(g_sdMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        Serial.println("[SD] busy(dump中?) → 今回のログ保存をスキップ");
+        return;
+    }
+    File f = SD.open(LOG_PATH, FILE_APPEND);
+    if (f) {
+        char ts[24];
+        rtcNowString(ts, sizeof(ts));
+
+        f.print(ts);
+        for (uint8_t ch = 0; ch < 5; ch++) {
+            f.print(',');
+            if (m.hx_ok[ch]) f.print(m.hx_phys[ch], 3); else f.print("NaN");
+            f.print(',');
+            f.print(chTypeLabel(CH_TYPE[ch]));
+        }
+        f.print(',');
+        if (m.ch6_ok) f.print(m.ch6_tempC, 2); else f.print("NaN");
+        f.print(',');
+        if (m.ch7_ok) f.print(m.ch7_V, 3); else f.print("NaN");
+        f.print(',');
+        if (m.ch8_ok) f.print(m.ch8_V, 3); else f.print("NaN");
+        f.println();
+        f.close();
+    }
+    xSemaphoreGive(g_sdMutex);
+}
+
+// ============================================================================
 // 通信（WiFi / BLE / シリアルデバッグ）
 // ============================================================================
 #if defined(COMM_USE_BLE)
-// BLEアドバタイズのMSD(Manufacturer Specific Data)に計測値を載せて常時ブロードキャストする方式。
-// NUS/接続型ではなく、project07_NEXCO/firmware_child と同じ「アドバタイズのみ」方式を踏襲。
+
+static NimBLECharacteristic* g_pTxCharacteristic = nullptr;
+static volatile bool g_bleControllerConnected = false;
+
+static void notifyReply(const String& msg) {
+    if (g_pTxCharacteristic == nullptr || !g_bleControllerConnected) return;
+    g_pTxCharacteristic->setValue((uint8_t*)msg.c_str(), msg.length());
+    g_pTxCharacteristic->notify();
+    Serial.print("[BLE] notify: ");
+    Serial.println(msg);
+}
+
+// SDログファイルをチャンク分割してNotifyでコントローラーへ送る。
+// フレーミング: "DUMPHDR:<total_bytes>" → 生データチャンクを複数notify → "DUMPEND"
+static void handleDumpCommand() {
+    if (!g_sd_ok) { notifyReply("ERR:NOSD"); return; }
+    if (xSemaphoreTake(g_sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        notifyReply("ERR:SDBUSY");
+        return;
+    }
+    File f = SD.open(LOG_PATH, FILE_READ);
+    if (!f) {
+        xSemaphoreGive(g_sdMutex);
+        notifyReply("ERR:OPEN");
+        return;
+    }
+
+    uint32_t total = f.size();
+    char hdr[32];
+    snprintf(hdr, sizeof(hdr), "DUMPHDR:%lu", (unsigned long)total);
+    notifyReply(hdr);
+    delay(30);
+
+    uint8_t buf[DUMP_CHUNK_SIZE];
+    size_t r;
+    uint32_t sent = 0;
+    while ((r = f.read(buf, sizeof(buf))) > 0 && g_bleControllerConnected) {
+        g_pTxCharacteristic->setValue(buf, r);
+        g_pTxCharacteristic->notify();
+        sent += r;
+        delay(20);  // BLEスタックの送信キュー詰まり防止
+    }
+    f.close();
+    xSemaphoreGive(g_sdMutex);
+
+    Serial.printf("[BLE] DUMP完了: %lu/%lu バイト送信\n", (unsigned long)sent, (unsigned long)total);
+    notifyReply("DUMPEND");
+}
+
+// コマンド解釈:
+//   GET                          現在の設定・状態を取得
+//   SETTIME:YYYYMMDDHHMMSS       時刻設定
+//   INTERVAL:N                   計測間隔をN分に変更（1〜1440）
+//   AVGN:N                       平均化サンプル数を変更（1〜50）
+//   AVGM:N                       メジアン算出用の測定回数を変更（1〜25）
+//   START / STOP                 計測ループの再開・一時停止
+//   TARE                         CH1〜5のゼロ点補正（現在値を新しいゼロとする）
+//   DEVID:N                      デバイスIDを変更（1〜255）
+//   DUMP                         SDログをコントローラーへ転送
+static void handleCommand(const String& raw) {
+    String cmd = raw;
+    cmd.trim();
+    Serial.print("[BLE] recv: ");
+    Serial.println(cmd);
+
+    if (cmd == "GET") {
+        char ts[24];
+        rtcNowString(ts, sizeof(ts));
+        char reply[128];
+        snprintf(reply, sizeof(reply), "INTERVAL=%lu;N=%u;M=%u;RUN=%d;DEVID=%u;TIME=%s",
+                  (unsigned long)g_measure_interval_min, g_avg_n, g_avg_m,
+                  g_running ? 1 : 0, g_device_id, ts);
+        notifyReply(reply);
+
+    } else if (cmd.startsWith("SETTIME:")) {
+        String v = cmd.substring(8);
+        if (v.length() == 14) {
+            uint16_t year = v.substring(0, 4).toInt();
+            uint8_t  mon  = v.substring(4, 6).toInt();
+            uint8_t  day  = v.substring(6, 8).toInt();
+            uint8_t  hh   = v.substring(8, 10).toInt();
+            uint8_t  mm   = v.substring(10, 12).toInt();
+            uint8_t  ss   = v.substring(12, 14).toInt();
+            rtcSetTime(year, mon, day, hh, mm, ss);
+            char ts[24];
+            rtcNowString(ts, sizeof(ts));
+            notifyReply("OK:TIME=" + String(ts));
+        } else {
+            notifyReply("ERR:SETTIME");
+        }
+
+    } else if (cmd.startsWith("INTERVAL:")) {
+        long n = cmd.substring(9).toInt();
+        if (n >= (long)INTERVAL_MIN_MIN && n <= (long)INTERVAL_MIN_MAX) {
+            g_measure_interval_min = (uint32_t)n;
+            settingsSaveInterval();
+            notifyReply("OK:INTERVAL=" + String((unsigned long)g_measure_interval_min));
+        } else {
+            notifyReply("ERR:INTERVAL");
+        }
+
+    } else if (cmd.startsWith("AVGN:")) {
+        long n = cmd.substring(5).toInt();
+        if (n >= AVG_N_MIN && n <= AVG_N_MAX) {
+            g_avg_n = (uint8_t)n;
+            settingsSaveAvgN();
+            notifyReply("OK:AVGN=" + String(g_avg_n));
+        } else {
+            notifyReply("ERR:AVGN");
+        }
+
+    } else if (cmd.startsWith("AVGM:")) {
+        long n = cmd.substring(5).toInt();
+        if (n >= AVG_M_MIN && n <= AVG_M_MAX) {
+            g_avg_m = (uint8_t)n;
+            settingsSaveAvgM();
+            notifyReply("OK:AVGM=" + String(g_avg_m));
+        } else {
+            notifyReply("ERR:AVGM");
+        }
+
+    } else if (cmd == "START") {
+        g_running = true;
+        notifyReply("OK:RUN=1");
+
+    } else if (cmd == "STOP") {
+        g_running = false;
+        notifyReply("OK:RUN=0");
+
+    } else if (cmd == "TARE") {
+        bool allOk = true;
+        for (uint8_t ch = 0; ch < 5; ch++) {
+            if (isnan(tareChannel(ch))) allOk = false;
+        }
+        notifyReply(allOk ? "OK:TARE" : "ERR:TARE_PARTIAL");
+
+    } else if (cmd.startsWith("DEVID:")) {
+        long n = cmd.substring(6).toInt();
+        if (n >= 1 && n <= 255) {
+            g_device_id = (uint8_t)n;
+            settingsSaveDevId();
+            // アドバタイズ名（スキャンレスポンス）を新しいIDで反映し直す
+            char bleName[24];
+            snprintf(bleName, sizeof(bleName), "Monita-%02X", g_device_id);
+            NimBLEAdvertisementData scanResponseData;
+            scanResponseData.setName(bleName);
+            NimBLEDevice::getAdvertising()->setScanResponseData(scanResponseData);
+            notifyReply("OK:DEVID=" + String(g_device_id));
+        } else {
+            notifyReply("ERR:DEVID");
+        }
+
+    } else if (cmd == "DUMP") {
+        handleDumpCommand();
+
+    } else {
+        notifyReply("ERR:UNKNOWN");
+    }
+}
+
+class MonitaServerCallbacks : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* pServer) override {
+        g_bleControllerConnected = true;
+        Serial.println("[BLE] コントローラー接続");
+    }
+    void onDisconnect(NimBLEServer* pServer) override {
+        g_bleControllerConnected = false;
+        Serial.println("[BLE] コントローラー切断 → 再アドバタイズ");
+        NimBLEDevice::startAdvertising();
+    }
+};
+
+class MonitaRxCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* pCharacteristic) override {
+        std::string value = pCharacteristic->getValue();
+        if (value.empty()) return;
+        handleCommand(String(value.c_str()));
+    }
+};
+
+// BLEアドバタイズのMSD(Manufacturer Specific Data)に計測値を載せて常時ブロードキャストしつつ、
+// GATTサーバー(NUS)も常設してコントローラーからのコマンド接続を受け付ける。
 static void commInit() {
     char bleName[24];
-    snprintf(bleName, sizeof(bleName), "Monita-%02X", DEVICE_ID_NUM);
+    snprintf(bleName, sizeof(bleName), "Monita-%02X", g_device_id);
     NimBLEDevice::init(bleName);
+    NimBLEDevice::setMTU(BLE_PREFERRED_MTU);
+
+    NimBLEServer* pServer = NimBLEDevice::createServer();
+    pServer->setCallbacks(new MonitaServerCallbacks());
+
+    NimBLEService* pService = pServer->createService(NUS_SERVICE_UUID);
+    NimBLECharacteristic* pRx = pService->createCharacteristic(NUS_CHAR_RX_UUID, NIMBLE_PROPERTY::WRITE);
+    pRx->setCallbacks(new MonitaRxCallbacks());
+    g_pTxCharacteristic = pService->createCharacteristic(NUS_CHAR_TX_UUID, NIMBLE_PROPERTY::NOTIFY);
+    pService->start();
 
     // 主アドバタイズパケット（31バイト上限）はManufacturer Data(20B)でほぼ埋まるため、
     // デバイス名はスキャンレスポンス（別枠31バイト）に載せる。
@@ -347,7 +757,7 @@ static void commInit() {
     scanResponseData.setName(bleName);
     NimBLEDevice::getAdvertising()->setScanResponseData(scanResponseData);
 
-    Serial.printf("[BLE] 初期化完了: %s\n", bleName);
+    Serial.printf("[BLE] 初期化完了: %s（GATT NUSサーバー常設）\n", bleName);
 }
 static void commSendPayload(const uint8_t* data, size_t len) { (void)data; (void)len; }
 #elif defined(COMM_USE_WIFI)
@@ -398,70 +808,6 @@ static void commInit()          { Serial.println("[COMM] シリアルデバッ�
 static void commSendPayload(const uint8_t* data, size_t len) { (void)data; (void)len; }
 #endif
 
-// ============================================================================
-// 全CH計測 → SD保存 → 送信
-// ============================================================================
-struct Measurement {
-    int32_t  hx_raw[5];
-    float    hx_phys[5];
-    bool     hx_ok[5];
-    float    ch6_tempC;
-    bool     ch6_ok;
-    float    ch7_V, ch8_V;
-    bool     ch7_ok, ch8_ok;
-};
-
-static Measurement measureAll() {
-    Measurement m = {};
-
-    for (uint8_t ch = 0; ch < 5; ch++) {
-        muxSelect(CH_TO_MUX[ch]);
-        delay(MUX_SETTLE_MS);
-        int32_t raw = hx711Read();
-        m.hx_ok[ch]  = (raw != INT32_MIN);
-        m.hx_raw[ch] = raw;
-        m.hx_phys[ch] = m.hx_ok[ch] ? hx711ToPhysical(raw) : NAN;
-    }
-
-    if (g_mcp9600_addr) {
-        float t = mcp9600ReadTemp(g_mcp9600_addr);
-        m.ch6_ok = !isnan(t);
-        m.ch6_tempC = t;
-    }
-
-    m.ch7_V = adsReadVoltage(ADS_CFG_CH7, GAIN_CH7, OFFSET_CH7);
-    m.ch7_ok = !isnan(m.ch7_V);
-    m.ch8_V = adsReadVoltage(ADS_CFG_CH8, GAIN_CH8, OFFSET_CH8);
-    m.ch8_ok = !isnan(m.ch8_V);
-
-    return m;
-}
-
-static void logToSD(const Measurement& m) {
-    if (!g_sd_log_enabled || !g_sd_ok) return;
-    File f = SD.open(LOG_PATH, FILE_APPEND);
-    if (!f) return;
-
-    char ts[24];
-    rtcNowString(ts, sizeof(ts));
-
-    f.print(ts);
-    for (uint8_t ch = 0; ch < 5; ch++) {
-        f.print(',');
-        if (m.hx_ok[ch]) f.print(m.hx_phys[ch], 3); else f.print("NaN");
-        f.print(',');
-        f.print(chTypeLabel(CH_TYPE[ch]));
-    }
-    f.print(',');
-    if (m.ch6_ok) f.print(m.ch6_tempC, 2); else f.print("NaN");
-    f.print(',');
-    if (m.ch7_ok) f.print(m.ch7_V, 3); else f.print("NaN");
-    f.print(',');
-    if (m.ch8_ok) f.print(m.ch8_V, 3); else f.print("NaN");
-    f.println();
-    f.close();
-}
-
 #if defined(COMM_USE_BLE)
 // ============================================================================
 // BLE アドバタイズ（COMM_USE_BLE時）
@@ -469,7 +815,7 @@ static void logToSD(const Measurement& m) {
 // MSD フォーマット（20バイト、project07_NEXCO/firmware_child と同じ考え方を8ch分に拡張）:
 //   [0-1]   Company ID  : 0xFF 0xFF（Bluetooth SIG未割当のテスト用領域）
 //   [2]     Pkt type    : BLE_PKT_TYPE（0x11 = project06_yokogawa/gateway_v1.1のEXPECTED_PKT_TYPEに合わせる）
-//   [3]     Device ID   : DEVICE_ID_NUM
+//   [3]     Device ID   : g_device_id
 //   [4-5]   CH1 ひずみ/変位 : int16 LE（µε相当、NaN時は0x7FFF）
 //   [6-7]   CH2             : int16 LE
 //   [8-9]   CH3             : int16 LE
@@ -491,7 +837,7 @@ static void bleAdvertiseMeasurement(const Measurement& m) {
     buf[0] = BLE_COMPANY_ID_LO;
     buf[1] = BLE_COMPANY_ID_HI;
     buf[2] = BLE_PKT_TYPE;
-    buf[3] = DEVICE_ID_NUM;
+    buf[3] = g_device_id;
 
     for (uint8_t ch = 0; ch < 5; ch++) {
         int32_t v = m.hx_ok[ch] ? (int32_t)lroundf(m.hx_phys[ch]) : 0x7FFF;
@@ -602,9 +948,15 @@ static void sendMeasurement(const Measurement& m) {
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println("=== Monita ver1.1 本番用（スケルトン） ===");
+    Serial.println("=== Monita ver1.1 本番用 ===");
 
     if (!g_rtc_set) rtcApplyDefault();
+
+    g_sdMutex = xSemaphoreCreateMutex();
+
+    settingsLoad();
+    Serial.printf("[NVS] interval=%lumin N=%u M=%u devid=0x%02X\n",
+                  (unsigned long)g_measure_interval_min, g_avg_n, g_avg_m, g_device_id);
 
     softI2CInit(PIN_SDA, PIN_SCL);
     delay(50);
@@ -635,11 +987,17 @@ void setup() {
 }
 
 void loop() {
-    // 起動直後は即1回目を実行し、以降はMEASURE_INTERVAL_SEC間隔で繰り返す
+    // 起動直後は即1回目を実行し、以降はg_measure_interval_min間隔で繰り返す
     static bool firstRun = true;
     static uint32_t lastMeasure = 0;
     uint32_t now = millis();
-    if (!firstRun && (now - lastMeasure < MEASURE_INTERVAL_SEC * 1000UL)) {
+
+    if (!g_running) {
+        delay(50);
+        return;
+    }
+
+    if (!firstRun && (now - lastMeasure < measureIntervalMs())) {
         delay(10);
         return;
     }
@@ -655,4 +1013,6 @@ void loop() {
     Serial.printf("[%s] CH1=%.2f CH2=%.2f CH3=%.2f CH4=%.2f CH5=%.2f  CH6=%.2fC  CH7=%.3fV CH8=%.3fV\n",
                   ts, m.hx_phys[0], m.hx_phys[1], m.hx_phys[2], m.hx_phys[3], m.hx_phys[4],
                   m.ch6_tempC, m.ch7_V, m.ch8_V);
+    if (m.ch6_openCircuit)  Serial.println("[WARN] CH6 オープン回路（熱電対未接続または断線）");
+    if (m.ch6_shortCircuit) Serial.println("[WARN] CH6 ショート検出（GNDまたはVCC）");
 }
