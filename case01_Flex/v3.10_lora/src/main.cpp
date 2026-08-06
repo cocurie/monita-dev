@@ -100,7 +100,7 @@ using namespace Adafruit_LittleFS_Namespace;
 // ============================================================
 #ifdef COMM_MODE_BLE
 static const uint8_t  DEVICE_ID           = 0x01;  // 子機 ID（複数台時は変える: 0x01〜0xFF）
-static const uint8_t  FW_VERSION          = 1;     // 子機ファームのバージョン。コミットのたびに+1すること
+static const uint8_t  FW_VERSION          = 2;     // 子機ファームのバージョン。コミットのたびに+1すること
 static const uint32_t MEASURE_INTERVAL_MIN = 20;   // 計測間隔（分）
 static const uint32_t ADV_DURATION_MIN     = 10;   // アドバタイズ継続時間（分）
 static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のときアドバタイズ
@@ -118,7 +118,7 @@ static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のとき
 // ============================================================
 #ifdef COMM_MODE_LORA
 static const uint8_t  DEVICE_ID  = 0x01;  // 子機 ID（複数台時は変える: 0x01〜0xFF）
-static const uint8_t  FW_VERSION = 7;     // 子機ファームのバージョン。コミットのたびに+1すること
+static const uint8_t  FW_VERSION = 8;     // 子機ファームのバージョン。コミットのたびに+1すること
 #endif
 
 // ============================================================
@@ -169,13 +169,6 @@ static const uint8_t  FW_VERSION = 7;     // 子機ファームのバージョ�
 #define LORA_UART_BAUD 9600   // E220-900T22S(JP) デフォルト（要データシート確認）
 #endif
 
-// ── I2C 加速度センサ設定 ───────────────────────────────────────
-// 対応センサ: LSM6DS3 / LSM6DSO / LSM6DSL（SA0 ピンでアドレス切替）
-//   SA0 = LOW（GND）  → 0x6A
-//   SA0 = HIGH（3V3） → 0x6B ← スキャンで確認済み
-// ※ MPU6050 を使う場合: AD0=LOW→0x68（DS3231と競合）, AD0=HIGH→0x69
-#define MPU_ADDR 0x6B  // LSM6DS SA0=HIGH
-
 // 各スロット i（0〜3）が CH(i+1) に相当。
 //   1 = HX711（ひずみ・荷重）
 //   2 = TCA9546A 経由 I2C センサ（LSM6DS 等の加速度センサなど）
@@ -185,6 +178,13 @@ static const uint8_t  FW_VERSION = 7;     // 子機ファームのバージョ�
 //       TCA9546A 経由でチャンネル分離するためアドレス競合なし
 const uint8_t CH_ASSIGN[4] = {3, 3, 1, 1};
 
+// ── I2C 加速度センサ設定 ───────────────────────────────────────
+// 対応センサ: LSM6DS3 / LSM6DSO / LSM6DSL（SA0 ピンでアドレス切替）
+//   SA0 = LOW（GND）  → 0x6A
+//   SA0 = HIGH（3V3） → 0x6B ← スキャンで確認済み
+// ※ MPU6050 を使う場合: AD0=LOW→0x68（DS3231と競合）, AD0=HIGH→0x69
+
+#define MPU_ADDR 0x6B  // LSM6DS SA0=HIGH
 // ── ひずみ補正係数（キャリブレーション） ──────────────────────────
 //
 // 【手順】
@@ -271,6 +271,57 @@ static inline void nrfPinDisconnect(uint8_t arduinoPin) {
     | ((uint32_t)GPIO_PIN_CNF_PULL_Disabled    << GPIO_PIN_CNF_PULL_Pos)
     | ((uint32_t)GPIO_PIN_CNF_DRIVE_S0S1       << GPIO_PIN_CNF_DRIVE_Pos)
     | ((uint32_t)GPIO_PIN_CNF_SENSE_Disabled   << GPIO_PIN_CNF_SENSE_Pos);
+}
+
+// I2C バスロックからの復旧を試みる（Wire.begin() の前に呼ぶこと）。
+//
+// 【何が起きるのか】
+//   スレーブ（TCA9534/TCA9546A/DS3231/センサモジュール等）が読み出しの途中で
+//   リセットや電源瞬断に見舞われると、そのスレーブが SDA を LOW に掴んだまま
+//   固まることがある。この状態で Wire.begin() → endTransmission() を呼ぶと
+//   TWIM がバスの解放を待ち続け、計測サイクルがそこで停止する。
+//   3V3_SW を毎サイクル入り切りする Flex は、スレーブ側の電源が落ちる瞬間に
+//   ちょうど転送中だったケースを踏みやすい。
+//
+// 【復旧方法（I2C 仕様の標準的な手順）】
+//   SDA が LOW に張り付いている間、SCL を手動で最大9回トグルして
+//   スレーブに残りのビットを吐き出させ、最後に STOP 条件を作ってバスを解放する。
+//   Gateway v1.0/v1.1・NEXCO には同等の対策を実装済み（差分ログ E 章）。
+static void i2cBusRecover() {
+  const uint8_t sda = PIN_WIRE_SDA;
+  const uint8_t scl = PIN_WIRE_SCL;
+
+  pinMode(sda, INPUT_PULLUP);
+  pinMode(scl, INPUT_PULLUP);
+  delayMicroseconds(10);
+
+  if (digitalRead(sda) == HIGH) return;  // 掴まれていない = 正常
+
+  Serial.println("[I2C] SDA が LOW に張り付いています。バス復旧を試みます");
+
+  pinMode(scl, OUTPUT);
+  for (uint8_t i = 0; i < 9 && digitalRead(sda) == LOW; i++) {
+    digitalWrite(scl, LOW);
+    delayMicroseconds(5);
+    digitalWrite(scl, HIGH);   // 約100kHz相当のクロックを手動生成
+    delayMicroseconds(5);
+  }
+
+  // STOP 条件（SCL=HIGH の状態で SDA を LOW→HIGH）を作ってバスを解放する
+  pinMode(sda, OUTPUT);
+  digitalWrite(sda, LOW);
+  delayMicroseconds(5);
+  digitalWrite(scl, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(sda, HIGH);
+  delayMicroseconds(5);
+
+  pinMode(sda, INPUT_PULLUP);
+  pinMode(scl, INPUT_PULLUP);
+  delayMicroseconds(10);
+
+  Serial.println(digitalRead(sda) == HIGH ? "[I2C] バス復旧に成功しました"
+                                          : "[I2C] ★バス復旧に失敗（SDA が LOW のまま）");
 }
 
 // DS3231（U7）: RTC + 温度センサ。I²C アドレスは固定（0x68）
@@ -748,6 +799,19 @@ static int measureDS18B20(uint8_t ch) {
 
 HX711 hx;
 
+// HX711 の1サンプル分の readiness を待つ上限（ms）。
+// HX711 は 10SPS 設定なら約100ms、80SPS なら約12.5ms で次データが揃うため、
+// 1秒待って来なければ配線断・電源断・モジュール故障とみなして打ち切る。
+//
+// 【なぜ毎サンプル上限が要るのか】
+//   hx.get_value() / hx.read() / hx.tare() の内部は最終的に wait_ready() を呼ぶが、
+//   ライブラリ側の wait_ready() は上限なしの while(!is_ready()) ループになっている
+//   （lib/HX711/src/HX711.cpp）。ループ開始前に1度だけ is_ready() を確認する実装だと、
+//   複数回の読み取りの途中でセンサーが応答しなくなった瞬間（配線の緩み・浸水・
+//   電圧降下など）にそこで永久ブロックし、WDT が満了するまで復帰しない。
+//   そのため「読み取り1回ごとに wait_ready_timeout() で確認してから呼ぶ」を徹底する。
+#define HX711_SAMPLE_TIMEOUT_MS 1000UL
+
 // チャンネルごとのタレオフセット（HX711 は1インスタンス共用なのでここに保存する）
 // hx.tare() のオフセットは1つしか保持できないため、チャンネル切替のたびに set_offset() で復元する
 static long s_hx_tare_offset[4] = {0, 0, 0, 0};
@@ -789,6 +853,21 @@ static void loadTareOffsets() {
   }
 }
 
+// タレ1回分のオフセットを、サンプルごとにタイムアウトを見ながら求める。
+// hx.tare() は内部で read_average() → read() を times 回呼ぶが、その各 read() が
+// 上限なしの wait_ready() を通るため、途中でセンサーが落ちると永久ブロックする。
+// ここでは自前で平均を取り、hx.set_offset() で反映することでその経路を避ける。
+// 戻り値: true=成功（オフセット設定済み）、false=タイムアウト（オフセットは変更しない）
+static bool hxTareWithTimeout(uint8_t times = 10) {
+  double sum = 0;
+  for (uint8_t i = 0; i < times; i++) {
+    if (!hx.wait_ready_timeout(HX711_SAMPLE_TIMEOUT_MS)) return false;
+    sum += (double)hx.read();
+  }
+  hx.set_offset((long)(sum / (double)times));
+  return true;
+}
+
 // HX711 全有効チャネルに tare を実行する（3V3_SW ON・Wire 初期化済みの状態で呼ぶこと）
 static void performTare() {
   if ((s_errors & ERR_TCA9534_I2C) != 0U) {
@@ -801,12 +880,7 @@ static void performTare() {
     muxSelect((uint8_t)(i + 1));
     delay(10);
     hx.begin(HX711_DOUT_PIN, HX711_SCK_PIN);
-    unsigned long t = millis();
-    while (!hx.is_ready()) {
-      if (millis() - t > 1000) break;
-    }
-    if (hx.is_ready()) {
-      hx.tare();
+    if (hxTareWithTimeout()) {
       s_hx_tare_offset[i] = hx.get_offset();  // チャンネルごとに保存
       successCount++;
       Serial.print("[TARE] CH");
@@ -926,19 +1000,22 @@ static void hxBegin(uint8_t ch) {
 
 // HX711 から SAMPLES_PER_AVG サンプルの平均を1回取得する。
 // 戻り値: true=正常、false=タイムアウト（ERR_HX711_TIMEOUT をセット）
+//
+// 各サンプルの前に必ず wait_ready_timeout() を通すこと（理由は
+// HX711_SAMPLE_TIMEOUT_MS の定義箇所のコメントを参照）。
 static bool hxReadAvg(float *outAvg) {
-  unsigned long start = millis();
-  while (!hx.is_ready()) {
-    if (millis() - start > 1000) {
-      Serial.println("[HX TIMEOUT]");
+  float sum = 0;
+  for (int i = 0; i < SAMPLES_PER_AVG; i++) {
+    if (!hx.wait_ready_timeout(HX711_SAMPLE_TIMEOUT_MS)) {
+      Serial.print("[HX TIMEOUT] sample ");
+      Serial.print(i);
+      Serial.print("/");
+      Serial.println(SAMPLES_PER_AVG);
       s_errors |= ERR_HX711_TIMEOUT;
       statusErrorRed();
       *outAvg = 0;
       return false;
     }
-  }
-  float sum = 0;
-  for (int i = 0; i < SAMPLES_PER_AVG; i++) {
     // get_value() = read() - tare_offset（タレ補正済み生値）
     // read() だとタレ値が反映されないため get_value() を使う
     sum += hx.get_value();
@@ -1464,6 +1541,16 @@ String hx4(int v) {
 // Sigfox UART（Serial1）
 // ============================================================
 
+// 応答文字列（String）の最大長。これを超えた分は読み捨てる。
+//
+// 【なぜ上限が要るのか】
+//   配線ノイズ・接触不良・モジュールの異常 URC などで RX にゴミが流れ込み続けると、
+//   応答待ちの間 String が際限なく伸びる。nRF52840 の RAM は 237KB しかないため、
+//   ヒープ枯渇 → malloc 失敗・メモリ破損で MCU がハングしうる。
+//   Gateway でも同じ構造のバグが原因で現地機が停止した（差分ログ J 章）。
+//   上限に達した後も受信自体は継続して読み捨てる（UART バッファを溢れさせないため）。
+#define SENDAT_MAX_RESPONSE_LEN 2048U
+
 // 改行付きで AT を送り、waitMs ミリ秒の間に届いた応答をすべて読んで返す（ポーリング）。
 // Sigfox 送信中は緑点滅をこのループで更新する。
 static String sendAT(String cmd, int waitMs = 2000) {
@@ -1475,13 +1562,20 @@ static String sendAT(String cmd, int waitMs = 2000) {
 
   long start = millis();
   String response = "";
+  bool truncated = false;
 
   while (millis() - start < (unsigned long)waitMs) {
     wdtFeed();  // 長時間の AT 応答待ちでもハング扱いされないよう給餌
     statusSigfoxBlinkTick();
     while (Serial1.available()) {
       char c = (char)Serial1.read();
-      response += c;
+      // 上限までは通常どおり蓄積し、超えた分は読み捨てるだけにする
+      if (response.length() < SENDAT_MAX_RESPONSE_LEN) {
+        response += c;
+      } else if (!truncated) {
+        truncated = true;
+        Serial.println("[AT] ★応答が上限に達したため以降を読み捨てます（ノイズ混入の疑い）");
+      }
     }
     yield();
   }
@@ -1967,6 +2061,7 @@ void setup() {
   Serial.println("[BLE] init OK");
 #endif
 
+  i2cBusRecover();  // 前回サイクルでスレーブが SDA を掴んだまま固まっていた場合の解放
   Wire.begin();
   analogReadResolution(12);
   delay(200);
@@ -2075,6 +2170,7 @@ void loop() {
   delay(100);
 #endif
 
+  i2cBusRecover();  // 前回サイクルでスレーブが SDA を掴んだまま固まっていた場合の解放
   Wire.begin();
 
   Serial.println("[WAKE]");
