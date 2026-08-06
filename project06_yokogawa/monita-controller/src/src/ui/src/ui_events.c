@@ -21,17 +21,42 @@ void on_rescan_clicked(lv_event_t * e)
 	ble_scan_and_populate();
 }
 
-void on_apply_sleep_clicked(lv_event_t * e)
-{
-	ble_apply_sleep();
-}
-
 void on_tare_clicked(lv_event_t * e)
 {
 	ble_tare();
 }
 
+void on_dump_clicked(lv_event_t * e)
+{
+	ble_dump();
+}
+
+void on_back_clicked(lv_event_t * e)
+{
+	ble_back_to_measure();
+}
+
+void on_apply_sleep_clicked(lv_event_t * e)
+{
+	ble_apply_settings();
+}
+
+void on_start_clicked(lv_event_t * e)
+{
+	ble_start();
+}
+
+void on_stop_clicked(lv_event_t * e)
+{
+	ble_stop();
+}
+
 void on_disconnect_clicked(lv_event_t * e)
 {
 	ble_disconnect();
+}
+
+void on_settings_clicked(lv_event_t * e)
+{
+	ble_open_settings();
 }

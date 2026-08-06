@@ -13,6 +13,13 @@
 #include <atomic>
 using std::atomic;
 
+#include <SPI.h>
+#include <SD.h>
+
+// ===== SDカード (Dumpコマンドで受信したログの保存先。AVL基板と共通ピン配置) =====
+#define SD_CS_PIN 5
+static bool g_sd_ok = false;
+
 // ===== 電源スイッチ (AVLファームと同一ハード: LTC2954プッシュボタン電源コントローラー) =====
 // PWボタン長押し(ハード側タイマー)で*INTがアサートされ、S_VP(IO36)がLOWになる。
 // 確認ダイアログ「はい」でSW_OFF(IO25)をLOW出力し*KILLをアサート、実電源を落とす。
@@ -278,8 +285,8 @@ static void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data
   }
 }
 
-// ===== BLEクライアント (XIAO ESP32-C3 "MonitaFlex" とのGATT通信) =====
-// monita-flex-wifi 側 (Seeed XIAO ESP32-C3) が実装しているNordic UART Service。
+// ===== BLEクライアント (XIAO ESP32-C3 "ver1.1" とのGATT通信) =====
+// project06_yokogawa/ver1.1 側 src/main.cpp が実装しているNordic UART Service。
 #include "src/ui/src/ble_client.h"
 
 static BLEUUID bleServiceUUID("6e400001-b5a3-f393-e0a9-e50e24dcca9e");
@@ -289,18 +296,61 @@ static BLEUUID bleCharUUID_TX("6e400003-b5a3-f393-e0a9-e50e24dcca9e");
 static NimBLEScan* pBleScan = nullptr;
 static NimBLEClient* pBleClient = nullptr;
 static NimBLERemoteCharacteristic* pRxCharacteristic = nullptr;
-static std::vector<NimBLEAdvertisedDevice*> foundDevices;
 static bool bleConnected = false;
+
+// ===== パッシブスキャン: ver1.1ファームのBLEアドバタイズ(Manufacturer Specific Data)を常時受信 =====
+// フォーマットは ver1.1 側 src/main.cpp の bleAdvertiseMeasurement() コメント参照。
+// CompanyID=0xFFFF, PktType=0x11 の20バイトMSDのみを対象とする（接続は不要）。
+static const uint8_t MONITA_COMPANY_LO = 0xFF;
+static const uint8_t MONITA_COMPANY_HI = 0xFF;
+static const uint8_t MONITA_PKT_TYPE   = 0x11;
+static const uint32_t DEVICE_STALE_MS  = 15000;  // これより古い最終受信のデバイスは一覧から除外
+
+struct MonitaDevice {
+    NimBLEAdvertisedDevice* adv;  // GATT接続用（アドレス保持のため複製を保持）
+    uint8_t devId;
+    int16_t chRaw[8];  // CH1-5:µε/mm相当(そのままの値), CH6:0.1℃単位, CH7-8:mV。0x7FFFはNaN
+    bool    chOk[8];
+    uint32_t lastSeenMs;
+};
+static std::vector<MonitaDevice> g_devices;
+
+// Mesure画面で表示中のデバイス（GATT接続の有無に関わらず、パッシブ受信値を表示し続ける）
+static bool g_hasSelected = false;
+static NimBLEAddress g_selectedAddr;
+
+static MonitaDevice* findDeviceByAddress(const NimBLEAddress& addr) {
+    for (auto& d : g_devices) {
+        if (d.adv->getAddress().equals(addr)) return &d;
+    }
+    return nullptr;
+}
 
 class MonitaAdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     void onResult(NimBLEAdvertisedDevice* advertisedDevice) override {
-        if (!advertisedDevice->haveServiceUUID() || !advertisedDevice->isAdvertisingService(bleServiceUUID)) {
-            return;
+        if (!advertisedDevice->haveManufacturerData()) return;
+        std::string md = advertisedDevice->getManufacturerData();
+        if (md.size() != 20) return;
+        const uint8_t* b = (const uint8_t*)md.data();
+        if (b[0] != MONITA_COMPANY_LO || b[1] != MONITA_COMPANY_HI || b[2] != MONITA_PKT_TYPE) return;
+
+        MonitaDevice* slot = findDeviceByAddress(advertisedDevice->getAddress());
+        if (slot == nullptr) {
+            MonitaDevice nd{};
+            nd.adv = new NimBLEAdvertisedDevice(*advertisedDevice);
+            g_devices.push_back(nd);
+            slot = &g_devices.back();
+        } else {
+            *slot->adv = *advertisedDevice;  // アドレス以外の広告情報も最新化
         }
-        for (auto* d : foundDevices) {
-            if (d->getAddress().equals(advertisedDevice->getAddress())) return; // 重複除外
+
+        slot->devId = b[3];
+        for (int i = 0; i < 8; i++) {
+            int16_t v = (int16_t)((uint16_t)b[4 + i * 2] | ((uint16_t)b[5 + i * 2] << 8));
+            slot->chOk[i]  = (v != 0x7FFF);
+            slot->chRaw[i] = v;
         }
-        foundDevices.push_back(new NimBLEAdvertisedDevice(*advertisedDevice));
+        slot->lastSeenMs = millis();
     }
 };
 
@@ -327,88 +377,274 @@ static void set_label_async(lv_obj_t* label, const String& text) {
 class MonitaClientCallbacks : public NimBLEClientCallbacks {
     void onConnect(NimBLEClient* pClient) override {
         bleConnected = true;
-        Serial.println("[BLE] Connected to MonitaFlex");
-        set_label_async(ui_Label8, "BLE: Connected");
+        Serial.println("[BLE] Connected");
     }
     void onDisconnect(NimBLEClient* pClient) override {
         bleConnected = false;
-        Serial.println("[BLE] Disconnected from MonitaFlex");
-        set_label_async(ui_Label8, "BLE: Disconnected");
+        Serial.println("[BLE] Disconnected");
     }
 };
 
+// ===== Dump受信 (SDログのチャンク転送) =====
+// プロトコル: "DUMPHDR:<総バイト数>" → 生データチャンク(複数notify) → "DUMPEND"
+// SDへの書き込みはSPIバス競合を避けるため、ここではメモリに溜めるだけにして
+// 実際の書き込みは loop() (メインスレッド)側の dumpWriteIfReady() で行う。
+static bool g_dumpReceiving = false;
+static uint32_t g_dumpExpected = 0;
+static std::vector<uint8_t> g_dumpBuffer;
+static volatile bool g_dumpReady = false;
+static uint8_t g_dumpDeviceId = 0;
+
+// RUN=1(計測中)/RUN=0(停止中)に応じて、Statusラベルの文言・色とStart/Stopボタンの表示を切り替える。
+// NimBLEコールバック(別タスク)から呼ばれるため lv_async_call() でメインループ側に委譲する。
+static void applyRunStateAsync(bool running) {
+    bool* p = new bool(running);
+    lv_async_call([](void* arg) {
+        bool running = *(bool*)arg;
+        delete (bool*)arg;
+        if (running) {
+            lv_label_set_text(ui_Label11, "Status: Running");
+            lv_obj_set_style_text_color(ui_Label11, lv_color_hex(0x00AA00), LV_PART_MAIN);
+            lv_obj_add_flag(ui_start, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(ui_stop, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_label_set_text(ui_Label11, "Status: Stopped");
+            lv_obj_set_style_text_color(ui_Label11, lv_color_hex(0x888888), LV_PART_MAIN);
+            lv_obj_clear_flag(ui_start, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(ui_stop, LV_OBJ_FLAG_HIDDEN);
+        }
+    }, p);
+}
+
+// "LIVE:CH1=1.94,CH2=1.41,...,CH8=1.884,TIME=2026-08-10 05:51:00" を解析して
+// Mesure画面のCH1〜8・timestampラベルを更新する（GATT接続中の実時間表示用）。
+static void applyLiveUpdate(const String& msg) {
+    String body = msg.substring(5); // "LIVE:" の後ろ
+
+    int timeIdx = body.indexOf("TIME=");
+    String chPart  = (timeIdx >= 0) ? body.substring(0, timeIdx) : body;
+    String timeVal = (timeIdx >= 0) ? body.substring(timeIdx + 5) : String("--");
+
+    static const char* keys[8]  = {"CH1=", "CH2=", "CH3=", "CH4=", "CH5=", "CH6=", "CH7=", "CH8="};
+    static const char* units[8] = {"uS", "uS", "uS", "mm", "mm", "C", "V", "V"};
+    lv_obj_t* chLabels[8] = {ui_CH1, ui_CH2, ui_CH3, ui_CH4, ui_CH5, ui_CH6, ui_CH7, ui_CH8};
+
+    for (int i = 0; i < 8; i++) {
+        int p = chPart.indexOf(keys[i]);
+        if (p < 0) continue;
+        int vs = p + strlen(keys[i]);
+        int ve = chPart.indexOf(',', vs);
+        String val = (ve >= 0) ? chPart.substring(vs, ve) : chPart.substring(vs);
+        char text[24];
+        snprintf(text, sizeof(text), "CH%d:%s%s", i + 1, val.c_str(), units[i]);
+        set_label_async(chLabels[i], text);
+    }
+    set_label_async(ui_timestamp, "timestamp: " + timeVal);
+}
+
 static void bleNotifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
+    if (g_dumpReceiving) {
+        if (length == 7 && memcmp(pData, "DUMPEND", 7) == 0) {
+            g_dumpReceiving = false;
+            g_dumpReady = true;
+            Serial.printf("[BLE] Dump complete: %u bytes received\n", (unsigned)g_dumpBuffer.size());
+        } else {
+            g_dumpBuffer.insert(g_dumpBuffer.end(), pData, pData + length);
+        }
+        return;
+    }
+
     String msg((char*)pData, length);
     Serial.print("[BLE] recv: ");
     Serial.println(msg);
 
-    set_label_async(ui_Label8, "Last: " + msg);
+    if (msg.startsWith("LIVE:")) {
+        applyLiveUpdate(msg);
+        return;
+    }
 
-    if (msg.startsWith("SLEEP=")) {
-        set_label_async(ui_Label4, "Sleep: " + msg.substring(6) + " min");
-    } else if (msg.startsWith("OK:SLP=")) {
-        set_label_async(ui_Label4, "Sleep: " + msg.substring(7) + " min");
+    if (msg.startsWith("DUMPHDR:")) {
+        g_dumpExpected = (uint32_t)msg.substring(8).toInt();
+        g_dumpBuffer.clear();
+        g_dumpBuffer.reserve(g_dumpExpected);
+        g_dumpReceiving = true;
+        Serial.printf("[BLE] Dump starting: %u bytes expected\n", (unsigned)g_dumpExpected);
+        return;
+    }
+
+    // GET/OK:INTERVAL 応答例: "INTERVAL=1;N=5;M=5;RUN=1;DEVID=1;TIME=..."（INTERVALは分単位）
+    int idx = msg.indexOf("INTERVAL=");
+    if (idx >= 0) {
+        int start = idx + 9;
+        int end = msg.indexOf(';', start);
+        String interval = (end >= 0) ? msg.substring(start, end) : msg.substring(start);
+        set_label_async(ui_sleepDisplay, "Interval: " + interval + " min.");
+    } else if (msg.startsWith("OK:INTERVAL=")) {
+        set_label_async(ui_sleepDisplay, "Interval: " + msg.substring(12) + " min.");
+    }
+
+    // GET応答("RUN=1;...")・START/STOP応答("OK:RUN=1"/"OK:RUN=0")のいずれにも対応
+    int runIdx = msg.indexOf("RUN=");
+    if (runIdx >= 0 && (size_t)(runIdx + 4) < msg.length()) {
+        applyRunStateAsync(msg.charAt(runIdx + 4) == '1');
+    }
+}
+
+// g_devices は常時バックグラウンドでパッシブスキャン受信されているので、
+// ここでは「最近見えているデバイス」のスナップショットをDropdownへ反映するだけでよい。
+// 文字列が前回と同じなら lv_dropdown_set_options() を呼ばない（不要な再描画・選択リセットを避ける）。
+static char g_lastDropdownOptions[512] = "";
+
+static void refreshDeviceListOptions() {
+    uint32_t now = millis();
+
+    // 古いエントリ（しばらく電波を受信できていないデバイス）を除去
+    for (size_t i = 0; i < g_devices.size();) {
+        if (now - g_devices[i].lastSeenMs > DEVICE_STALE_MS) {
+            delete g_devices[i].adv;
+            g_devices.erase(g_devices.begin() + i);
+        } else {
+            i++;
+        }
+    }
+
+    char options[512];
+    if (g_devices.empty()) {
+        snprintf(options, sizeof(options), "No devices found");
+    } else {
+        options[0] = '\0';
+        for (size_t i = 0; i < g_devices.size(); i++) {
+            char line[48];
+            snprintf(line, sizeof(line), "Monita-%02X (%s)", g_devices[i].devId,
+                     g_devices[i].adv->getAddress().toString().c_str());
+            strncat(options, line, sizeof(options) - strlen(options) - 1);
+            if (i + 1 < g_devices.size()) {
+                strncat(options, "\n", sizeof(options) - strlen(options) - 1);
+            }
+        }
+    }
+
+    if (strcmp(options, g_lastDropdownOptions) != 0) {
+        lv_dropdown_set_options(ui_Dropdown1, options);
+        strncpy(g_lastDropdownOptions, options, sizeof(g_lastDropdownOptions) - 1);
+        g_lastDropdownOptions[sizeof(g_lastDropdownOptions) - 1] = '\0';
+        Serial.printf("[BLE] %u device(s) visible\n", (unsigned)g_devices.size());
     }
 }
 
 extern "C" void ble_scan_and_populate(void) {
-    Serial.println("[BLE] Scanning...");
-
-    for (auto* d : foundDevices) delete d;
-    foundDevices.clear();
-
-    pBleScan->start(3, false); // 3秒間スキャン（ブロッキング）
-
-    if (foundDevices.empty()) {
-        lv_dropdown_set_options(ui_Dropdown1, "No devices found");
-        Serial.println("[BLE] No devices found");
-        return;
-    }
-
-    char options[512] = "";
-    for (size_t i = 0; i < foundDevices.size(); i++) {
-        std::string name = foundDevices[i]->getName();
-        if (name.empty()) name = foundDevices[i]->getAddress().toString();
-        strncat(options, name.c_str(), sizeof(options) - strlen(options) - 1);
-        if (i + 1 < foundDevices.size()) {
-            strncat(options, "\n", sizeof(options) - strlen(options) - 1);
-        }
-        Serial.printf("[BLE] %u: %s (%s)\n", (unsigned)i, name.c_str(),
-                      foundDevices[i]->getAddress().toString().c_str());
-    }
-    lv_dropdown_set_options(ui_Dropdown1, options);
-    Serial.printf("[BLE] Found %u device(s)\n", (unsigned)foundDevices.size());
-
+    refreshDeviceListOptions();
     if (lv_scr_act() != ui_DviceList) {
         _ui_screen_change(&ui_DviceList, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, &ui_DviceList_screen_init);
     }
 }
 
+// DviceList画面を表示している間、loop()から定期的に呼んで一覧を自動更新する。
+static void deviceListAutoRefresh() {
+    static uint32_t lastRefresh = 0;
+    uint32_t now = millis();
+    if (now - lastRefresh < 1000) return;
+    lastRefresh = now;
+    if (lv_scr_act() == ui_DviceList) {
+        refreshDeviceListOptions();
+    }
+}
+
+// Mesure画面のCH1〜8・timestampラベルをg_selectedAddrの最新パッシブ受信値で更新する。
+// メインループから直接呼ばれるので lv_async_call は不要。
+static void measureScreenAutoRefresh() {
+    static uint32_t lastRefresh = 0;
+    uint32_t now = millis();
+    if (now - lastRefresh < 500) return;
+    lastRefresh = now;
+
+    if (lv_scr_act() != ui_Mesure || !g_hasSelected) return;
+
+    // GATT接続中は ble_client の "LIVE:" Notify が表示を更新するので、
+    // ここでパッシブ受信のキャッシュ値を書き戻して上書きしないようにする。
+    if (pBleClient != nullptr && pBleClient->isConnected()) return;
+
+    MonitaDevice* d = findDeviceByAddress(g_selectedAddr);
+    if (d == nullptr) {
+        lv_label_set_text(ui_timestamp, "timestamp: (no signal)");
+        return;
+    }
+
+    auto fmtCh = [&](int i, const char* unit, float scale) {
+        char b[24];
+        if (d->chOk[i]) {
+            snprintf(b, sizeof(b), "%.1f%s", d->chRaw[i] * scale, unit);
+        } else {
+            snprintf(b, sizeof(b), "--%s", unit);
+        }
+        return String(b);
+    };
+
+    lv_label_set_text(ui_CH1, ("CH1:" + fmtCh(0, "uS", 1.0f)).c_str());
+    lv_label_set_text(ui_CH2, ("CH2:" + fmtCh(1, "uS", 1.0f)).c_str());
+    lv_label_set_text(ui_CH3, ("CH3:" + fmtCh(2, "uS", 1.0f)).c_str());
+    lv_label_set_text(ui_CH4, ("CH4:" + fmtCh(3, "mm", 1.0f)).c_str());
+    lv_label_set_text(ui_CH5, ("CH5:" + fmtCh(4, "mm", 1.0f)).c_str());
+    lv_label_set_text(ui_CH6, ("CH6:" + fmtCh(5, "C", 0.1f)).c_str());
+    lv_label_set_text(ui_CH7, ("CH7:" + fmtCh(6, "V", 0.001f)).c_str());
+    lv_label_set_text(ui_CH8, ("CH8:" + fmtCh(7, "V", 0.001f)).c_str());
+
+    char ts[32];
+    snprintf(ts, sizeof(ts), "timestamp: %lus ago", (unsigned long)((now - d->lastSeenMs) / 1000));
+    lv_label_set_text(ui_timestamp, ts);
+}
+
+// 受信済みのDumpデータをSDへ書き込む（メインループから呼ぶ。SPIバス競合を避けるため）。
+static void dumpWriteIfReady() {
+    if (!g_dumpReady) return;
+    g_dumpReady = false;
+
+    if (!g_sd_ok || g_dumpBuffer.empty()) {
+        Serial.println("[DUMP] SD unavailable or empty buffer, discarding");
+        g_dumpBuffer.clear();
+        return;
+    }
+
+    char path[40];
+    snprintf(path, sizeof(path), "/dump_%02X_%lu.csv", g_dumpDeviceId, (unsigned long)millis());
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) {
+        Serial.printf("[DUMP] Failed to open %s for write\n", path);
+        g_dumpBuffer.clear();
+        return;
+    }
+    f.write(g_dumpBuffer.data(), g_dumpBuffer.size());
+    f.close();
+    Serial.printf("[DUMP] Saved %u bytes to %s\n", (unsigned)g_dumpBuffer.size(), path);
+    g_dumpBuffer.clear();
+}
+
 extern "C" void ble_connect_selected(void) {
     // すでに接続済みなら測定画面へ戻るだけ
     if (pBleClient != nullptr && pBleClient->isConnected()) {
-        if (lv_scr_act() != ui_Measure) {
-            _ui_screen_change(&ui_Measure, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, &ui_Measure_screen_init);
+        if (lv_scr_act() != ui_Mesure) {
+            _ui_screen_change(&ui_Mesure, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, &ui_Mesure_screen_init);
         }
         return;
     }
 
     uint16_t idx = lv_dropdown_get_selected(ui_Dropdown1);
-    if (idx >= foundDevices.size()) {
+    if (idx >= g_devices.size()) {
         Serial.println("[BLE] Invalid selection index");
         return;
     }
-    NimBLEAdvertisedDevice* target = foundDevices[idx];
+    NimBLEAdvertisedDevice* target = g_devices[idx].adv;
+    g_selectedAddr = target->getAddress();
+    g_hasSelected = true;
+    g_dumpDeviceId = g_devices[idx].devId;
 
     if (pBleClient == nullptr) {
         pBleClient = NimBLEDevice::createClient();
         pBleClient->setClientCallbacks(new MonitaClientCallbacks(), false);
     }
 
-    std::string devName = target->getName();
-    if (devName.empty()) devName = target->getAddress().toString();
-    Serial.printf("[BLE] Connecting to %s (%s) ...\n",
-                  devName.c_str(), target->getAddress().toString().c_str());
+    Serial.printf("[BLE] Connecting to Monita-%02X (%s) ...\n",
+                  g_devices[idx].devId, target->getAddress().toString().c_str());
     if (!pBleClient->connect(target)) {
         Serial.println("[BLE] Connection failed");
         return;
@@ -429,21 +665,34 @@ extern "C" void ble_connect_selected(void) {
 
     Serial.println("[BLE] Connected and subscribed");
 
-    _ui_screen_change(&ui_Measure, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, &ui_Measure_screen_init);
+    _ui_screen_change(&ui_Mesure, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, &ui_Mesure_screen_init);
 
     if (pRxCharacteristic != nullptr) {
-        pRxCharacteristic->writeValue("GET"); // 現在のスリープ間隔を取得
+        pRxCharacteristic->writeValue("GET"); // 現在の設定値を取得
     }
 }
 
-extern "C" void ble_apply_sleep(void) {
+extern "C" void ble_apply_settings(void) {
     if (pBleClient == nullptr || !pBleClient->isConnected() || pRxCharacteristic == nullptr) {
         Serial.println("[BLE] Not connected");
         return;
     }
-    int32_t n = lv_spinbox_get_value(ui_Spinbox1);
-    char cmd[16];
-    snprintf(cmd, sizeof(cmd), "SLP:%ld", (long)n);
+    int32_t interval = lv_spinbox_get_value(ui_Spinbox1);
+    int32_t avgN      = lv_spinbox_get_value(ui_Spinbox2);
+    int32_t avgM      = lv_spinbox_get_value(ui_Spinbox3);
+
+    char cmd[24];
+    snprintf(cmd, sizeof(cmd), "INTERVAL:%ld", (long)interval);
+    Serial.printf("[BLE] send: %s\n", cmd);
+    pRxCharacteristic->writeValue(cmd);
+    delay(50);
+
+    snprintf(cmd, sizeof(cmd), "AVGN:%ld", (long)avgN);
+    Serial.printf("[BLE] send: %s\n", cmd);
+    pRxCharacteristic->writeValue(cmd);
+    delay(50);
+
+    snprintf(cmd, sizeof(cmd), "AVGM:%ld", (long)avgM);
     Serial.printf("[BLE] send: %s\n", cmd);
     pRxCharacteristic->writeValue(cmd);
 }
@@ -456,10 +705,51 @@ extern "C" void ble_tare(void) {
     pRxCharacteristic->writeValue("TARE");
 }
 
+extern "C" void ble_dump(void) {
+    if (pBleClient == nullptr || !pBleClient->isConnected() || pRxCharacteristic == nullptr) {
+        Serial.println("[BLE] Not connected");
+        return;
+    }
+    Serial.println("[BLE] send: DUMP");
+    pRxCharacteristic->writeValue("DUMP");
+}
+
+extern "C" void ble_start(void) {
+    if (pBleClient == nullptr || !pBleClient->isConnected() || pRxCharacteristic == nullptr) {
+        Serial.println("[BLE] Not connected");
+        return;
+    }
+    pRxCharacteristic->writeValue("START");
+}
+
+extern "C" void ble_stop(void) {
+    if (pBleClient == nullptr || !pBleClient->isConnected() || pRxCharacteristic == nullptr) {
+        Serial.println("[BLE] Not connected");
+        return;
+    }
+    pRxCharacteristic->writeValue("STOP");
+}
+
+extern "C" void ble_open_settings(void) {
+    if (lv_scr_act() != ui_Setting) {
+        _ui_screen_change(&ui_Setting, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, &ui_Setting_screen_init);
+    }
+    if (pBleClient != nullptr && pBleClient->isConnected() && pRxCharacteristic != nullptr) {
+        pRxCharacteristic->writeValue("GET");
+    }
+}
+
+extern "C" void ble_back_to_measure(void) {
+    if (lv_scr_act() != ui_Mesure) {
+        _ui_screen_change(&ui_Mesure, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, &ui_Mesure_screen_init);
+    }
+}
+
 extern "C" void ble_disconnect(void) {
     if (pBleClient != nullptr && pBleClient->isConnected()) {
         pBleClient->disconnect();
     }
+    g_hasSelected = false;
     if (lv_scr_act() != ui_Initial) {
         _ui_screen_change(&ui_Initial, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, &ui_Initial_screen_init);
     }
@@ -565,14 +855,18 @@ void setup()
 
     pinMode(TFT_CS, OUTPUT);
     pinMode(XPT2046_CS, OUTPUT);
+    pinMode(SD_CS_PIN, OUTPUT);
     digitalWrite(TFT_CS, HIGH);
     digitalWrite(XPT2046_CS, HIGH);
+    digitalWrite(SD_CS_PIN, HIGH);
 
     pinMode(Sensor_VP, INPUT);
     analogReadResolution(12);
     analogSetPinAttenuation(Sensor_VP, ADC_11db);
 
     SPI.begin(18, 19, 23);
+    g_sd_ok = SD.begin(SD_CS_PIN);
+    Serial.println(g_sd_ok ? "[OK] SD card" : "[WARN] SD card not found");
 
     lv_init();
 
@@ -605,11 +899,13 @@ void setup()
 
     NimBLEDevice::init("");
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    NimBLEDevice::setMTU(247);  // ver1.1側のDUMP転送に合わせて大きめのMTUを希望
     pBleScan = NimBLEDevice::getScan();
     pBleScan->setAdvertisedDeviceCallbacks(new MonitaAdvertisedDeviceCallbacks());
     pBleScan->setInterval(160);
     pBleScan->setWindow(15);
-    pBleScan->setActiveScan(true);
+    pBleScan->setActiveScan(false);   // MSDは主アドバタイズパケットに載っているのでパッシブで十分
+    pBleScan->start(0, nullptr, false);  // 継続的にバックグラウンドでスキャンし続ける
 
     Serial.println("Setup done");
 }
@@ -618,5 +914,8 @@ void loop()
 {
     lv_timer_handler();
     poweroff_poll();
+    deviceListAutoRefresh();
+    measureScreenAutoRefresh();
+    dumpWriteIfReady();
     delay(5);
 }

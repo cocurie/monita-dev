@@ -139,7 +139,7 @@ static const uint8_t  BLE_COMPANY_ID_HI = 0xFF;
 // 汎用gateway_v1.1のv3.03互換フィルタ（PktType=0x03、CH1-4固定オフセット）とは非互換のため、
 // 0x03を間借りせず横河専用の値に戻した（2026-08-05、8CH対応Gateway新設に伴う変更）。
 static const uint8_t  BLE_PKT_TYPE      = 0x11;
-static const uint32_t BLE_ADV_INTERVAL_MS = 3000;
+static const uint32_t BLE_ADV_INTERVAL_MS = 1000;
 
 // ---- GATT NUS (コントローラーからのコマンド受信用) ----
 // monita-controller (project06_yokogawa) 側と同一のUUIDを使用。
@@ -392,14 +392,41 @@ static void mcp9600CheckFaults(uint8_t addr, bool& ocFault, bool& scFault,
 // ============================================================================
 RTC_DATA_ATTR static bool g_rtc_set = false;
 
+// 専用RTCチップが無いため、コントローラーからSETTIMEを受けるまでの間は
+// 「ファームをビルドした日時」を暫定の初期値として使う（固定値2026/01/01よりは実態に近い）。
+static bool parseBuildDateTime(struct tm& out) {
+    static const char* MONTHS = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    char monStr[4] = {};
+    int day, year, hh, mm, ss;
+    // __DATE__ 例: "Aug 10 2026", __TIME__ 例: "05:51:00"
+    if (sscanf(__DATE__, "%3s %d %d", monStr, &day, &year) != 3) return false;
+    if (sscanf(__TIME__, "%d:%d:%d", &hh, &mm, &ss) != 3) return false;
+
+    const char* p = strstr(MONTHS, monStr);
+    if (p == nullptr) return false;
+    int mon = (int)((p - MONTHS) / 3);  // 0-11
+
+    out = {};
+    out.tm_year = year - 1900;
+    out.tm_mon  = mon;
+    out.tm_mday = day;
+    out.tm_hour = hh;
+    out.tm_min  = mm;
+    out.tm_sec  = ss;
+    return true;
+}
+
 static void rtcApplyDefault() {
     struct tm tm0 = {};
-    tm0.tm_year = RTC_DEFAULT_YEAR - 1900;
-    tm0.tm_mon  = RTC_DEFAULT_MONTH - 1;
-    tm0.tm_mday = RTC_DEFAULT_DAY;
-    tm0.tm_hour = RTC_DEFAULT_HOUR;
-    tm0.tm_min  = RTC_DEFAULT_MIN;
-    tm0.tm_sec  = RTC_DEFAULT_SEC;
+    if (!parseBuildDateTime(tm0)) {
+        // 万一パースに失敗したらフォールバック
+        tm0.tm_year = RTC_DEFAULT_YEAR - 1900;
+        tm0.tm_mon  = RTC_DEFAULT_MONTH - 1;
+        tm0.tm_mday = RTC_DEFAULT_DAY;
+        tm0.tm_hour = RTC_DEFAULT_HOUR;
+        tm0.tm_min  = RTC_DEFAULT_MIN;
+        tm0.tm_sec  = RTC_DEFAULT_SEC;
+    }
     time_t t = mktime(&tm0);
     struct timeval tv = { t, 0 };
     settimeofday(&tv, nullptr);
@@ -878,6 +905,34 @@ static void bleAdvertiseMeasurement(const Measurement& m) {
                   (int16_t)(buf[16] | (buf[17] << 8)),
                   (int16_t)(buf[18] | (buf[19] << 8)));
 }
+
+// アドバタイズは接続確立後に止まる機材があり、その間コントローラー側の表示が更新できなくなる。
+// GATT接続中は計測の度にNotifyで直接最新値+実時刻を送り、接続中でもリアルタイム表示できるようにする。
+static void sendLiveUpdateIfConnected(const Measurement& m) {
+    if (!g_bleControllerConnected || g_pTxCharacteristic == nullptr) return;
+
+    char ts[24];
+    rtcNowString(ts, sizeof(ts));
+
+    char line[160];
+    int n = snprintf(line, sizeof(line),
+        "LIVE:CH1=%s,CH2=%s,CH3=%s,CH4=%s,CH5=%s,CH6=%s,CH7=%s,CH8=%s,TIME=%s",
+        m.hx_ok[0] ? String(m.hx_phys[0], 2).c_str() : "NaN",
+        m.hx_ok[1] ? String(m.hx_phys[1], 2).c_str() : "NaN",
+        m.hx_ok[2] ? String(m.hx_phys[2], 2).c_str() : "NaN",
+        m.hx_ok[3] ? String(m.hx_phys[3], 2).c_str() : "NaN",
+        m.hx_ok[4] ? String(m.hx_phys[4], 2).c_str() : "NaN",
+        m.ch6_ok   ? String(m.ch6_tempC, 1).c_str()  : "NaN",
+        m.ch7_ok   ? String(m.ch7_V, 3).c_str()      : "NaN",
+        m.ch8_ok   ? String(m.ch8_V, 3).c_str()      : "NaN",
+        ts);
+    if (n <= 0 || (size_t)n >= sizeof(line)) return;
+
+    g_pTxCharacteristic->setValue((uint8_t*)line, (size_t)n);
+    g_pTxCharacteristic->notify();
+    Serial.print("[BLE] live notify: ");
+    Serial.println(line);
+}
 #endif
 
 #if defined(COMM_USE_WIFI)
@@ -1007,6 +1062,9 @@ void loop() {
     Measurement m = measureAll();
     logToSD(m);
     sendMeasurement(m);
+#if defined(COMM_USE_BLE)
+    sendLiveUpdateIfConnected(m);
+#endif
 
     char ts[24];
     rtcNowString(ts, sizeof(ts));
