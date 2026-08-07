@@ -100,7 +100,7 @@ using namespace Adafruit_LittleFS_Namespace;
 // ============================================================
 #ifdef COMM_MODE_BLE
 static const uint8_t  DEVICE_ID           = 0x01;  // 子機 ID（複数台時は変える: 0x01〜0xFF）
-static const uint8_t  FW_VERSION          = 2;     // 子機ファームのバージョン。コミットのたびに+1すること
+static const uint8_t  FW_VERSION          = 3;     // 子機ファームのバージョン。コミットのたびに+1すること
 static const uint32_t MEASURE_INTERVAL_MIN = 20;   // 計測間隔（分）
 static const uint32_t ADV_DURATION_MIN     = 10;   // アドバタイズ継続時間（分）
 static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のときアドバタイズ
@@ -118,7 +118,7 @@ static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のとき
 // ============================================================
 #ifdef COMM_MODE_LORA
 static const uint8_t  DEVICE_ID  = 0x0E;  // 子機 ID（iPEC実機テスト用。Gateway側 01_http_post の TARGET_DEVICE_ID と一致させること）
-static const uint8_t  FW_VERSION = 8;     // 子機ファームのバージョン。コミットのたびに+1すること
+static const uint8_t  FW_VERSION = 9;     // 子機ファームのバージョン。コミットのたびに+1すること
 #endif
 
 // ============================================================
@@ -127,7 +127,7 @@ static const uint8_t  FW_VERSION = 8;     // 子機ファームのバージョ�
 
 // USB Serial デバッグログは常時有効（USB未接続時は write() が即座に破棄されるため
 // 消費電力への影響はない）。
-#define SLEEP_MINUTES        1       // 1サイクル後のスリープ時間（分）
+#define SLEEP_MINUTES        120       // 1サイクル後のスリープ時間（分）
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 // ── タレ（ゼロ点補正）操作 ─────────────────────────────────────
 // 【操作方法】D0 のタクトスイッチを押しながら電源スイッチ(S1)を ON にし、
@@ -176,7 +176,7 @@ static const uint8_t  FW_VERSION = 8;     // 子機ファームのバージョ�
 //   3 = DS18B20（1-Wire 温度センサ）※ 外部プルアップ 4.7kΩ（3V3_SW → CH pin3）必要
 //   4 = VL53L4CD（ToF距離センサ、I2C）※ I2Cモジュール（MPU6050等と同一配線）を使用。
 //       TCA9546A 経由でチャンネル分離するためアドレス競合なし
-const uint8_t CH_ASSIGN[4] = {3, 3, 1, 1};
+const uint8_t CH_ASSIGN[4] = {1, 1, 1, 1};
 
 // ── I2C 加速度センサ設定 ───────────────────────────────────────
 // 対応センサ: LSM6DS3 / LSM6DSO / LSM6DSL（SA0 ピンでアドレス切替）
@@ -511,7 +511,7 @@ static int32_t loraSleepJitterSeconds(uint16_t jitterMaxSec) {
 // これによりタイムアウトは「スリープ時間」「活動時間」の長い方だけを
 // 超える値であればよい（合計値をカバーする必要はない）。
 // ============================================================
-static uint32_t const WDT_TIMEOUT_MS = 65UL * 60UL * 1000UL;  // 65分（VL53L4CD 2段メジアン化で計測時間が最大約10分に伸びたため余裕を持たせた値）
+static uint32_t const WDT_TIMEOUT_MS = 130UL * 60UL * 1000UL;  // 130分（VL53L4CD 2段メジアン化で計測時間が最大約10分に伸びたため余裕を持たせた値）
 
 static void wdtInit(uint32_t timeoutMs) {
   NRF_WDT->CONFIG  = (WDT_CONFIG_SLEEP_Run << WDT_CONFIG_SLEEP_Pos);  // スリープ中も継続動作
