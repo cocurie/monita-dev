@@ -117,8 +117,8 @@ static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のとき
 // （BLEのような継続アドバタイズ／時間窓判定は行わない）。
 // ============================================================
 #ifdef COMM_MODE_LORA
-static const uint8_t  DEVICE_ID  = 0x01;  // 子機 ID（複数台時は変える: 0x01〜0xFF）
-static const uint8_t  FW_VERSION = 7;     // 子機ファームのバージョン。コミットのたびに+1すること
+static const uint8_t  DEVICE_ID  = 0x0E;  // 子機 ID（iPEC実機テスト用。Gateway側 01_http_post の TARGET_DEVICE_ID と一致させること）
+static const uint8_t  FW_VERSION = 8;     // 子機ファームのバージョン。コミットのたびに+1すること
 #endif
 
 // ============================================================
@@ -127,7 +127,7 @@ static const uint8_t  FW_VERSION = 7;     // 子機ファームのバージョ�
 
 // USB Serial デバッグログは常時有効（USB未接続時は write() が即座に破棄されるため
 // 消費電力への影響はない）。
-#define SLEEP_MINUTES        60       // 1サイクル後のスリープ時間（分）
+#define SLEEP_MINUTES        1       // 1サイクル後のスリープ時間（分）
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 // ── タレ（ゼロ点補正）操作 ─────────────────────────────────────
 // 【操作方法】D0 のタクトスイッチを押しながら電源スイッチ(S1)を ON にし、
@@ -1769,9 +1769,14 @@ static void loraSendFrame(const uint8_t *msd, uint8_t msdLen) {
 //   [14]    Minute
 //   [15-18] CH1〜CH4 Range（uint8_t、0〜255にクランプ）
 static void sendLoRa() {
+  // ★一時的な緩和（iPEC疎通テスト用）: センサー・ADC未実装のためHX711/DS18B20が
+  //   毎回タイムアウト/未検出エラーになるが、本テストの目的はLoRa→Gateway→iPEC
+  //   の通信経路の疎通確認であり、CH値が0（未実装により正常）でも送信して構わない。
+  //   センサー実装後・本番運用時は、この分岐を削除して元のスキップ動作に戻すこと。
   if (s_errors != 0U) {
-    Serial.println("[LORA] skipped (errors)");
-    return;
+    Serial.print("[LORA] errors present (0x");
+    Serial.print(s_errors, HEX);
+    Serial.println(") だが疎通テストのため送信を続行");
   }
 
   if (!loraCheckAndConfigure()) {
