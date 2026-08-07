@@ -1,23 +1,31 @@
 /**
- * Monita LoRa 検証 Step26: ダウンリンク送信テストツール（ブレッドボード版）
+ * Monita LoRa 検証 Step03（Gateway側）: ダウンリンク送信テストツール（Gateway v1.1実機版）
  *
  * 【目的】
- *   test_sketches/25_lora_downlink_child が正しくダウンリンクを受信・検証・適用
- *   できるかを、Gateway実機に触れずに確認するための送信専用ツール。
- *   XIAO nRF52840 Sense + E220-900T22S(JP) をブレッドボードに直結し、
- *   D0ボタンを押すたびに1回、TARGET_DEVICE_ID宛てのダウンリンクフレームを送信する。
+ *   case01_Flex/test_sketches/25_lora_downlink_child（Flex実機）が正しく
+ *   ダウンリンクを受信・検証・適用できるかを確認するための送信専用ツール。
+ *   Gateway v1.1実機（XIAO nRF52840 + E220-900T22S(JP)）にそのまま書き込んで使う。
  *
- * 【配線】25_lora_downlink_childと同一
- *   XIAO D8 (TX) → E220 RXD / XIAO D9 (RX) ← E220 TXD
- *   XIAO D1 → E220 M0 / XIAO D2 → E220 M1
- *   XIAO 3V3 → E220 VCC（常時給電）/ XIAO GND → E220 GND
- *   XIAO D0 → タクトスイッチ（もう片方はGND、INPUT_PULLUPで使用）
+ * 【★2026-08-07: case01_Flex/test_sketches/26_lora_downlink_sender との違い】
+ *   - 26番はXIAO+E220ブレッドボード単体・D0ボタン押下で1回送信、という設計だったが、
+ *     Gateway v1.1実機で進めることになったため新規作成した。
+ *   - Gateway v1.1はD0がLoRa RX（UARTE1）として使用済みでボタンが無い
+ *     （物理スイッチ自体、他の理由で撤去済み。gateway_v1.00_to_v1.10_diff.md 補足参照）。
+ *     そのため「一定間隔で自動的に連続送信」する方式にした。
+ *   - LoRa UARTもGateway v1.1と同じ第2ハードウェアUART（UARTE1、D0/D1）を使う。
+ *     FlexのSerial1(D8/D9)とは配線・実装方式が異なる点に注意。
+ *   - UARTE1を自前で使う場合、割り込みハンドラを手動転送しないと write() が
+ *     2回目の呼び出しで無期限にブロックする不具合がある（gateway_v1.1本番ファームで
+ *     実機デバッグ済みの既知の罠）。同じ回避策をそのまま踏襲している。
+ *
+ * 【配線】Gateway v1.1実機そのまま（platformio.iniのコメント参照）
+ *   XIAO D0 ← E220 TXD / XIAO D1 → E220 RXD / XIAO D2 → E220 M0・M1共通駆動
  *
  * 【送信内容】
  *   TEST_SEND_TIME_FLAG / TEST_SEND_SLEEP_FLAG / TEST_SEND_AVGMED_FLAG の
- *   define で、どのフラグを立てて送るか切り替えられる（テストのたびに
- *   コメントアウトを変えて個別に確認できるようにしている）。
+ *   define で、どのフラグを立てて送るか切り替えられる。
  *   時刻はビルド時刻（__DATE__/__TIME__）を使う。
+ *   SEND_INTERVAL_MS 間隔で自動的に送信を繰り返す。
  *
  * フレーム仕様は25_lora_downlink_childのコメント参照（同一仕様）。
  */
@@ -45,17 +53,29 @@ static const uint8_t TARGET_DEVICE_ID = 0x08;
 #define TEST_NEW_SAMPLES_PER_AVG 8
 #define TEST_NEW_MEASURE_COUNT   8
 
-#define BUTTON_PIN  0   // D0
-#define BOOT_BLUE_MS 500
+// 自動連続送信の間隔（ms）。Gateway v1.1にはD0ボタンが無いため、
+// ボタン押下の代わりにこの間隔で自動的にダウンリンクを送信し続ける。
+#define SEND_INTERVAL_MS  15000UL
 
 // ============================================================
-// ピン割当（ブレッドボード配線）
+// ピン割当（Gateway v1.1実機。gateway_v1.1/platformio.iniのコメント参照）
 // ============================================================
-#define LORA_TX_PIN 8
-#define LORA_RX_PIN 9
-#define LORA_M0_PIN 1
-#define LORA_M1_PIN 2
+static int const LORA_RX_PIN   = 0;  // D0: E220 TXD → XIAO RX
+static int const LORA_TX_PIN   = 1;  // D1: XIAO TX → E220 RXD
+static int const LORA_M0M1_PIN = 2;  // D2: E220 M0・M1 共通駆動（基板でM0/M1短絡済み）
 #define LORA_UART_BAUD 9600
+
+// ============================================================
+// LoRa用UART（UARTE1、第2ハードウェアUART）
+//
+// gateway_v1.1/src/main.cpp と同じ理由で、割り込みハンドラを手動転送しないと
+// write() が2回目の呼び出しで無期限にブロックする（実機デバッグ済みの既知の罠）。
+// ============================================================
+static Uart loraSerial(NRF_UARTE1, UARTE1_IRQn, LORA_RX_PIN, LORA_TX_PIN);
+
+extern "C" void UARTE1_IRQHandler(void) {
+  loraSerial.IrqHandler();
+}
 
 // ============================================================
 // ステータスLED
@@ -80,7 +100,7 @@ static void statusIdle()      { rgbHwShow(0, 0, 32); }   // 常時ダウンラ�
 static void statusSendGreen() { rgbHwShow(0, 255, 0); }
 
 // ============================================================
-// LoRa（E220-900T22S(JP)）— 子機・Gatewayと同一設定値
+// LoRa（E220-900T22S(JP)）— 子機・Gateway本番ファームと同一設定値
 // ============================================================
 #define LORA_MODE_SWITCH_DELAY_MS 100U
 #define LORA_CFG_REG_START 0x00
@@ -93,26 +113,26 @@ static const uint8_t LORA_CFG_REG1 = 0x01;
 static const uint8_t LORA_CFG_REG2 = 0x00;
 static const uint8_t LORA_CFG_REG3 = 0x80;
 
-static void loraSetMode(bool m0High, bool m1High) {
-  digitalWrite(LORA_M0_PIN, m0High ? HIGH : LOW);
-  digitalWrite(LORA_M1_PIN, m1High ? HIGH : LOW);
+static bool loraSetMode(bool high) {
+  digitalWrite(LORA_M0M1_PIN, high ? HIGH : LOW);
   delay(LORA_MODE_SWITCH_DELAY_MS);
+  return true;
 }
-static inline void loraModeNormal() { loraSetMode(false, false); }
-static inline void loraModeConfig() { loraSetMode(true, true); }
+static inline bool loraModeNormal() { return loraSetMode(false); }
+static inline bool loraModeConfig() { return loraSetMode(true); }
 
 static bool loraReadConfig(uint8_t *out6) {
-  while (Serial1.available()) Serial1.read();
-  Serial1.write((uint8_t)0xC1);
-  Serial1.write((uint8_t)LORA_CFG_REG_START);
-  Serial1.write((uint8_t)LORA_CFG_REG_LEN);
+  while (loraSerial.available()) loraSerial.read();
+  loraSerial.write((uint8_t)0xC1);
+  loraSerial.write((uint8_t)LORA_CFG_REG_START);
+  loraSerial.write((uint8_t)LORA_CFG_REG_LEN);
 
   const int respLen = 3 + LORA_CFG_REG_LEN;
   uint8_t resp[3 + LORA_CFG_REG_LEN];
   int idx = 0;
   unsigned long t0 = millis();
   while (millis() - t0 < 500UL && idx < respLen) {
-    if (Serial1.available()) resp[idx++] = (uint8_t)Serial1.read();
+    if (loraSerial.available()) resp[idx++] = (uint8_t)loraSerial.read();
   }
   if (idx < respLen) return false;
   if (resp[0] != 0xC1) return false;
@@ -121,18 +141,18 @@ static bool loraReadConfig(uint8_t *out6) {
 }
 
 static void loraWriteConfig() {
-  Serial1.write((uint8_t)0xC0);
-  Serial1.write((uint8_t)LORA_CFG_REG_START);
-  Serial1.write((uint8_t)LORA_CFG_REG_LEN);
-  Serial1.write(LORA_CFG_ADDH);
-  Serial1.write(LORA_CFG_ADDL);
-  Serial1.write(LORA_CFG_REG0);
-  Serial1.write(LORA_CFG_REG1);
-  Serial1.write(LORA_CFG_REG2);
-  Serial1.write(LORA_CFG_REG3);
+  loraSerial.write((uint8_t)0xC0);
+  loraSerial.write((uint8_t)LORA_CFG_REG_START);
+  loraSerial.write((uint8_t)LORA_CFG_REG_LEN);
+  loraSerial.write(LORA_CFG_ADDH);
+  loraSerial.write(LORA_CFG_ADDL);
+  loraSerial.write(LORA_CFG_REG0);
+  loraSerial.write(LORA_CFG_REG1);
+  loraSerial.write(LORA_CFG_REG2);
+  loraSerial.write(LORA_CFG_REG3);
   delay(200);
   unsigned long t0 = millis();
-  while (millis() - t0 < 300UL) { while (Serial1.available()) Serial1.read(); }
+  while (millis() - t0 < 300UL) { while (loraSerial.available()) loraSerial.read(); }
 }
 
 static bool loraCheckAndConfigureOnce() {
@@ -200,6 +220,15 @@ static void loraPrintFrameHex(const uint8_t *msd, uint8_t msdLen, uint8_t sum) {
   Serial.println(sum, HEX);
 }
 
+// ★2026-08-07修正: フレーム全体をRAM上に組み立ててから1回のブロック書き込みで送る。
+//
+// 【経緯】
+//   当初は 0xAA / LEN / payload / checksum をバイト単位で write() していたが、
+//   実機テストでFlex側に一切届かなかった。一方、同じGateway基板・同じモジュールで
+//   19_lora_parent に足したPING送信（uint8_t配列を write(buf,len) で1回送信）は
+//   確実に届いた。Adafruitコアの write(uint8_t) は内部で write(&data,1) を呼ぶため
+//   1バイトごとに個別のDMA転送＋ENDTX待ちが発生し、E220の透過モードでの
+//   パケット境界判定に影響した可能性がある。実績のあるブロック書き込みに揃える。
 static void loraSendFrame(const uint8_t *msd, uint8_t msdLen) {
   uint8_t sum = (uint8_t)(0xAAU + msdLen);
   for (uint8_t i = 0; i < msdLen; i++) sum = (uint8_t)(sum + msd[i]);
@@ -208,11 +237,15 @@ static void loraSendFrame(const uint8_t *msd, uint8_t msdLen) {
   loraPrintFrameHex(msd, msdLen, sum);
 #endif
 
-  Serial1.write((uint8_t)0xAA);
-  Serial1.write(msdLen);
-  for (uint8_t i = 0; i < msdLen; i++) Serial1.write(msd[i]);
-  Serial1.write(sum);
-  Serial1.flush();
+  uint8_t frame[3 + 32];  // [SYNC][LEN][payload...][checksum]
+  uint8_t n = 0;
+  frame[n++] = 0xAA;
+  frame[n++] = msdLen;
+  for (uint8_t i = 0; i < msdLen; i++) frame[n++] = msd[i];
+  frame[n++] = sum;
+
+  loraSerial.write(frame, n);
+  loraSerial.flush();
 }
 
 // ============================================================
@@ -249,12 +282,16 @@ enum DownlinkFlag {
 };
 
 static void sendDownlinkCommand() {
-  if (!loraCheckAndConfigure()) {
-#if DEBUG_MODE
-    Serial.println("[LORA] config check failed, TX skipped");
-#endif
-    return;
-  }
+  // ★2026-08-07修正: 送信のたびの設定確認（Configモードへの出入り）をやめ、
+  //   Normalモードを再確定するだけにした。
+  //
+  // 【経緯】
+  //   当初は送信のたびに loraCheckAndConfigure() を呼んでいた（Config→read→Normal）。
+  //   E220はConfigモード中は電波を送受信できず、Normalへ戻すのに固定100msの待ちしか
+  //   入れていない（AUX未接続のため完了を検知できない）。実機テストではこの構成で
+  //   Flex側に一切届かず、一方 19_lora_parent のPING送信（Normalのまま送信）は
+  //   確実に届いた。設定確認は起動時に1回だけ行う方式（19と同じ）に揃える。
+  loraModeNormal();
 
   uint8_t flags = 0;
 #if TEST_SEND_TIME_FLAG
@@ -301,46 +338,47 @@ static void sendDownlinkCommand() {
 // Arduino エントリ
 // ============================================================
 static void loraUartBegin() {
-  Serial1.setPins(LORA_RX_PIN, LORA_TX_PIN);
-  Serial1.begin(LORA_UART_BAUD);
+  loraSerial.begin(LORA_UART_BAUD);
   delay(500);
 }
-
-static bool s_lastButtonState = HIGH;
 
 void setup() {
   rgbHwBegin();
   statusBootBlue();
-  delay(BOOT_BLUE_MS);
+  delay(500);
 
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(LORA_M0_PIN, OUTPUT);
-  pinMode(LORA_M1_PIN, OUTPUT);
-  digitalWrite(LORA_M0_PIN, LOW);
-  digitalWrite(LORA_M1_PIN, LOW);
+  pinMode(LORA_M0M1_PIN, OUTPUT);
+  digitalWrite(LORA_M0M1_PIN, LOW);  // Normalモードで起動
 
 #if DEBUG_MODE
   Serial.begin(115200);
   for (int rep = 0; rep < 3; rep++) {
     delay(1000);
-    Serial.println("\n[Step26] LoRaダウンリンク送信テストツール起動");
+    Serial.println("\n[Step03] LoRaダウンリンク送信テストツール起動（Gateway v1.1実機版）");
     Serial.print("送信先DeviceID=0x"); Serial.println(TARGET_DEVICE_ID, HEX);
-    Serial.println("D0ボタンを押すとダウンリンクを1回送信します");
+    Serial.print(SEND_INTERVAL_MS / 1000UL); Serial.println("秒間隔で自動送信します（D0ボタンは無し）");
   }
 #endif
 
   loraUartBegin();
+
+  // 設定確認は起動時に1回だけ行う（19_lora_parentと同じ方式）。
+  // 以降の送信ではConfigモードへ入らず、Normalモードのまま送信する。
+  if (!loraCheckAndConfigure()) {
+#if DEBUG_MODE
+    Serial.println("[LORA] ★起動時の設定確認に失敗しました（配線・給電を確認してください）");
+#endif
+  }
+  loraModeNormal();
+
   statusIdle();
 }
 
+static unsigned long s_lastSendMs = 0;
+
 void loop() {
-  bool btn = digitalRead(BUTTON_PIN);
-  if (s_lastButtonState == HIGH && btn == LOW) {
-    delay(20);  // チャタリング除去
-    if (digitalRead(BUTTON_PIN) == LOW) {
-      sendDownlinkCommand();
-    }
+  if (millis() - s_lastSendMs >= SEND_INTERVAL_MS) {
+    s_lastSendMs = millis();
+    sendDownlinkCommand();
   }
-  s_lastButtonState = btn;
-  delay(10);
 }

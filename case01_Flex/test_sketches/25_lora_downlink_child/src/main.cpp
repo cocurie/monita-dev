@@ -1,24 +1,35 @@
 /**
- * Monita LoRa 検証 Step25: ダウンリンク受信テスト用 子機（ブレッドボード版）
+ * Monita LoRa 検証 Step25: ダウンリンク受信テスト用 子機（Flex実機版）
  *
  * 【目的】
  *   Gateway→子機方向のLoRaダウンリンク（時刻補正・送信頻度・ひずみ計測の
  *   平均/メジアン回数の変更）を受信・検証・適用・フラッシュ保存する部分だけを
- *   切り出して検証する。test_sketches/22_lora_multi_child をベースにしている。
+ *   切り出して検証する。
  *
- * 【22_lora_multi_childとの違い】
- *   - 毎回のアップリンク送信後、DOWNLINK_RX_WINDOW_MS の間だけLoRa受信を待つ
+ * 【★2026-08-07変更: ブレッドボード版→Flex実機版】
+ *   当初はXIAO+E220を直結したブレッドボードで作ったが、実機のFlex v3.1x基板は
+ *   E220のM0/M1がXIAOのGPIOに直結されておらず、TCA9534(U6)のP2（基板上でM0/M1
+ *   短絡・共通駆動）経由でI2C制御する設計になっている（v3.10_lora本番ファーム
+ *   と同一）。そのままでは実機でE220が設定モードに入れずconfig read失敗になる
+ *   ため、M0/M1制御・TCA9534初期化・3V3_SW制御を本番ファームから移植した。
+ *
+ * 【配線】Flex v3.1x実機そのまま（ブレッドボード配線は不要）
+ *   XIAO D8/D9  → Sigfox/LoRa共用UART（E220 RXD/TXD）
+ *   XIAO D10    → 3V3_SW（MOSFET_GATE）
+ *   XIAO I2C    → TCA9534(0x20)。P2がE220 M0/M1共通駆動
+ *
+ * 【25_lora_downlink_child ブレッドボード版との違い】
+ *   - LORA_M0_PIN/LORA_M1_PINへの直接digitalWriteをやめ、TCA9534 P2経由のI2C制御に変更
+ *   - 起床時にSW_POWER_PIN（3V3_SW）をON、スリープ前にOFFする処理を追加
+ *   - Wire.begin() / tca9534Configure() を起床のたびに実行
+ *   - HX711・DS3231等のセンサー計測は行わない（ダウンリンク受信ロジックの検証に特化）
+ *   - 毎回のアップリンク送信直後、DOWNLINK_RX_WINDOW_MS の間だけLoRa受信を待つ
  *   - 受信したフレームがダウンリンクコマンド（Company ID・PktType一致）であれば
  *     内容を検証し、送信頻度／平均回数／メジアン回数をランタイム変数に適用する
  *   - 上記の変更値はInternalFS（フラッシュ）に保存し、リセット後も保持する
- *   - DS3231が無い簡易ブレッドボード版のため、時刻補正フラグを受信した場合は
+ *   - DS3231を初期化していないため、時刻補正フラグを受信した場合は
  *     「本来ならDS3231に書き込む内容」をログ表示するだけに留める
- *     （実装をv3.10_loraへ統合する際にDS3231書き込みへ差し替える）
- *
- * 【配線】22_lora_multi_childと同一
- *   XIAO D8 (TX) → E220 RXD / XIAO D9 (RX) ← E220 TXD
- *   XIAO D1 → E220 M0 / XIAO D2 → E220 M1
- *   XIAO 3V3 → E220 VCC（常時給電）/ XIAO GND → E220 GND
+ *     （v3.10_loraへ統合する際にDS3231書き込みへ差し替える）
  *
  * 【★書き込み前に必ず変更すること】
  *   DEVICE_ID を台ごとに重複しないユニークな値にする。
@@ -48,6 +59,7 @@
 
 #include <Arduino.h>
 #include <nrf.h>
+#include <Wire.h>
 #include <Adafruit_TinyUSB.h>       // USB CDC（Serial）。USE_TINYUSBビルド時に必要
 #include <InternalFileSystem.h>     // ランタイム設定のフラッシュ保存に使用
 using namespace Adafruit_LittleFS_Namespace;
@@ -62,7 +74,7 @@ static const uint8_t FW_VERSION = 1;
 #define DEBUG_MODE          1     // 1: USB Serialデバッグログ有効
 
 // ランタイム設定のデフォルト値（フラッシュに保存が無い初回起動時に使う）
-#define DEFAULT_SLEEP_MINUTES   4     // 送信間隔（分）
+#define DEFAULT_SLEEP_MINUTES   1     // 送信間隔（分）
 #define DEFAULT_SAMPLES_PER_AVG 5     // ひずみ計測: 平均サンプル数
 #define DEFAULT_MEASURE_COUNT   5     // ひずみ計測: メジアンをとる回数
 
@@ -72,14 +84,30 @@ static const uint8_t FW_VERSION = 1;
 // 消費電流とのトレードオフ。本番機ではこれを最小限に抑える設計にする。
 #define DOWNLINK_RX_WINDOW_MS 10000UL
 
+// ★切り分け用: 1 にすると「スリープもアップリンク送信も一切せず、ひたすら受信し続ける」
+//   RX専用モードになる。
+//
+// 【なぜ必要か】
+//   通常モードは「10秒のRXウィンドウ」しか開かないため、Gateway側の送信タイミングと
+//   噛み合わないと受信できず、「電波が届いていない」のか「タイミングが合っていない」のか
+//   区別できない。RX専用モードならタイミング要因が完全に消えるので、
+//   それでも1バイトも受信できなければRF側（アンテナ・距離・モジュール個体・
+//   Gateway側の送信経路）の問題だと確定できる。
+//   切り分けが済んだら 0 に戻すこと。
+#define RX_ONLY_MODE 1
+
 // ============================================================
-// ピン割当（ブレッドボード配線。22_lora_multi_childと同一）
+// ピン割当（Flex v3.1x実機。v3.10_loraと同一）
 // ============================================================
-#define LORA_TX_PIN 8
-#define LORA_RX_PIN 9
-#define LORA_M0_PIN 1
-#define LORA_M1_PIN 2
+#define SIGFOX_TX_PIN 8    // D8: XIAO TX → E220 RXD（Sigfoxと共用ネット）
+#define SIGFOX_RX_PIN 9    // D9: XIAO RX ← E220 TXD（Sigfoxと共用ネット）
+#define LORA_TX_PIN   SIGFOX_TX_PIN
+#define LORA_RX_PIN   SIGFOX_RX_PIN
 #define LORA_UART_BAUD 9600
+
+#define SW_POWER_PIN 10    // D10 = MOSFET_GATE → 3V3_SW ON/OFF（HIGHで周辺レール給電）
+
+#define TCA9534_ADDR 0x20  // TCA9534（U6）I2Cアドレス
 
 // ============================================================
 // ステータスLED（XIAO nRF52840 Sense 内蔵の離散RGB。アクティブLOW）
@@ -196,6 +224,7 @@ static void deepSleep(uint32_t minutes) {
 
   rgbOff();
   Serial1.end();
+  digitalWrite(SW_POWER_PIN, LOW);  // 3V3_SW OFF（周辺給電を落とす）
 
 #if DEBUG_MODE
   Serial.print("[RTC2 sleep] "); Serial.print(minutes); Serial.println(" min");
@@ -236,9 +265,52 @@ static void deepSleep(uint32_t minutes) {
 }
 
 // ============================================================
+// TCA9534（U6）— LoRa M0/M1 共通駆動（v3.10_loraと同一。P2の1本でM0・M1を制御）
+// ============================================================
+static bool tca9534WriteReg(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(TCA9534_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+
+static bool tca9534ReadReg(uint8_t reg, uint8_t *out) {
+  Wire.beginTransmission(TCA9534_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(TCA9534_ADDR, (uint8_t)1) != 1) return false;
+  *out = Wire.read();
+  return true;
+}
+
+// `3V3_SW` 復帰後も呼べるよう冪等に。
+static bool tca9534Configure() {
+  if (!tca9534WriteReg(0x02, 0x00)) return false;               // Polarity: 反転なし
+  if (!tca9534WriteReg(0x03, 0xFB)) return false;                // P2のみ出力、他は入力
+  uint8_t out = 0;
+  if (!tca9534ReadReg(0x01, &out)) return false;
+  out = (uint8_t)((out & (uint8_t)~0x04U) | 0x00U);              // P2=0（E220 Mode0=通常送受信）
+  return tca9534WriteReg(0x01, out);
+}
+
+#define LORA_MODE_SWITCH_DELAY_MS 100U  // M0/M1切替後の安定待ち
+
+// TCA9534 P2（=E220 M0・M1 共通駆動）を high/low に駆動する。
+// 両LOW=Mode0通常送受信／両HIGH=Mode3設定。
+static bool loraSetMode(bool high) {
+  uint8_t out = 0;
+  if (!tca9534ReadReg(0x01, &out)) return false;
+  out = (uint8_t)((out & (uint8_t)~0x04U) | (high ? 0x04U : 0U));  // P2 = bit2
+  if (!tca9534WriteReg(0x01, out)) return false;
+  delay(LORA_MODE_SWITCH_DELAY_MS);
+  return true;
+}
+static inline bool loraModeNormal() { return loraSetMode(false); }
+static inline bool loraModeConfig() { return loraSetMode(true); }
+
+// ============================================================
 // LoRa（E220-900T22S(JP)）— v3.10_loraと同じ設定値・フレーム形式
 // ============================================================
-#define LORA_MODE_SWITCH_DELAY_MS 100U
 #define LORA_CFG_REG_START 0x00
 #define LORA_CFG_REG_LEN   6
 
@@ -249,14 +321,6 @@ static const uint8_t LORA_CFG_REG0 = 0x68;  // UART9600bps + エア速度(SF7/BW
 static const uint8_t LORA_CFG_REG1 = 0x01;  // ペイロード長200B/RSSIノイズ無効/送信出力13dBm
 static const uint8_t LORA_CFG_REG2 = 0x00;  // チャンネル0
 static const uint8_t LORA_CFG_REG3 = 0x80;  // RSSIバイト有効化ON/透過送信モード
-
-static void loraSetMode(bool m0High, bool m1High) {
-  digitalWrite(LORA_M0_PIN, m0High ? HIGH : LOW);
-  digitalWrite(LORA_M1_PIN, m1High ? HIGH : LOW);
-  delay(LORA_MODE_SWITCH_DELAY_MS);
-}
-static inline void loraModeNormal() { loraSetMode(false, false); }
-static inline void loraModeConfig() { loraSetMode(true, true); }
 
 static bool loraReadConfig(uint8_t *out6) {
   while (Serial1.available()) Serial1.read();
@@ -293,7 +357,12 @@ static void loraWriteConfig() {
 }
 
 static bool loraCheckAndConfigureOnce() {
-  loraModeConfig();
+  if (!loraModeConfig()) {
+#if DEBUG_MODE
+    Serial.println("[LORA] TCA9534 M0/M1切替(Config)失敗");
+#endif
+    return false;
+  }
 
   uint8_t cur[LORA_CFG_REG_LEN] = {0};
   bool readOk = loraReadConfig(cur);
@@ -442,9 +511,9 @@ static bool applyDownlinkPayload(const uint8_t *payload, uint8_t len) {
     uint8_t month = payload[6], day = payload[7];
     uint8_t hour  = payload[8], minute = payload[9], sec = payload[10];
 #if DEBUG_MODE
-    // このブレッドボード版にはDS3231が無いため、書き込み内容をログ表示するだけに留める。
+    // このテストではDS3231を初期化していないため、書き込み内容をログ表示するだけに留める。
     // v3.10_loraへ統合する際はここを ds3231SetTime() 等への書き込みに差し替える。
-    Serial.print("[DOWNLINK] 時刻補正（DS3231未搭載のためログのみ）: ");
+    Serial.print("[DOWNLINK] 時刻補正（DS3231書込は未実装のためログのみ）: ");
     Serial.print(year); Serial.print("-");
     Serial.print(month); Serial.print("-");
     Serial.print(day); Serial.print(" ");
@@ -455,7 +524,7 @@ static bool applyDownlinkPayload(const uint8_t *payload, uint8_t len) {
   }
 
   if (flags & DL_FLAG_SLEEP_MIN) {
-    uint16_t newSleepMin = ((uint16_t)payload[11] << 8) | payload[12];  // ★注: 下記TXコードもLE/BE統一
+    uint16_t newSleepMin = ((uint16_t)payload[11] << 8) | payload[12];
     if (newSleepMin > 0 && newSleepMin != s_settings.sleepMinutes) {
       s_settings.sleepMinutes = newSleepMin;
       changed = true;
@@ -489,6 +558,63 @@ static bool applyDownlinkPayload(const uint8_t *payload, uint8_t len) {
   return true;
 }
 
+// ★2026-08-07追加: UARTE受信ストール対策
+//
+// 【なぜ必要か】
+//   nRF52のUARTEは、エラー（overrun/framing等）や設定モードとの行き来のあとに
+//   受信が停止（ストール）したまま復帰しないことがある。この状態になると
+//   Serial1.available() が永久に0を返し続け、電波が届いていても1バイトも読めない。
+//   実際 19_lora_parent のログでも「受信ストール検出 → RX再起動 #1」の"後"から
+//   初めてフレームを受信し始めており、この対策なしでは受信できていなかった。
+//   （19_lora_parent / gateway_v1.1 で実機確認済みのロジックを移植）
+//
+// 【Flex版の注意】
+//   Gateway側はLoRaにUARTE1を使うが、FlexのSerial1は UARTE0（コアのUart.cppで
+//   Serial1 = NRF_UARTE0 と定義されている）。レジスタを読み替えていることに注意。
+// ★2026-08-07: この対策は当初「UARTE受信ストールが原因では」という仮説で入れたが、
+//   実機検証の結果ERRORSRCは一度も立たず、ストールではないことが判明した
+//   （真因はGateway側 03_lora_downlink_sender の送信処理だった）。
+//   さらに loraKickTx() が受信バッファをクリアするため、有効なままだと
+//   届いたダウンリンクを取りこぼす恐れがある。既定で無効にしておく。
+#define LORA_RX_WATCHDOG_ENABLED 0
+
+#define LORA_RX_STALL_MS 3000UL   // この時間1バイトも受信が無ければRXを再起動する
+static uint32_t s_loraLastRxMs = 0;
+static uint32_t s_loraRekicks  = 0;
+
+// E220へダミーを1回書いて送受信を促す（19_lora_parentのloraKickTx()相当）
+static void loraKickTx() {
+  const uint8_t dummy[3] = {0x00, 0x00, 0x00};
+  Serial1.write(dummy, sizeof(dummy));
+  Serial1.flush();
+  delay(200);
+  while (Serial1.available()) Serial1.read();
+}
+
+// UARTE0のエラー要因を回収し、受信が止まっていれば受信を再起動する
+static void loraRxWatchdog() {
+  uint32_t errsrc = NRF_UARTE0->ERRORSRC;
+  if (errsrc) {
+    NRF_UARTE0->ERRORSRC = errsrc;
+#if DEBUG_MODE
+    Serial.print("[LORA] UARTE0 ERRORSRC=0x"); Serial.println(errsrc, HEX);
+#endif
+  }
+  if (NRF_UARTE0->EVENTS_ERROR) NRF_UARTE0->EVENTS_ERROR = 0;
+
+  if (millis() - s_loraLastRxMs >= LORA_RX_STALL_MS) {
+    s_loraLastRxMs = millis();
+    s_loraRekicks++;
+    NRF_UARTE0->TASKS_STARTRX = 1;
+#if DEBUG_MODE
+    Serial.print("[LORA] 受信ストール検出 → RX再起動 #");
+    Serial.println(s_loraRekicks);
+#endif
+    loraModeNormal();
+    loraKickTx();
+  }
+}
+
 // DOWNLINK_RX_WINDOW_MS の間だけSerial1を監視し、ダウンリンクフレームを待つ。
 // 受信できなければ何もせずタイムアウトで戻る（消費電流はこの待ち時間に比例する）。
 static void downlinkRxWindow(uint32_t windowMs) {
@@ -501,11 +627,24 @@ static void downlinkRxWindow(uint32_t windowMs) {
   uint8_t len = 0, idx = 0, sum = 0, rxByte = 0;
   uint8_t body[32];  // payload最大32バイト想定（今回は15バイト）
   bool got = false;
+  uint32_t rawByteCount = 0;  // ウィンドウ内で受信した生バイト総数（切り分け用）
 
   unsigned long t0 = millis();
+  s_loraLastRxMs = millis();  // ストール判定の起点をウィンドウ開始時にリセット
   while (millis() - t0 < windowMs && !got) {
+#if LORA_RX_WATCHDOG_ENABLED
+    loraRxWatchdog();
+#endif
+
     while (Serial1.available()) {
       rxByte = (uint8_t)Serial1.read();
+      rawByteCount++;
+      s_loraLastRxMs = millis();  // 受信できている間はストール判定をリセット
+#if DEBUG_MODE
+      Serial.print("[DOWNLINK] raw byte: 0x");
+      if (rxByte < 0x10) Serial.print('0');
+      Serial.println(rxByte, HEX);
+#endif
       switch (state) {
         case LORA_WAIT_SYNC:
           if (rxByte == 0xAA) { sum = rxByte; state = LORA_WAIT_LEN; }
@@ -547,7 +686,11 @@ static void downlinkRxWindow(uint32_t windowMs) {
   }
 
 #if DEBUG_MODE
-  if (!got) Serial.println("[DOWNLINK] RXウィンドウ内に受信なし");
+  if (!got) {
+    Serial.print("[DOWNLINK] RXウィンドウ内に受信なし（生バイト受信数=");
+    Serial.print(rawByteCount);
+    Serial.println("）");
+  }
 #endif
   rgbOff();
 }
@@ -617,6 +760,24 @@ static void loraUartBegin() {
   delay(500);
 }
 
+// 起床のたびに呼ぶ: 3V3_SW ON → Wire初期化 → TCA9534設定
+static bool peripheralsBegin() {
+  pinMode(SW_POWER_PIN, OUTPUT);
+  digitalWrite(SW_POWER_PIN, HIGH);  // 3V3_SW ON
+  delay(100);  // レール安定化待ち（v3.10_loraのBLEモードと同じ配慮）
+
+  Wire.begin();
+
+  if (!tca9534Configure()) {
+#if DEBUG_MODE
+    Serial.println("[TCA9534] 初期化失敗");
+#endif
+    statusErrorRed();
+    return false;
+  }
+  return true;
+}
+
 void setup() {
   wdtInit(WDT_TIMEOUT_MS);
 
@@ -625,29 +786,61 @@ void setup() {
   delay(BOOT_BLUE_MS);
   rgbOff();
 
-  pinMode(LORA_M0_PIN, OUTPUT);
-  pinMode(LORA_M1_PIN, OUTPUT);
-  digitalWrite(LORA_M0_PIN, LOW);
-  digitalWrite(LORA_M1_PIN, LOW);
-
 #if DEBUG_MODE
   Serial.begin(115200);
   for (int rep = 0; rep < 3; rep++) {
     delay(1000);
-    Serial.println("\n[Step25] LoRaダウンリンク受信テスト 子機起動");
+    Serial.println("\n[Step25] LoRaダウンリンク受信テスト 子機起動（Flex実機版）");
     Serial.print("DeviceID=0x"); Serial.println(DEVICE_ID, HEX);
   }
 #endif
 
   loadSettings();
+  peripheralsBegin();
   loraUartBegin();
 
+#if RX_ONLY_MODE
+  // RX専用モード: E220をNormal（透過送受信）モードに入れるところまでは通常と同じだが、
+  // アップリンク送信もスリープも行わず、loop()でひたすら受信を待ち続ける。
+  if (!loraCheckAndConfigure()) {
+    statusErrorRed();
+#if DEBUG_MODE
+    Serial.println("[LORA] config check failed（RX専用モードだが設定確認に失敗）");
+#endif
+  }
+#if DEBUG_MODE
+  // ★切り分け用: loraModeNormal()（TCA9534 P2=LOW書込）が本当に反映されているか、
+  //   I2C読み出しで直接確認する。ここがHIGHのままだとE220はConfigモードに
+  //   固着しており、ローカルAT応答は正常でも電波の受信は一切できない状態になる。
+  {
+    uint8_t out = 0;
+    if (tca9534ReadReg(0x01, &out)) {
+      Serial.print("[TCA9534] P2(M0/M1)実測値: ");
+      Serial.println((out & 0x04U) ? "HIGH（★Configモード固着の疑い）" : "LOW（Normalモード、正常）");
+    } else {
+      Serial.println("[TCA9534] P2読み出し失敗");
+    }
+  }
+  Serial.println("★RX_ONLY_MODE=1: 送信もスリープもせず、受信のみを継続します");
+  Serial.println("  Gateway側(03_lora_downlink_sender)の送信を待ち受けます");
+#endif
+#else
   sendLoRaDummy();
   deepSleep(s_settings.sleepMinutes);
+#endif
 }
 
 void loop() {
   wdtFeed();
+
+#if RX_ONLY_MODE
+  // タイミング要因を完全に排除するため、10秒ごとに区切って受信し続ける
+  // （区切るのはWDT給餌と「まだ生きている」ことをログで示すためだけ）。
+  downlinkRxWindow(10000UL);
+  return;
+#endif
+
+  peripheralsBegin();
   loraUartBegin();
 
 #if DEBUG_MODE
