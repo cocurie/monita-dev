@@ -164,7 +164,7 @@ const char* GAS_SCRIPT_ID = "AKfycbzKVvW6vEUvJ28c_xJbHoS2ulvHiPD4OsNONdrTrf6u4kL
 // 上のTEST_INJECT_FAKE_DEVICE_COUNTは起動時に1回だけ注入するのに対し、こちらは
 // 送信のたびに値を変えながら継続的に注入するため、スプレッドシートに定期的に
 // 新しい行が増えていくのを確認できる。検証後は必ず0に戻すこと。
-#define TEST_PERIODIC_FAKE_DATA 1
+#define TEST_PERIODIC_FAKE_DATA 0
 
 // SIM 切り替え — 使う方のブロックだけ有効にする
 // ── 1NCE SIM ──────────────────────────────────
@@ -207,7 +207,7 @@ static uint8_t  const EXPECTED_PKT_TYPE  = 0x04;             // Flex v3.10 LoRa 
 
 // GAS 送信インターバル。LoRaビルドではコントローラーからBLE経由で変更可能（内蔵フラッシュに保存し
 // 再起動後も維持）。BLEビルドではこの既定値のまま（変更手段なし）。
-static uint32_t const SEND_INTERVAL_DEFAULT_MS = 60000;  // 既定 5 分
+static uint32_t const SEND_INTERVAL_DEFAULT_MS = 7200000;  // 既定 120 分
 static uint32_t       sendIntervalMs           = SEND_INTERVAL_DEFAULT_MS;  // 実行時可変
 
 // Pkt type と併せて二重チェックする Device ID ホワイトリスト（BLE/LoRa共通）
@@ -219,7 +219,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 72;
+static uint8_t  const GATEWAY_FW_VERSION = 73;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -387,7 +387,7 @@ static inline void wdtFeed() {
 // するアプリ層ウォッチドッグを設ける。再起動後は setup() が AT&F + CFUN=1,1 で
 // モデムもソフトリセットするため、モデム側スタックの詰まりも合わせて解消される。
 // ══════════════════════════════════════════════
-static uint32_t const APP_WDT_NO_SEND_RESET_MS = 1800000UL;  // 30分: この間GAS送信成功が無ければ再起動
+static uint32_t const APP_WDT_NO_SEND_RESET_MS = 10800000UL;  // 180分: この間GAS送信成功が無ければ再起動（SEND_INTERVAL_DEFAULT_MS=120分より長く取り、1サイクル分の余裕を持たせる）
 static uint32_t lastGasSuccessMs = 0;  // 最後にGAS送信が成功した millis()（setup先頭で初期化）
 
 // 段階的復旧（★2026-07-21 追加、有野川障害の教訓）:
