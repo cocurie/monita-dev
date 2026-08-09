@@ -74,15 +74,45 @@ static const uint8_t FW_VERSION = 1;
 #define DEBUG_MODE          1     // 1: USB Serialデバッグログ有効
 
 // ランタイム設定のデフォルト値（フラッシュに保存が無い初回起動時に使う）
-#define DEFAULT_SLEEP_MINUTES   1     // 送信間隔（分）
+#define DEFAULT_SLEEP_MINUTES   2     // 送信間隔（分）
 #define DEFAULT_SAMPLES_PER_AVG 5     // ひずみ計測: 平均サンプル数
 #define DEFAULT_MEASURE_COUNT   5     // ひずみ計測: メジアンをとる回数
+
+// ★設定フォーマット／既定値のバージョン。
+// 上のDEFAULT_*を変更したときは必ず+1すること。バージョンが変わると、
+// フラッシュに残っている旧い保存内容は破棄され、新しい既定値が適用される。
+// （これが無いと、既定値を書き換えても過去のテストで保存された値が復元され続け、
+//   「ソースを直したのに実機の挙動が変わらない」という分かりにくい状態になる）
+#define SETTINGS_VERSION 2
 
 #define BOOT_BLUE_MS         500
 
 // 毎回のアップリンク送信後、ダウンリンクを待つ時間（ms）。
-// 消費電流とのトレードオフ。本番機ではこれを最小限に抑える設計にする。
-#define DOWNLINK_RX_WINDOW_MS 10000UL
+//
+// ★2026-08-09: 2000msで確定（切り分け中は一時的に10000にしていた）。
+// Gatewayはアップリンク検知から DOWNLINK_RESPONSE_DELAY_MS(400ms) 待って応答するため、
+// 子機の窓が開いた直後（開いてから約70ms後）にダウンリンクが届く。2秒あれば十分内側に入る。
+// 窓の長さはそのまま消費電流に効く（E220の受信待機8.2mA＋この間スリープできないnRF52の
+// アクティブ電流）ため、必要最小限に抑えている。
+#define DOWNLINK_RX_WINDOW_MS 2000UL
+
+// ダウンリンク結果のステータスコード（GAS・Gatewayファームと一致させること）
+#define DL_STATUS_OK          0   // 要求通り適用
+#define DL_STATUS_RANGE_ERROR 1   // 値域エラー（受け付けられない値だったので拒否）
+#define DL_STATUS_CLAMPED     2   // クランプ適用（WDT制約等で要求と異なる値を適用）
+
+// ★ダウンリンクで設定できる送信間隔の上限。
+//
+// 【なぜ上限が要るか】nRF52840のWDTは一度TASKS_STARTを叩くと、リセットするまで
+// タイムアウト値(CRV)の変更もSTOPもできない。したがって「スリープ中にWDTが焚かれない」
+// ことを保証するには、ランタイムで設定できるスリープ時間をWDTタイムアウトより
+// 確実に短い範囲に制限する必要がある。ここを守らないと、設定変更した瞬間から
+// 正常動作中に無限リブートを起こす（CLAUDE.md §7 の観点そのもの）。
+// 本テストスケッチは WDT_TIMEOUT_MS = 10分 なので、余裕を見て 8分を上限とする。
+// ★本番ファーム(v3.10_lora)へ統合する際は、そちらのWDT_TIMEOUT_MS(130分)に合わせて
+//   この値を見直すこと。あるいは「適用→フラッシュ保存→NVIC_SystemReset()」として
+//   setup()でWDTを張り直せば、上限そのものを無くせる。
+#define DL_MAX_SLEEP_MINUTES 8
 
 // ★切り分け用: 1 にすると「スリープもアップリンク送信も一切せず、ひたすら受信し続ける」
 //   RX専用モードになる。
@@ -94,7 +124,30 @@ static const uint8_t FW_VERSION = 1;
 //   それでも1バイトも受信できなければRF側（アンテナ・距離・モジュール個体・
 //   Gateway側の送信経路）の問題だと確定できる。
 //   切り分けが済んだら 0 に戻すこと。
-#define RX_ONLY_MODE 1
+//
+// ★2026-08-09: 0 に戻した。
+//   Class A方式（アップリンク送信→2秒の受信窓→スリープ）ではGatewayは
+//   「子機のアップリンクを検知したこと」を引き金にダウンリンクを返すため、
+//   RX_ONLY_MODE=1（送信もスリープもしない）のままでは引き金が発生せず、
+//   一連の流れが一切動かない。本来の動作経路を検証するため通常モードで動かす。
+#define RX_ONLY_MODE 0
+
+// ★2026-08-09【一時的な切り分け用】1にすると、スリープ中も3V3_SW（E220の電源）を切らない。
+//
+// 【何を切り分けるか】実機で「Gatewayは確かに送信しているのに、子機は10秒窓でも0バイト
+// （UARTE0_ERRORSRC=0x0）」という状態が確定した。子機→Gateway方向は正常なので、
+// 子機の受信だけが死んでいる。
+// 最有力の原因は「スリープのたびにE220を電源再投入していること」で、
+// [[e220_rx_latch_on_battery_poweron]] に記録済みの
+// 「電源投入時の立ち上がり方が引き金で、configには応答するのにRF受信だけ死ぬ」症状と一致する
+// （以前受信に成功したのはRX_ONLY_MODE=1、つまり電源を落とさない条件だった）。
+//
+//   → 1にして受信できるなら「電源再投入によるラッチ」が確定
+//   → 1にしても受信できないなら別原因（モジュール個体不良等）
+//
+// ★これは診断専用。E220の受信待機は8.2mA流れ続けるため、本番でこのまま使うことはできない。
+//   原因が確定したら0に戻し、正しい解除手順を実装する。
+#define DIAG_KEEP_E220_POWERED 0
 
 // ============================================================
 // ピン割当（Flex v3.1x実機。v3.10_loraと同一）
@@ -137,12 +190,14 @@ static void statusErrorRed()  { rgbHwShow(255, 0, 0); }
 // ランタイム設定（ダウンリンクで変更可能。フラッシュに保存してリセット後も保持）
 // ============================================================
 struct ChildSettings {
+  uint8_t  version;       // SETTINGS_VERSION。一致しない保存内容は破棄する
   uint16_t sleepMinutes;
   uint8_t  samplesPerAvg;
   uint8_t  measureCount;
 };
 
 static ChildSettings s_settings = {
+  SETTINGS_VERSION,
   DEFAULT_SLEEP_MINUTES,
   DEFAULT_SAMPLES_PER_AVG,
   DEFAULT_MEASURE_COUNT,
@@ -167,10 +222,26 @@ static void loadSettings() {
   if (!InternalFS.begin()) return;
   File f(InternalFS);
   if (f.open(SETTINGS_FILE, FILE_O_READ)) {
-    if ((size_t)f.size() == sizeof(s_settings)) {
-      f.read((uint8_t*)&s_settings, sizeof(s_settings));
+    // ★一旦テンポラリへ読み、バージョンが一致した場合のみ採用する。
+    //   直接s_settingsへ読むと、破棄すべき旧データで既定値を上書きしてしまう。
+    ChildSettings tmp = {0, 0, 0, 0};
+    if ((size_t)f.size() == sizeof(tmp)) {
+      f.read((uint8_t*)&tmp, sizeof(tmp));
+      if (tmp.version == SETTINGS_VERSION) {
+        s_settings = tmp;
 #if DEBUG_MODE
-      Serial.println("[SETTINGS] flashから復元しました");
+        Serial.println("[SETTINGS] flashから復元しました");
+#endif
+      } else {
+#if DEBUG_MODE
+        Serial.print("[SETTINGS] 保存内容のバージョンが古いため破棄し、既定値を使います（保存=");
+        Serial.print(tmp.version); Serial.print(" / 現在=");
+        Serial.print(SETTINGS_VERSION); Serial.println("）");
+#endif
+      }
+    } else {
+#if DEBUG_MODE
+      Serial.println("[SETTINGS] 保存内容のサイズが不一致のため破棄し、既定値を使います");
 #endif
     }
     f.close();
@@ -223,8 +294,14 @@ static void deepSleep(uint32_t minutes) {
 #endif
 
   rgbOff();
+#if DIAG_KEEP_E220_POWERED
+  // 【切り分け中】E220の電源を維持したまま眠る。UARTも閉じない
+  //（閉じると受信バッファが失われ、電源維持の効果が測れないため）。
+  Serial.println("[DIAG] 3V3_SWを維持したままスリープします（E220の電源は切りません）");
+#else
   Serial1.end();
   digitalWrite(SW_POWER_PIN, LOW);  // 3V3_SW OFF（周辺給電を落とす）
+#endif
 
 #if DEBUG_MODE
   Serial.print("[RTC2 sleep] "); Serial.print(minutes); Serial.println(" min");
@@ -439,11 +516,55 @@ static void loraSendFrame(const uint8_t *msd, uint8_t msdLen) {
   for (uint8_t i = 0; i < msdLen; i++) Serial1.write(msd[i]);
   Serial1.write(sum);
   Serial1.flush();
+
+  // ★2026-08-09追加: 送信直後にUARTE0のDMA受信を再武装する。
+  //
+  // 【経緯】実機で「子機が送信すると、その後の受信窓で1バイトも受信できない」事象を確認した。
+  // RX_ONLY_MODE=1（一切送信しない条件）では正常に受信できていたため、送信が受信を
+  // 止めていると判断した。Gateway側でも「1回送信した直後から受信が完全に止まる」という
+  // 同じ症状が出ている。
+  // Adafruit nRF52コアのUartドライバは RXD.MAXCNT=1 の1バイトDMAで、ENDRX割り込みの中でのみ
+  // TASKS_STARTRX を再発行する構造のため、送信処理で割り込み連鎖が途切れると受信が
+  // 永久に再開しない（[[gateway_flex_lora_e2e_debug]]と同種の問題）。
+  //
+  // ★ここで再武装しておくことが重要。Gatewayからのダウンリンクは、受信窓が開くより
+  //   前（送信完了待ちのdelay中）に到着するため、その時点でRXが生きていないと
+  //   リングバッファにすら入らず、窓を開けた時には手遅れになる。
+  NRF_UARTE0->TASKS_STARTRX = 1;
 }
 
 #define LORA_TX_COMPLETE_DELAY_MS 300U
-#define LORA_TX_REPEAT 2
+
+// ★2026-08-09: 2 → 1 に変更。
+// ダウンリンクを受ける構成では同一フレームの2回送信が邪魔になる:
+//   ・Gatewayは1回目を受けた時点で応答を返すため、その応答が子機の2回目の送信と
+//     重なると、E220は半二重なので子機側で受信できず消える
+//   ・受信窓を開くまでの時間が約700msも延びる
+// アップリンクの冗長性は下がるが、確認応答方式により「届かなければ次サイクルで再試行」
+// されるため、取りこぼしはコマンド消失にはつながらない。
+#define LORA_TX_REPEAT 1
 #define LORA_TX_REPEAT_GAP_MS 100U
+
+// ★2026-08-09追加: 送信後にE220のRF受信を復活させる。
+//
+// 【経緯】実機で以下が確定した:
+//   ・子機→Gateway方向は正常（Gatewayはアップリンクを受信できている）
+//   ・Gateway→子機方向だけが死ぬ。10秒窓でも0バイト、UARTE0_ERRORSRC=0x0
+//   ・E220の電源を切らずに維持しても改善しない（電源再投入は原因ではない）
+//   ・子機が一度も送信しない条件(RX_ONLY_MODE)では正常に受信できていた
+// つまり「送信するとE220がRF受信をやめる」状態で、これはGateway側でも同じ症状が出ていた。
+// Gatewayは30秒ごとのキック送信＋RX再武装で毎回復活させることで受信を維持できている
+// （[[e220_rx_latch_on_battery_poweron]] の「通常モードで数バイト送信させると受信が復活」）。
+//
+// ★19_lora_parentのloraKickTx()と違い、ここでは受信バッファを捨てない。
+//   Gatewayの応答はこの直後に届くため、捨ててしまうと本命を取りこぼす。
+static void loraReviveRx() {
+  const uint8_t dummy[3] = {0x00, 0x00, 0x00};  // 受信側は0xAAを探すためフレーム誤認しない
+  Serial1.write(dummy, sizeof(dummy));
+  Serial1.flush();
+  delay(120);                     // キックのRF送出完了待ち（AUX未接続のため固定ディレイ）
+  NRF_UARTE0->TASKS_STARTRX = 1;  // DMA受信を再武装
+}
 
 // ============================================================
 // ダウンリンク受信・パース
@@ -464,8 +585,51 @@ enum DownlinkFlag {
 
 enum LoraRxState { LORA_WAIT_SYNC, LORA_WAIT_LEN, LORA_WAIT_BODY, LORA_WAIT_CKSUM, LORA_WAIT_RSSI };
 
+// 確認応答フレーム（子機→Gateway、★2026-08-09追加）
+//
+// 【なぜ必要か】ダウンリンクを送りっぱなしにすると、子機が受け損ねた場合に
+// コマンドが黙って消える。Gatewayは「送った」ことしか分からず、再試行も報告もできない。
+// 適用のたびに子機側から短い確認フレームを1発返すことで、
+//   ・Gatewayは確認が取れるまで予約を保持し、次サイクルで自動再試行できる
+//   ・適用結果（成功／値域エラー／クランプ）をスプレッドシートまで返せる
+// ようになる。送信コストは適用時のみの約50ms(43mA)で、実質無視できる。
+//
+// レイアウト（7バイト。アップリンク(0x04)とは別のPktTypeなので既存の解析に影響しない）:
+//   [0] PktType = 0x05
+//   [1] DeviceID
+//   [2] status（DL_STATUS_*）
+//   [3-4] 実際に適用した送信間隔（分）uint16 ビッグエンディアン
+//         ※ダウンリンク側のsleepMinutesと同じバイト順に揃えている
+//   [5] 実際に適用した平均回数
+//   [6] 実際に適用したメジアン回数
+static const uint8_t DOWNLINK_ACK_PKT_TYPE = 0x05;
+
+static void sendDownlinkAck(uint8_t status, uint16_t sleepMin, uint8_t avg, uint8_t median) {
+  uint8_t ack[7];
+  ack[0] = DOWNLINK_ACK_PKT_TYPE;
+  ack[1] = DEVICE_ID;
+  ack[2] = status;
+  ack[3] = (uint8_t)(sleepMin >> 8);
+  ack[4] = (uint8_t)(sleepMin & 0xFF);
+  ack[5] = avg;
+  ack[6] = median;
+
+#if DEBUG_MODE
+  Serial.print("[DOWNLINK] 確認応答を送信: status="); Serial.print(status);
+  Serial.print(" 適用値 間隔="); Serial.print(sleepMin);
+  Serial.print("分 平均="); Serial.print(avg);
+  Serial.print(" メジアン="); Serial.println(median);
+#endif
+
+  statusSendGreen();
+  loraSendFrame(ack, sizeof(ack));
+  delay(LORA_TX_COMPLETE_DELAY_MS);  // 送信完了待ち（AUX未接続のため固定ディレイ）
+  rgbOff();
+}
+
 // 受信したダウンリンクフレームを検証・適用する。
-// true: 有効なダウンリンクとして処理した（適用有無に関わらず、Company ID一致でパース成功した場合）
+// true: 自分宛ての有効なダウンリンクとして処理した（＝受信窓を閉じてよい）
+// false: 他機宛て・別種のフレーム・壊れたフレーム（＝受信窓を継続すべき）
 static bool applyDownlinkPayload(const uint8_t *payload, uint8_t len) {
   if (len != DOWNLINK_PAYLOAD_LEN) {
 #if DEBUG_MODE
@@ -523,22 +687,49 @@ static bool applyDownlinkPayload(const uint8_t *payload, uint8_t len) {
 #endif
   }
 
+  // ★2026-08-09: 検証・クランプ・確認応答を追加。
+  // 「要求値をそのまま適用できたか」をstatusで区別してGatewayへ返し、
+  // スプレッドシートまで結果が届くようにする。
+  uint8_t status = DL_STATUS_OK;
+
   if (flags & DL_FLAG_SLEEP_MIN) {
     uint16_t newSleepMin = ((uint16_t)payload[11] << 8) | payload[12];
-    if (newSleepMin > 0 && newSleepMin != s_settings.sleepMinutes) {
-      s_settings.sleepMinutes = newSleepMin;
-      changed = true;
+    if (newSleepMin == 0) {
+      status = DL_STATUS_RANGE_ERROR;
 #if DEBUG_MODE
-      Serial.print("[DOWNLINK] 送信頻度を変更: "); Serial.print(newSleepMin); Serial.println("分");
+      Serial.println("[DOWNLINK] 値域エラー: 送信間隔が0です");
 #endif
+    } else {
+      if (newSleepMin > DL_MAX_SLEEP_MINUTES) {
+        // WDTタイムアウトを超えるスリープは無限リブートを招くため上限で頭打ちにする
+        // （拒否ではなく丸めて適用し、実際の値をGatewayへ返す）
+#if DEBUG_MODE
+        Serial.print("[DOWNLINK] 送信間隔"); Serial.print(newSleepMin);
+        Serial.print("分はWDT制約の上限"); Serial.print(DL_MAX_SLEEP_MINUTES);
+        Serial.println("分を超えるため、上限値へ丸めます");
+#endif
+        newSleepMin = DL_MAX_SLEEP_MINUTES;
+        status = DL_STATUS_CLAMPED;
+      }
+      if (newSleepMin != s_settings.sleepMinutes) {
+        s_settings.sleepMinutes = newSleepMin;
+        changed = true;
+#if DEBUG_MODE
+        Serial.print("[DOWNLINK] 送信頻度を変更: "); Serial.print(newSleepMin); Serial.println("分");
+#endif
+      }
     }
   }
 
   if (flags & DL_FLAG_AVG_MEDIAN) {
     uint8_t newAvg = payload[13];
     uint8_t newMedian = payload[14];
-    if (newAvg > 0 && newMedian > 0 &&
-        (newAvg != s_settings.samplesPerAvg || newMedian != s_settings.measureCount)) {
+    if (newAvg == 0 || newMedian == 0) {
+      status = DL_STATUS_RANGE_ERROR;
+#if DEBUG_MODE
+      Serial.println("[DOWNLINK] 値域エラー: 平均回数またはメジアン回数が0です");
+#endif
+    } else if (newAvg != s_settings.samplesPerAvg || newMedian != s_settings.measureCount) {
       s_settings.samplesPerAvg = newAvg;
       s_settings.measureCount  = newMedian;
       changed = true;
@@ -552,8 +743,13 @@ static bool applyDownlinkPayload(const uint8_t *payload, uint8_t len) {
   if (changed) {
     saveSettings();
     statusRxApplied();
-    delay(1000);
+    delay(200);  // 適用成功のシアン点灯を視認できる程度に短く保持
   }
+
+  // ★確認応答は「変更があったか」に関わらず必ず返す。
+  // 既に要求と同じ設定だった場合（changed==false）も、子機は要求された状態にあるので
+  // Gatewayにとっては成功であり、ここで返さないと永久に再試行され続けてしまう。
+  sendDownlinkAck(status, s_settings.sleepMinutes, s_settings.samplesPerAvg, s_settings.measureCount);
 
   return true;
 }
@@ -629,6 +825,8 @@ static void downlinkRxWindow(uint32_t windowMs) {
   bool got = false;
   uint32_t rawByteCount = 0;  // ウィンドウ内で受信した生バイト総数（切り分け用）
 
+  NRF_UARTE0->TASKS_STARTRX = 1;  // 窓を開ける時点でもRXを再武装しておく（保険）
+
   unsigned long t0 = millis();
   s_loraLastRxMs = millis();  // ストール判定の起点をウィンドウ開始時にリセット
   while (millis() - t0 < windowMs && !got) {
@@ -676,8 +874,12 @@ static void downlinkRxWindow(uint32_t windowMs) {
 #if DEBUG_MODE
           Serial.print("[DOWNLINK] RSSI(raw)="); Serial.println(rxByte);
 #endif
-          applyDownlinkPayload(body, len);
-          got = true;
+          // ★2026-08-09修正: 従来は applyDownlinkPayload() の戻り値を無視して
+          // 無条件に got=true としていたため、他機のアップリンクなど「自分宛てでない
+          // 正しい形のフレーム」を1つ拾っただけで受信窓が閉じ、その直後に届く
+          // 本命のダウンリンクを取りこぼす可能性があった。
+          // 自分宛てとして実際に処理できた場合のみ窓を閉じる。
+          got = applyDownlinkPayload(body, len);
           state = LORA_WAIT_SYNC;
           break;
       }
@@ -689,6 +891,12 @@ static void downlinkRxWindow(uint32_t windowMs) {
   if (!got) {
     Serial.print("[DOWNLINK] RXウィンドウ内に受信なし（生バイト受信数=");
     Serial.print(rawByteCount);
+    // ★切り分け用: UARTE0のエラー要因を出す。
+    //   0x0 のまま受信0なら「UARTは正常だがE220が何も出力していない」＝RF側またはモジュールの問題。
+    //   bit0=OVERRUN / bit1=PARITY / bit2=FRAMING / bit3=BREAK
+    uint32_t errsrc = NRF_UARTE0->ERRORSRC;
+    if (errsrc) NRF_UARTE0->ERRORSRC = errsrc;  // 書き戻すとクリアされる
+    Serial.print(" UARTE0_ERRORSRC=0x"); Serial.print(errsrc, HEX);
     Serial.println("）");
   }
 #endif
@@ -745,6 +953,10 @@ static void sendLoRaDummy() {
   Serial.print(" CH="); for (int i = 0; i < 4; i++) { Serial.print(ch[i]); Serial.print(" "); }
   Serial.println();
 #endif
+
+  // ★送信でRF受信が止まるため、窓を開ける直前にキックで復活させる。
+  // Gatewayの応答はアップリンク検知から約200〜300ms後に届くので、ここで復活させておけば間に合う。
+  loraReviveRx();
 
   // 送信直後、ダウンリンクコマンドが来ていないか短時間だけ受信を待つ。
   // E220は透過モードのままなのでM0/M1は変更不要（送受信兼用）。
@@ -841,7 +1053,12 @@ void loop() {
 #endif
 
   peripheralsBegin();
+#if !DIAG_KEEP_E220_POWERED
   loraUartBegin();
+#else
+  // 【切り分け中】deepSleep()でSerial1.end()していないため、begin()し直さない
+  // （end()せずにbegin()を重ねるとUARTEの二重初期化になる）。
+#endif
 
 #if DEBUG_MODE
   Serial.println("[WAKE]");

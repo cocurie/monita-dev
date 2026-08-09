@@ -69,6 +69,7 @@ function triggerGatewayReset() {
 
   var deviceId = 'gateway_v11_test';
   PropertiesService.getScriptProperties().setProperty('pending_cmd_' + deviceId, 'reset');
+  refreshCmdStatusSheet();
   ui.alert('予約しました。Gatewayが次にオンラインになったタイミング（最大5分後）で再起動します。');
 }
 
@@ -82,18 +83,21 @@ function triggerGatewayReset() {
 function triggerGatewayStop() {
   var deviceId = 'gateway_v11_test';
   PropertiesService.getScriptProperties().setProperty('pending_cmd_' + deviceId, 'stop');
+  refreshCmdStatusSheet();
   SpreadsheetApp.getUi().alert('予約しました。次にGatewayがオンラインになったタイミング（最大5分後）でデータ送信を停止します。');
 }
 
 function triggerGatewayStart() {
   var deviceId = 'gateway_v11_test';
   PropertiesService.getScriptProperties().setProperty('pending_cmd_' + deviceId, 'start');
+  refreshCmdStatusSheet();
   SpreadsheetApp.getUi().alert('予約しました。次にGatewayがオンラインになったタイミング（最大5分後）でデータ送信を再開します。');
 }
 
 function triggerGatewaySendNow() {
   var deviceId = 'gateway_v11_test';
   PropertiesService.getScriptProperties().setProperty('pending_cmd_' + deviceId, 'send_now');
+  refreshCmdStatusSheet();
   SpreadsheetApp.getUi().alert('予約しました。次にGatewayがオンラインになったタイミング（最大5分後）で今持っているデータを送信します。');
 }
 
@@ -115,6 +119,7 @@ function triggerGatewaySetInterval() {
 
   var deviceId = 'gateway_v11_test';
   PropertiesService.getScriptProperties().setProperty('pending_cmd_' + deviceId, 'interval:' + minutes);
+  refreshCmdStatusSheet();
   ui.alert('予約しました。次にGatewayがオンラインになったタイミング（最大5分後）で送信間隔を' + minutes + '分に変更します。');
 }
 
@@ -122,6 +127,7 @@ function triggerGatewaySetInterval() {
 function triggerGatewayStatusNow() {
   var deviceId = 'gateway_v11_test';
   PropertiesService.getScriptProperties().setProperty('pending_cmd_' + deviceId, 'status_now');
+  refreshCmdStatusSheet();
   SpreadsheetApp.getUi().alert('予約しました。次にGatewayがオンラインになったタイミング（最大5分後）でステータスをdataboxシートへ報告します。');
 }
 
@@ -129,6 +135,7 @@ function triggerGatewayStatusNow() {
 function triggerGatewayRtcResync() {
   var deviceId = 'gateway_v11_test';
   PropertiesService.getScriptProperties().setProperty('pending_cmd_' + deviceId, 'rtc_resync');
+  refreshCmdStatusSheet();
   SpreadsheetApp.getUi().alert('予約しました。次にGatewayがオンラインになったタイミング（最大5分後）でRTCを網時刻に再同期します。');
 }
 
@@ -136,7 +143,194 @@ function triggerGatewayRtcResync() {
 function triggerGatewayLogDump() {
   var deviceId = 'gateway_v11_test';
   PropertiesService.getScriptProperties().setProperty('pending_cmd_' + deviceId, 'log_dump');
+  refreshCmdStatusSheet();
   SpreadsheetApp.getUi().alert('予約しました。次にGatewayがオンラインになったタイミング（最大5分後）で直近のログを"gwlog"シートへ送信します。');
+}
+
+
+// ================================
+// LoRaダウンリンク（★2026-08-08追加 / 08-09に確認応答方式へ改訂）
+// ================================
+// 対象: case02_Gateway/test_sketches/03_lora_downlink_sender（GW_DEVICE_ID='lora_downlink_test'）が
+// 予約をポーリングし、case01_Flex/test_sketches/25_lora_downlink_child宛てにLoRaダウンリンクで
+// 送信頻度(sleepMinutes)・平均/メジアン回数を変更する。本番のgateway_v11_test/v3.10_loraとは
+// 別デバイスIDなので、通常運用のGatewayには一切影響しない。
+//
+// 【方式: Class A + 確認応答（2026-08-09確定）】
+//   子機は省電力のため常時受信できない。そこで「子機が自分のアップリンクを送った直後に
+//   2秒だけ受信窓を開け、Gatewayがその場で即座に応答する」Class A方式を採る。
+//   Gatewayは送信しただけでは予約を消さず、子機からの確認フレーム(PktType 0x05)を
+//   受け取って初めて完了扱いにする。途中で取りこぼしても失われず、子機の次サイクルで
+//   自動的に再試行される（fire-and-forgetをやめ、再試行前提の意味論にした）。
+//
+// 【予約の保持形式】Script Properties のキー `downlink_child_<HEX2>` にJSONで保持する。
+//   { sleep, avg, median, state, attempts, status, appliedSleep, appliedAvg, appliedMedian, updated }
+//   state: queued（予約直後）→ sent（Gatewayが送信し確認待ち）→ done / failed
+// ★複数子機に同時に別々の予約を積める（子機IDごとに独立したキーのため）。
+
+// ダウンリンク結果のステータスコード（子機ファーム・Gatewayファームと一致させること）
+const DL_STATUS_OK          = 0;   // 要求通り適用
+const DL_STATUS_RANGE_ERROR = 1;   // 値域エラー（子機が拒否）
+const DL_STATUS_CLAMPED     = 2;   // クランプ適用（WDT制約等で要求と異なる値を適用）
+const DL_STATUS_NO_ACK      = 99;  // 未達（Gatewayが規定回数送っても確認が返らなかった。Gateway自身が報告）
+
+function dlKey_(childHex) { return 'downlink_child_' + childHex; }
+
+function dlGet_(childHex) {
+  var raw = PropertiesService.getScriptProperties().getProperty(dlKey_(childHex));
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
+
+function dlSet_(childHex, obj) {
+  obj.updated = new Date().toISOString();
+  PropertiesService.getScriptProperties().setProperty(dlKey_(childHex), JSON.stringify(obj));
+}
+
+// ステータスコードを日本語の結果表示に変換する
+function dlStatusLabel_(d) {
+  if (!d) return '';
+  if (d.state === 'queued') return '';
+  if (d.state === 'sent')   return '送信済み（確認待ち）';
+  if (d.status === DL_STATUS_OK)          return '完了';
+  if (d.status === DL_STATUS_CLAMPED)     return '完了（値を丸めた: 間隔=' + d.appliedSleep + '分, 平均=' + d.appliedAvg + ', メジアン=' + d.appliedMedian + '）';
+  if (d.status === DL_STATUS_RANGE_ERROR) return '失敗（子機が値域エラーで拒否）';
+  if (d.status === DL_STATUS_NO_ACK)      return '失敗（未達。' + (d.attempts || 0) + '回試行しても確認が返らず）';
+  return '失敗（不明なステータス: ' + d.status + '）';
+}
+
+function triggerLoraDownlinkTest() {
+  var ui = SpreadsheetApp.getUi();
+
+  var r1 = ui.prompt('LoRaダウンリンクテスト (1/3)', '対象の子機DeviceIDを16進2桁で入力してください（例: 08）:', ui.ButtonSet.OK_CANCEL);
+  if (r1.getSelectedButton() !== ui.Button.OK) return;
+  var deviceIdHex = r1.getResponseText().trim().replace(/^0x/i, '');
+  if (!/^[0-9a-fA-F]{1,2}$/.test(deviceIdHex)) {
+    ui.alert('DeviceIDは16進2桁で入力してください（例: 08）。');
+    return;
+  }
+  deviceIdHex = ('0' + deviceIdHex).slice(-2).toUpperCase();
+
+  var r2 = ui.prompt('LoRaダウンリンクテスト (2/3)', '新しい送信間隔を分単位で入力してください（1〜1440分）:', ui.ButtonSet.OK_CANCEL);
+  if (r2.getSelectedButton() !== ui.Button.OK) return;
+  var sleepMin = parseInt(r2.getResponseText(), 10);
+  if (isNaN(sleepMin) || sleepMin < 1 || sleepMin > 1440) {
+    ui.alert('送信間隔は1〜1440の整数で入力してください。');
+    return;
+  }
+
+  var r3 = ui.prompt('LoRaダウンリンクテスト (3/3)', '平均回数,メジアン回数をカンマ区切りで入力してください（例: 8,8）:', ui.ButtonSet.OK_CANCEL);
+  if (r3.getSelectedButton() !== ui.Button.OK) return;
+  var parts = r3.getResponseText().split(',');
+  var avg = parseInt(parts[0], 10);
+  var median = parseInt(parts[1], 10);
+  if (isNaN(avg) || isNaN(median) || avg < 1 || avg > 255 || median < 1 || median > 255) {
+    ui.alert('平均回数・メジアン回数はそれぞれ1〜255の整数で入力してください（例: 8,8）。');
+    return;
+  }
+
+  // ★予約ごとに通し番号(seq)を振る。
+  // Gatewayからの報告にはこのseqを含めてもらい、一致しない報告は無視する。
+  // これが無いと、古い予約の「未達」報告が、その後に入れ直した新しい予約を
+  // 失敗扱いで上書きして消してしまう（実機で発生）。
+  var prevRec = dlGet_(deviceIdHex);
+  var nextSeq = (prevRec && prevRec.seq ? prevRec.seq : 0) + 1;
+
+  dlSet_(deviceIdHex, {
+    sleep: sleepMin, avg: avg, median: median,
+    state: 'queued', attempts: 0, seq: nextSeq,
+  });
+  refreshCmdStatusSheet();
+  ui.alert('子機0x' + deviceIdHex + 'へのダウンリンクを予約しました' +
+           '（送信間隔=' + sleepMin + '分, 平均=' + avg + ', メジアン=' + median + '）。\n\n' +
+           '子機は省電力のため常時受信していません。次にこの子機がアップリンクを送った' +
+           'タイミング（最大で子機の送信間隔ぶん）で適用され、結果が"cmd_status"シートに反映されます。');
+}
+
+
+// ================================
+// コマンド予約状況シート（★2026-08-08追加）
+// ================================
+// pending_cmd_<deviceId>（Script Properties）は値を見ただけでは現状が分からないため、
+// databoxとは別の "cmd_status" シートに一覧表示する。予約・消化のたびに自動更新する
+// （setProperty/deletePropertyを行う箇所すべてから refreshCmdStatusSheet() を呼ぶ）。
+const CMD_STATUS_SHEET_NAME = 'cmd_status';
+
+// 一覧表示するGateway側デバイスID（pending_cmd_<id>を実際に持つもの）
+const CMD_STATUS_GATEWAY_IDS = [
+  { id: 'gateway_v11_test',  label: 'Gateway（本番 gateway_v1.1）' },
+  { id: 'lora_downlink_test', label: 'Gateway（LoRaダウンリンクテスト用 03_lora_downlink_sender）' },
+];
+
+// 一覧表示するFlex子機DeviceID（LoRaダウンリンクの宛先として使われうる値）。
+// 子機自体はGASを直接ポーリングしないため、pending_cmd_<id>という個別の予約枠は無い。
+// 現在lora_downlink_testに積まれているdownlinkコマンドの宛先と一致する行にだけ、
+// その内容を表示する（一度に1台分しか予約できない設計のため）。
+const CMD_STATUS_CHILD_IDS = ['01', '02', '03', '04', '05', '06', '07', '08', '09', '0A', '0B', '0C', '0D', '0E'];
+
+const CMD_STATUS_HEADER = ['デバイスID', '種別', '現在の予約', '状態', '結果', '試行回数', '最終更新日時'];
+
+function getCmdStatusSheet_() {
+  var ss = getSpreadsheet();
+  var sheet = ss.getSheetByName(CMD_STATUS_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(CMD_STATUS_SHEET_NAME);
+    sheet.appendRow(CMD_STATUS_HEADER);
+    sheet.setFrozenRows(1);
+  } else if (sheet.getLastColumn() < CMD_STATUS_HEADER.length) {
+    // 旧4列版から列を増やした場合にヘッダーを張り替える
+    sheet.getRange(1, 1, 1, CMD_STATUS_HEADER.length).setValues([CMD_STATUS_HEADER]);
+  }
+  return sheet;
+}
+
+// ダウンリンク履歴シート（1件ごとに追記。障害調査用）
+function getDownlinkLogSheet_() {
+  var ss = getSpreadsheet();
+  var sheet = ss.getSheetByName('downlink_log');
+  if (!sheet) {
+    sheet = ss.insertSheet('downlink_log');
+    sheet.appendRow(['日時', '子機ID', '要求(間隔/平均/メジアン)', '結果', '実際に適用された値', '試行回数']);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+// 予約の現在値を読み取り、cmd_status シートを丸ごと再構成する。
+function refreshCmdStatusSheet() {
+  var props = PropertiesService.getScriptProperties();
+  var sheet = getCmdStatusSheet_();
+  var now = new Date();
+  var nCol = CMD_STATUS_HEADER.length;
+
+  // ヘッダー行以外をクリアしてから書き直す
+  var lastRow = sheet.getLastRow();
+  if (lastRow > 1) sheet.getRange(2, 1, lastRow - 1, nCol).clearContent();
+
+  var rows = [];
+
+  // Gateway側（pending_cmd_<id> に単発コマンドを持つもの）
+  CMD_STATUS_GATEWAY_IDS.forEach(function (dev) {
+    var cmd = props.getProperty('pending_cmd_' + dev.id) || 'none';
+    rows.push([dev.id, dev.label, cmd, cmd === 'none' ? '—' : '予約中', '', '', now]);
+  });
+
+  // Flex子機側（子機IDごとに独立した予約・状態を持つ）
+  CMD_STATUS_CHILD_IDS.forEach(function (childHex) {
+    var d = dlGet_(childHex);
+    if (!d) {
+      rows.push(['0x' + childHex, 'Flex子機', 'none', '—', '', '', now]);
+      return;
+    }
+    var req = '間隔=' + d.sleep + '分, 平均=' + d.avg + ', メジアン=' + d.median;
+    var stateLabel = { queued: '予約中', sent: '送信済み（確認待ち）', done: '完了', failed: '失敗' }[d.state] || d.state;
+    rows.push([
+      '0x' + childHex, 'Flex子機', req, stateLabel, dlStatusLabel_(d),
+      d.attempts || 0, d.updated ? new Date(d.updated) : now,
+    ]);
+  });
+
+  sheet.getRange(2, 1, rows.length, nCol).setValues(rows);
 }
 
 
@@ -154,7 +348,13 @@ function onOpen() {
     .addItem('ステータス確認', 'triggerGatewayStatusNow')
     .addItem('RTC再同期', 'triggerGatewayRtcResync')
     .addItem('診断ログを吸い上げ', 'triggerGatewayLogDump')
+    .addSeparator()
+    .addItem('LoRaダウンリンクテスト（子機設定変更）', 'triggerLoraDownlinkTest')
+    .addSeparator()
+    .addItem('予約状況を更新', 'refreshCmdStatusSheet')
     .addToUi();
+
+  refreshCmdStatusSheet();
 }
 
 
@@ -456,6 +656,83 @@ function doGet(e) {
   if (p.action === 'ack_cmd') {
     var deviceId = p.device_id || 'default';
     PropertiesService.getScriptProperties().deleteProperty('pending_cmd_' + deviceId);
+    refreshCmdStatusSheet();
+    return ContentService.createTextOutput('ok');
+  }
+
+  // ══════════════════════════════════════════════
+  // LoRaダウンリンク（Class A + 確認応答方式。★2026-08-09追加）
+  // ══════════════════════════════════════════════
+  // action=check_downlinks: Gatewayが定期的に呼び、未完了の子機宛て予約を一括で取得する。
+  //   子機が起きた瞬間に応答しなければならない（受信窓は2秒）ため、Gatewayは事前に
+  //   この結果をローカルにキャッシュしておき、アップリンク受信時はネットワークを介さず
+  //   即座にLoRa送信する。1行1件・改行区切りで返す: "08:4:5:5\n0E:60:10:10"
+  //   ★AT+SHREQの512バイト制限に収まるよう、1回に返すのは最大20件までとする。
+  if (p.action === 'check_downlinks') {
+    var lines = [];
+    for (var ci = 0; ci < CMD_STATUS_CHILD_IDS.length && lines.length < 20; ci++) {
+      var hex = CMD_STATUS_CHILD_IDS[ci];
+      var d = dlGet_(hex);
+      if (d && (d.state === 'queued' || d.state === 'sent')) {
+        // 形式: HEX2:sleepMin:avg:median:attempts:seq
+        // ★attemptsもseqもGAS側を正とする。Gateway側で数えると、再取得のたびに
+        //   リセットされたり、予約を入れ直しても古い試行回数を引き継いだりするため。
+        lines.push(hex + ':' + d.sleep + ':' + d.avg + ':' + d.median +
+                   ':' + (d.attempts || 0) + ':' + (d.seq || 0));
+      }
+    }
+    return ContentService.createTextOutput(lines.length ? lines.join('\n') : 'none');
+  }
+
+  // action=downlink_result: Gatewayがダウンリンクの最終結果を報告する。
+  //   子機から確認フレーム(PktType 0x05)を受け取った場合はその中身を、規定回数送っても
+  //   確認が返らなかった場合は status=99（未達）をGateway自身が報告する。
+  //   例: ...?action=downlink_result&child=08&status=0&sleep=4&avg=5&median=5&attempts=1
+  if (p.action === 'downlink_result') {
+    var childHex = String(p.child || '').toUpperCase();
+    if (!/^[0-9A-F]{2}$/.test(childHex)) {
+      return ContentService.createTextOutput('error: bad child id');
+    }
+    var rec = dlGet_(childHex);
+    if (!rec) return ContentService.createTextOutput('stale: no reservation');
+    // ★seqが一致しない報告は「既に入れ替わった古い予約に対する報告」なので捨てる。
+    //   これを見ないと、古い未達報告が新しい予約を失敗扱いで消してしまう。
+    if (String(p.seq || '') !== String(rec.seq || '')) {
+      return ContentService.createTextOutput('stale: seq mismatch');
+    }
+    rec.status        = parseInt(p.status || '0', 10);
+    rec.attempts      = parseInt(p.attempts || '0', 10);
+    rec.appliedSleep  = parseInt(p.sleep  || '0', 10);
+    rec.appliedAvg    = parseInt(p.avg    || '0', 10);
+    rec.appliedMedian = parseInt(p.median || '0', 10);
+    rec.state = (rec.status === DL_STATUS_OK || rec.status === DL_STATUS_CLAMPED) ? 'done' : 'failed';
+    dlSet_(childHex, rec);
+
+    getDownlinkLogSheet_().appendRow([
+      new Date(), '0x' + childHex,
+      (rec.sleep !== undefined ? rec.sleep : '?') + ' / ' + (rec.avg !== undefined ? rec.avg : '?') + ' / ' + (rec.median !== undefined ? rec.median : '?'),
+      dlStatusLabel_(rec),
+      rec.appliedSleep + ' / ' + rec.appliedAvg + ' / ' + rec.appliedMedian,
+      rec.attempts,
+    ]);
+
+    refreshCmdStatusSheet();
+    return ContentService.createTextOutput('ok');
+  }
+
+  // action=downlink_sent: Gatewayがダウンリンクを送信した（まだ確認は取れていない）時点の中間報告。
+  //   状態を queued → sent に進め、試行回数を記録する。予約自体は消さない（確認が取れるまで再試行）。
+  if (p.action === 'downlink_sent') {
+    var sentHex = String(p.child || '').toUpperCase();
+    var sentRec = dlGet_(sentHex);
+    if (!sentRec) return ContentService.createTextOutput('stale: no reservation');
+    if (String(p.seq || '') !== String(sentRec.seq || '')) {
+      return ContentService.createTextOutput('stale: seq mismatch');
+    }
+    sentRec.state = 'sent';
+    sentRec.attempts = parseInt(p.attempts || '1', 10);
+    dlSet_(sentHex, sentRec);
+    refreshCmdStatusSheet();
     return ContentService.createTextOutput('ok');
   }
 
@@ -468,6 +745,7 @@ function doGet(e) {
     var deviceId = p.device_id || 'default';
     var cmd = p.cmd || '';
     PropertiesService.getScriptProperties().setProperty('pending_cmd_' + deviceId, cmd);
+    refreshCmdStatusSheet();
     return ContentService.createTextOutput('ok: queued "' + cmd + '" for device_id=' + deviceId);
   }
 
