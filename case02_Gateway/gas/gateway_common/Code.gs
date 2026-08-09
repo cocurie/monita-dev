@@ -1,6 +1,20 @@
 // ================================
-// Monita Gateway (LTE-M) → GAS 受信スクリプト
-// project07_NEXCO 専用（中国自動車道有野川付近RC床版 剥落モニタリング）
+// Monita Gateway (LTE-M/LoRa) → GAS 汎用バックエンド
+//
+// ★2026-08-10改名: project07_nexco/ から gas/gateway_common/ へ移設。
+// 元は project07_NEXCO（中国自動車道有野川付近RC床版 剥落モニタリング）本番監視の
+// バックアップ用コピーとして作られたが、LoRaダウンリンク（Class A + 確認応答）の
+// リモート制御基盤をこの上に構築したことで、Gateway/Flex共通の開発・検証インフラへと
+// 役割が変わった。
+//
+// ★本番project07_NEXCO監視とは完全に別物。
+//   このファイルの実体は、リモートテスト専用のApps Scriptプロジェクト
+//   （デプロイURL末尾 AKfycbzKVvW6... 、対象スプレッドシート 14g7rMQIT0tHwrYcripV84in_ME7B9yodOC7SDqFz17w）
+//   に手動で貼り付けて使っている。本番project07_NEXCO監視（対象スプレッドシート
+//   1gWDPFg2qxtb61-lSDZO8KEF1y4V74aoDylNjspc0S78）は別のApps Scriptプロジェクトで
+//   独立して運用されており、このファイルとは同期されない。
+//   ★このリポジトリには本番project07_NEXCO監視の最新コードは保管されていない
+//     （2026-08-10時点でのgapとして認識しておくこと）。
 //
 // ================================
 // バージョン対応表
@@ -10,13 +24,18 @@
 //     - v4: project07_NEXCO 専用フォーマットに対応（2026-07-25）
 //       ペイロード: 26B/台 = 52 hex文字
 //       DeviceID(1B) + Temp(1B) + CH1-4メジアン(8B) + CH1-4 Max/Min(16B, チャンネルごとに隣接)
+//     - v5: LoRaダウンリンク（Class A + 確認応答方式）のリモート制御機能を追加（2026-08-09〜10）
+//       check_downlinks / downlink_sent / downlink_result アクション、cmd_status・downlink_logシート、
+//       Gateway操作/Flex操作メニュー
 //
 //   対応する子機ファーム:
-//     - project07_NEXCO/firmware/src/main.cpp（COMM_MODE_BLE）
+//     - project07_NEXCO/firmware/src/main.cpp（COMM_MODE_BLE、本番項目用）
 //       SAMPLES_PER_AVG=5, MEASURE_COUNT=10
+//     - case01_Flex/test_sketches/25_lora_downlink_child（LoRaダウンリンク検証用）
 //
 //   対応するGatewayファーム:
-//     - project07_NEXCO/firmware_gateway/src/main.cpp
+//     - project07_NEXCO/firmware_gateway/src/main.cpp（本番項目用）
+//     - case02_Gateway/test_sketches/03_lora_downlink_sender（LoRaダウンリンク検証用）
 //
 // ================================
 // スプレッドシート列構成（databox シート）
@@ -199,19 +218,64 @@ function dlStatusLabel_(d) {
   return '失敗（不明なステータス: ' + d.status + '）';
 }
 
-function triggerLoraDownlinkTest() {
-  var ui = SpreadsheetApp.getUi();
-
-  var r1 = ui.prompt('LoRaダウンリンクテスト (1/3)', '対象の子機DeviceIDを16進2桁で入力してください（例: 08）:', ui.ButtonSet.OK_CANCEL);
-  if (r1.getSelectedButton() !== ui.Button.OK) return;
-  var deviceIdHex = r1.getResponseText().trim().replace(/^0x/i, '');
-  if (!/^[0-9a-fA-F]{1,2}$/.test(deviceIdHex)) {
+// ★2026-08-10追加: 子機DeviceID(16進2桁)をプロンプトで入力させる共通処理。
+// 個別メニュー項目（送信間隔だけ変更、平均/メジアンだけ変更 等）から共通して使う。
+function promptChildHex_(ui, title, message) {
+  var r = ui.prompt(title, message, ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return null;
+  var hex = r.getResponseText().trim().replace(/^0x/i, '');
+  if (!/^[0-9a-fA-F]{1,2}$/.test(hex)) {
     ui.alert('DeviceIDは16進2桁で入力してください（例: 08）。');
-    return;
+    return null;
   }
-  deviceIdHex = ('0' + deviceIdHex).slice(-2).toUpperCase();
+  return ('0' + hex).slice(-2).toUpperCase();
+}
 
-  var r2 = ui.prompt('LoRaダウンリンクテスト (2/3)', '新しい送信間隔を分単位で入力してください（1〜1440分）:', ui.ButtonSet.OK_CANCEL);
+// ★2026-08-10追加: 送信間隔・平均・メジアンを個別に変更できるようにするため、
+// 「今その子機に指定されているはずの値」を推定する。ダウンリンクは3項目セットで
+// 送る仕様（DL_FLAG_SLEEP_MIN・DL_FLAG_AVG_MEDIANを毎回両方立てる）なので、
+// 片方だけ変更したい時も残りの項目には何かしら値を入れる必要がある。
+// 優先順位: 直近に子機が確認した実際の適用値 → 直近の予約値（未確認でも） → 既定値。
+function getKnownChildSettings_(childHex) {
+  var d = dlGet_(childHex);
+  if (d && (d.state === 'done') && d.appliedSleep) {
+    return { sleep: d.appliedSleep, avg: d.appliedAvg, median: d.appliedMedian };
+  }
+  if (d && d.sleep) {
+    return { sleep: d.sleep, avg: d.avg, median: d.median };
+  }
+  return { sleep: 60, avg: 5, median: 5};  // 子機ファームのDEFAULT_*と揃えた保険値
+}
+
+// ★予約ごとに通し番号(seq)を振って予約する共通処理。
+// Gatewayからの報告にはこのseqを含めてもらい、一致しない報告は無視する。
+// これが無いと、古い予約の「未達」報告が、その後に入れ直した新しい予約を
+// 失敗扱いで上書きして消してしまう（実機で発生）。
+function queueDownlink_(childHex, sleepMin, avg, median, sourceNote) {
+  var prevRec = dlGet_(childHex);
+  var nextSeq = (prevRec && prevRec.seq ? prevRec.seq : 0) + 1;
+
+  dlSet_(childHex, {
+    sleep: sleepMin, avg: avg, median: median,
+    state: 'queued', attempts: 0, seq: nextSeq,
+  });
+
+  dlLog_(childHex, nextSeq, '予約',
+         '間隔=' + sleepMin + '分 / 平均=' + avg + ' / メジアン=' + median,
+         (prevRec && prevRec.state !== 'done' && prevRec.state !== 'failed')
+           ? '★未完了の予約(seq=' + prevRec.seq + ')を上書きしました'
+           : sourceNote);
+
+  refreshCmdStatusSheet();
+}
+
+// 送信間隔・平均回数・メジアン回数をまとめて変更する（従来の3ステップ入力）
+function triggerFlexSetAll() {
+  var ui = SpreadsheetApp.getUi();
+  var deviceIdHex = promptChildHex_(ui, 'Flex設定変更 (1/3)', '対象の子機DeviceIDを16進2桁で入力してください（例: 08）:');
+  if (!deviceIdHex) return;
+
+  var r2 = ui.prompt('Flex設定変更 (2/3)', '新しい送信間隔を分単位で入力してください（1〜1440分）:', ui.ButtonSet.OK_CANCEL);
   if (r2.getSelectedButton() !== ui.Button.OK) return;
   var sleepMin = parseInt(r2.getResponseText(), 10);
   if (isNaN(sleepMin) || sleepMin < 1 || sleepMin > 1440) {
@@ -219,7 +283,7 @@ function triggerLoraDownlinkTest() {
     return;
   }
 
-  var r3 = ui.prompt('LoRaダウンリンクテスト (3/3)', '平均回数,メジアン回数をカンマ区切りで入力してください（例: 8,8）:', ui.ButtonSet.OK_CANCEL);
+  var r3 = ui.prompt('Flex設定変更 (3/3)', '平均回数,メジアン回数をカンマ区切りで入力してください（例: 8,8）:', ui.ButtonSet.OK_CANCEL);
   if (r3.getSelectedButton() !== ui.Button.OK) return;
   var parts = r3.getResponseText().split(',');
   var avg = parseInt(parts[0], 10);
@@ -229,22 +293,129 @@ function triggerLoraDownlinkTest() {
     return;
   }
 
-  // ★予約ごとに通し番号(seq)を振る。
-  // Gatewayからの報告にはこのseqを含めてもらい、一致しない報告は無視する。
-  // これが無いと、古い予約の「未達」報告が、その後に入れ直した新しい予約を
-  // 失敗扱いで上書きして消してしまう（実機で発生）。
-  var prevRec = dlGet_(deviceIdHex);
-  var nextSeq = (prevRec && prevRec.seq ? prevRec.seq : 0) + 1;
-
-  dlSet_(deviceIdHex, {
-    sleep: sleepMin, avg: avg, median: median,
-    state: 'queued', attempts: 0, seq: nextSeq,
-  });
-  refreshCmdStatusSheet();
+  queueDownlink_(deviceIdHex, sleepMin, avg, median, 'スプレッドシートのメニュー（まとめて変更）から予約');
   ui.alert('子機0x' + deviceIdHex + 'へのダウンリンクを予約しました' +
            '（送信間隔=' + sleepMin + '分, 平均=' + avg + ', メジアン=' + median + '）。\n\n' +
            '子機は省電力のため常時受信していません。次にこの子機がアップリンクを送った' +
            'タイミング（最大で子機の送信間隔ぶん）で適用され、結果が"cmd_status"シートに反映されます。');
+}
+
+// 送信間隔だけを変更する（平均・メジアンは直近の既知値を引き継ぐ）
+function triggerFlexSetInterval() {
+  var ui = SpreadsheetApp.getUi();
+  var deviceIdHex = promptChildHex_(ui, 'Flex 送信間隔の変更 (1/2)', '対象の子機DeviceIDを16進2桁で入力してください（例: 08）:');
+  if (!deviceIdHex) return;
+
+  var known = getKnownChildSettings_(deviceIdHex);
+  var r2 = ui.prompt('Flex 送信間隔の変更 (2/2)',
+    '新しい送信間隔を分単位で入力してください（1〜1440分）:\n' +
+    '（平均=' + known.avg + ', メジアン=' + known.median + ' は変更せず維持します）',
+    ui.ButtonSet.OK_CANCEL);
+  if (r2.getSelectedButton() !== ui.Button.OK) return;
+  var sleepMin = parseInt(r2.getResponseText(), 10);
+  if (isNaN(sleepMin) || sleepMin < 1 || sleepMin > 1440) {
+    ui.alert('送信間隔は1〜1440の整数で入力してください。');
+    return;
+  }
+
+  queueDownlink_(deviceIdHex, sleepMin, known.avg, known.median,
+                 'スプレッドシートのメニュー（送信間隔のみ変更）から予約');
+  ui.alert('子機0x' + deviceIdHex + 'の送信間隔を' + sleepMin + '分に変更するよう予約しました。');
+}
+
+// 平均回数・メジアン回数だけを変更する（送信間隔は直近の既知値を引き継ぐ）
+function triggerFlexSetAvgMedian() {
+  var ui = SpreadsheetApp.getUi();
+  var deviceIdHex = promptChildHex_(ui, 'Flex 平均/メジアン回数の変更 (1/2)', '対象の子機DeviceIDを16進2桁で入力してください（例: 08）:');
+  if (!deviceIdHex) return;
+
+  var known = getKnownChildSettings_(deviceIdHex);
+  var r2 = ui.prompt('Flex 平均/メジアン回数の変更 (2/2)',
+    '平均回数,メジアン回数をカンマ区切りで入力してください（例: 8,8）:\n' +
+    '（送信間隔=' + known.sleep + '分 は変更せず維持します）',
+    ui.ButtonSet.OK_CANCEL);
+  if (r2.getSelectedButton() !== ui.Button.OK) return;
+  var parts = r2.getResponseText().split(',');
+  var avg = parseInt(parts[0], 10);
+  var median = parseInt(parts[1], 10);
+  if (isNaN(avg) || isNaN(median) || avg < 1 || avg > 255 || median < 1 || median > 255) {
+    ui.alert('平均回数・メジアン回数はそれぞれ1〜255の整数で入力してください（例: 8,8）。');
+    return;
+  }
+
+  queueDownlink_(deviceIdHex, known.sleep, avg, median,
+                 'スプレッドシートのメニュー（平均/メジアンのみ変更）から予約');
+  ui.alert('子機0x' + deviceIdHex + 'の平均回数=' + avg + ', メジアン回数=' + median + 'に変更するよう予約しました。');
+}
+
+// ================================
+// 予約を手動で取り消す（★2026-08-10追加、スプレッドシートのボタン用）
+// Gateway側のpending_cmd_<id>を取り消す。実機がオフラインで長時間放置される、
+// 値を間違えて予約した等のケースで、次に実機がオンラインになるのを待たずに
+// その場で取り消せるようにする。
+function triggerCancelGatewayReservation() {
+  var ui = SpreadsheetApp.getUi();
+
+  var choices = CMD_STATUS_GATEWAY_IDS.map(function (dev) { return dev.label; });
+  var r1 = ui.prompt(
+    'Gateway予約の取り消し (1/2)',
+    '取り消す対象の番号を入力してください:\n' +
+      choices.map(function (c, i) { return (i + 1) + '. ' + c; }).join('\n'),
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (r1.getSelectedButton() !== ui.Button.OK) return;
+  var idx = parseInt(r1.getResponseText(), 10) - 1;
+  if (isNaN(idx) || idx < 0 || idx >= choices.length) {
+    ui.alert('番号が不正です。');
+    return;
+  }
+
+  var devId = CMD_STATUS_GATEWAY_IDS[idx].id;
+  var label = choices[idx];
+  var current = PropertiesService.getScriptProperties().getProperty('pending_cmd_' + devId) || 'none';
+  if (current === 'none') {
+    ui.alert(label + ' には現在予約がありません。');
+    return;
+  }
+
+  var r2 = ui.alert(
+    'Gateway予約の取り消し (2/2)',
+    label + ' の以下の予約を取り消しますか？\n\n' + current,
+    ui.ButtonSet.YES_NO
+  );
+  if (r2 !== ui.Button.YES) return;
+
+  PropertiesService.getScriptProperties().deleteProperty('pending_cmd_' + devId);
+  refreshCmdStatusSheet();
+  ui.alert(label + ' の予約を取り消しました。');
+}
+
+// Flex子機宛てのLoRaダウンリンク予約(downlink_child_<HEX>)を取り消す。
+function triggerCancelFlexReservation() {
+  var ui = SpreadsheetApp.getUi();
+
+  var deviceIdHex = promptChildHex_(ui, 'Flex予約の取り消し (1/2)', '対象の子機DeviceIDを16進2桁で入力してください（例: 08）:');
+  if (!deviceIdHex) return;
+
+  var d = dlGet_(deviceIdHex);
+  if (!d) {
+    ui.alert('子機0x' + deviceIdHex + ' には現在予約がありません。');
+    return;
+  }
+  var current = '間隔=' + d.sleep + '分, 平均=' + d.avg + ', メジアン=' + d.median +
+                '（状態: ' + (d.state || '?') + '）';
+
+  var r2 = ui.alert(
+    'Flex予約の取り消し (2/2)',
+    '子機0x' + deviceIdHex + ' の以下の予約を取り消しますか？\n\n' + current,
+    ui.ButtonSet.YES_NO
+  );
+  if (r2 !== ui.Button.YES) return;
+
+  dlLog_(deviceIdHex, d.seq, '取消', current, 'スプレッドシートのメニューから手動取消');
+  PropertiesService.getScriptProperties().deleteProperty(dlKey_(deviceIdHex));
+  refreshCmdStatusSheet();
+  ui.alert('子機0x' + deviceIdHex + ' の予約を取り消しました。');
 }
 
 
@@ -268,7 +439,11 @@ const CMD_STATUS_GATEWAY_IDS = [
 // その内容を表示する（一度に1台分しか予約できない設計のため）。
 const CMD_STATUS_CHILD_IDS = ['01', '02', '03', '04', '05', '06', '07', '08', '09', '0A', '0B', '0C', '0D', '0E'];
 
-const CMD_STATUS_HEADER = ['デバイスID', '種別', '現在の予約', '状態', '結果', '試行回数', '最終更新日時'];
+// ★2026-08-10追加: MAC列。「シート名編集」タブを廃止し、LoRa子機のMAC↔シート名対応を
+// cmd_statusだけで完結させるため（MAC自体はgetDeviceSheetNameByMac_の導出ロジックが
+// 生成する固定形式で、ここは表示のみ。ユーザーが編集してもrefreshCmdStatusSheet()で
+// 上書きされる点に注意）。
+const CMD_STATUS_HEADER = ['デバイスID', '種別', 'MAC（データ振り分け用）', '現在の予約', '状態', '結果', '試行回数', '最終更新日時'];
 
 function getCmdStatusSheet_() {
   var ss = getSpreadsheet();
@@ -284,16 +459,36 @@ function getCmdStatusSheet_() {
   return sheet;
 }
 
-// ダウンリンク履歴シート（1件ごとに追記。障害調査用）
+// ダウンリンク履歴シート（1イベントごとに追記。障害調査用）
+//
+// ★2026-08-09改訂: 従来は「最終結果」しか記録しておらず、しかもseq不一致の応答は
+// 記録する前にreturnしていたため、予約を入れ直すと「実際に配信された事実」が
+// 履歴から完全に消えていた。予約・送信・結果のすべての段階を残す。
+const DOWNLINK_LOG_HEADER = ['日時', '子機ID', 'seq', '種別', '内容', '備考'];
+
 function getDownlinkLogSheet_() {
   var ss = getSpreadsheet();
   var sheet = ss.getSheetByName('downlink_log');
   if (!sheet) {
     sheet = ss.insertSheet('downlink_log');
-    sheet.appendRow(['日時', '子機ID', '要求(間隔/平均/メジアン)', '結果', '実際に適用された値', '試行回数']);
+    sheet.appendRow(DOWNLINK_LOG_HEADER);
     sheet.setFrozenRows(1);
+  } else if (sheet.getLastColumn() < DOWNLINK_LOG_HEADER.length) {
+    sheet.getRange(1, 1, 1, DOWNLINK_LOG_HEADER.length).setValues([DOWNLINK_LOG_HEADER]);
   }
   return sheet;
+}
+
+// 履歴を1行追記する。どの経路からでも必ずここを通す（記録漏れを作らないため）。
+function dlLog_(childHex, seq, kind, detail, note) {
+  try {
+    getDownlinkLogSheet_().appendRow([
+      new Date(), '0x' + childHex, seq || '', kind, detail || '', note || '',
+    ]);
+  } catch (e) {
+    // 履歴の書き込み失敗で本体の処理を止めない
+    console.error('downlink_log 追記に失敗: ' + e);
+  }
 }
 
 // 予約の現在値を読み取り、cmd_status シートを丸ごと再構成する。
@@ -309,23 +504,26 @@ function refreshCmdStatusSheet() {
 
   var rows = [];
 
-  // Gateway側（pending_cmd_<id> に単発コマンドを持つもの）
+  // Gateway側（pending_cmd_<id> に単発コマンドを持つもの。MACは無いので空欄）
   CMD_STATUS_GATEWAY_IDS.forEach(function (dev) {
     var cmd = props.getProperty('pending_cmd_' + dev.id) || 'none';
-    rows.push([dev.id, dev.label, cmd, cmd === 'none' ? '—' : '予約中', '', '', now]);
+    rows.push([dev.id, dev.label, '', cmd, cmd === 'none' ? '—' : '予約中', '', '', now]);
   });
 
-  // Flex子機側（子機IDごとに独立した予約・状態を持つ）
+  // Flex子機側（子機IDごとに独立した予約・状態を持つ）。
+  // ★MAC列はgetDeviceSheetNameByMac_が実際に照合する形式と完全一致させる
+  //   （"00-00-00-00-00-<HEX2>"）。ここが表示専用の別形式だと紛らわしいため。
   CMD_STATUS_CHILD_IDS.forEach(function (childHex) {
+    var mac = '00-00-00-00-00-' + childHex;
     var d = dlGet_(childHex);
     if (!d) {
-      rows.push(['0x' + childHex, 'Flex子機', 'none', '—', '', '', now]);
+      rows.push(['0x' + childHex, 'Flex子機', mac, 'none', '—', '', '', now]);
       return;
     }
     var req = '間隔=' + d.sleep + '分, 平均=' + d.avg + ', メジアン=' + d.median;
     var stateLabel = { queued: '予約中', sent: '送信済み（確認待ち）', done: '完了', failed: '失敗' }[d.state] || d.state;
     rows.push([
-      '0x' + childHex, 'Flex子機', req, stateLabel, dlStatusLabel_(d),
+      '0x' + childHex, 'Flex子機', mac, req, stateLabel, dlStatusLabel_(d),
       d.attempts || 0, d.updated ? new Date(d.updated) : now,
     ]);
   });
@@ -349,9 +547,21 @@ function onOpen() {
     .addItem('RTC再同期', 'triggerGatewayRtcResync')
     .addItem('診断ログを吸い上げ', 'triggerGatewayLogDump')
     .addSeparator()
-    .addItem('LoRaダウンリンクテスト（子機設定変更）', 'triggerLoraDownlinkTest')
+    .addItem('予約を取り消す', 'triggerCancelGatewayReservation')
     .addSeparator()
     .addItem('予約状況を更新', 'refreshCmdStatusSheet')
+    .addToUi();
+
+  // ★2026-08-10追加: Flex子機向けのLoRaダウンリンク操作をGateway操作から分離。
+  // 今後、子機側の個別設定項目（送信頻度・平均/メジアン回数以外にも増える見込み）が
+  // 増えてもGateway操作メニューを圧迫しないようにするため。
+  SpreadsheetApp.getUi()
+    .createMenu('Flex操作')
+    .addItem('送信間隔を変更', 'triggerFlexSetInterval')
+    .addItem('平均/メジアン回数を変更', 'triggerFlexSetAvgMedian')
+    .addItem('まとめて変更（送信間隔＋平均/メジアン）', 'triggerFlexSetAll')
+    .addSeparator()
+    .addItem('予約を取り消す', 'triggerCancelFlexReservation')
     .addToUi();
 
   refreshCmdStatusSheet();
@@ -374,7 +584,12 @@ function testMailPermission() {
 // 基本設定
 // ================================
 
-const SPREADSHEET_ID = '12VfgxPoRmpr9tkI1myzvIgvjqcDxERkVcQxXWzvYr0I';
+// ★2026-08-09修正: リモートテスト用スプレッドシート（14g7rMQ...）へ変更。
+// 従来値 '12VfgxPoRmpr9tkI1myzvIgvjqcDxERkVcQxXWzvYr0I' のままだと、
+// cmd_status・downlink_log・databox のすべてが「見ていない方のファイル」に作られ、
+// 「GASに何も残っていない」ように見える（実際は別ファイルに書かれていた）。
+// ★デプロイ先を切り替えるときは必ずこの定数も合わせること。
+const SPREADSHEET_ID = '14g7rMQIT0tHwrYcripV84in_ME7B9yodOC7SDqFz17w';
 
 // ★2026-08-04追加: リモートコマンド（resetなど）用のトークン。
 // GatewayファームのGW_CMD_TOKENと同じ値にすること。set_cmdの認証にのみ使う
@@ -610,7 +825,25 @@ function parseGatewayV11Record(hex26) {
 // ================================
 // MACアドレス → シート名 取得（「シート名編集」シート参照）
 // ================================
+// LoRa子機の疑似MAC形式（gateway_v1.1が生成する "00-00-00-00-00-<DeviceID hex2>"）から
+// DeviceIDを取り出す。マッチしなければnull。
+function extractLoraChildHexFromMac_(mac) {
+  var m = /^00-00-00-00-00-([0-9A-Fa-f]{2})$/.exec(String(mac || ''));
+  return m ? m[1].toUpperCase() : null;
+}
+
+// ★2026-08-10改訂: LoRa子機（0x01〜0x0E）は「シート名編集」への手動登録が不要になった。
+// gateway_v1.1が送る疑似MACは "00-00-00-00-00-<DeviceID>" という固定形式なので、
+// DeviceIDから "child_<HEX2>" というシート名を直接導出できる。cmd_statusシートで
+// 予約状況とデータ振り分け先を1つのタブにまとめて見られるようにするための変更
+// （元々は「シート名編集」でMAC↔シート名を手動対応させる必要があった）。
+// LoRa子機以外（BLE機器等）は従来通り「シート名編集」を参照する（互換維持）。
 function getDeviceSheetNameByMac(ss, mac) {
+  var loraHex = extractLoraChildHexFromMac_(mac);
+  if (loraHex && CMD_STATUS_CHILD_IDS.indexOf(loraHex) >= 0) {
+    return 'child_' + loraHex;
+  }
+
   var mapSheet = ss.getSheetByName("シート名編集");
   if (!mapSheet) return null;
   var last = mapSheet.getLastRow();
@@ -693,14 +926,22 @@ function doGet(e) {
     if (!/^[0-9A-F]{2}$/.test(childHex)) {
       return ContentService.createTextOutput('error: bad child id');
     }
+    var applied = (p.sleep || '?') + ' / ' + (p.avg || '?') + ' / ' + (p.median || '?');
+    var statusNum = parseInt(p.status || '0', 10);
+
     var rec = dlGet_(childHex);
-    if (!rec) return ContentService.createTextOutput('stale: no reservation');
-    // ★seqが一致しない報告は「既に入れ替わった古い予約に対する報告」なので捨てる。
-    //   これを見ないと、古い未達報告が新しい予約を失敗扱いで消してしまう。
-    if (String(p.seq || '') !== String(rec.seq || '')) {
+
+    // ★履歴は「予約が今も生きているか」に関わらず必ず残す。
+    //   以前はstale時にここより前でreturnしていたため、予約を入れ直すと
+    //   「実際に子機へ配信されて適用された」事実が履歴から消えていた。
+    if (!rec || String(p.seq || '') !== String(rec.seq || '')) {
+      dlLog_(childHex, p.seq, '結果(期限切れ)', '適用値: ' + applied,
+             'この応答が返る前に予約が入れ替わっていたため、現在の予約状態には反映していません' +
+             '（子機側では実際に適用されています）');
       return ContentService.createTextOutput('stale: seq mismatch');
     }
-    rec.status        = parseInt(p.status || '0', 10);
+
+    rec.status        = statusNum;
     rec.attempts      = parseInt(p.attempts || '0', 10);
     rec.appliedSleep  = parseInt(p.sleep  || '0', 10);
     rec.appliedAvg    = parseInt(p.avg    || '0', 10);
@@ -708,13 +949,9 @@ function doGet(e) {
     rec.state = (rec.status === DL_STATUS_OK || rec.status === DL_STATUS_CLAMPED) ? 'done' : 'failed';
     dlSet_(childHex, rec);
 
-    getDownlinkLogSheet_().appendRow([
-      new Date(), '0x' + childHex,
-      (rec.sleep !== undefined ? rec.sleep : '?') + ' / ' + (rec.avg !== undefined ? rec.avg : '?') + ' / ' + (rec.median !== undefined ? rec.median : '?'),
-      dlStatusLabel_(rec),
-      rec.appliedSleep + ' / ' + rec.appliedAvg + ' / ' + rec.appliedMedian,
-      rec.attempts,
-    ]);
+    dlLog_(childHex, p.seq, '結果',
+           '要求: ' + rec.sleep + ' / ' + rec.avg + ' / ' + rec.median + '　→　適用: ' + applied,
+           dlStatusLabel_(rec) + '（' + rec.attempts + '回目で確定）');
 
     refreshCmdStatusSheet();
     return ContentService.createTextOutput('ok');
@@ -725,13 +962,20 @@ function doGet(e) {
   if (p.action === 'downlink_sent') {
     var sentHex = String(p.child || '').toUpperCase();
     var sentRec = dlGet_(sentHex);
-    if (!sentRec) return ContentService.createTextOutput('stale: no reservation');
-    if (String(p.seq || '') !== String(sentRec.seq || '')) {
+
+    if (!sentRec || String(p.seq || '') !== String(sentRec.seq || '')) {
+      dlLog_(sentHex, p.seq, '送信(期限切れ)', '', '送信後に予約が入れ替わっていました');
       return ContentService.createTextOutput('stale: seq mismatch');
     }
+
     sentRec.state = 'sent';
     sentRec.attempts = parseInt(p.attempts || '1', 10);
     dlSet_(sentHex, sentRec);
+
+    dlLog_(sentHex, p.seq, '送信',
+           '間隔=' + sentRec.sleep + '分 / 平均=' + sentRec.avg + ' / メジアン=' + sentRec.median,
+           sentRec.attempts + '回目（子機からの確認応答を待っています）');
+
     refreshCmdStatusSheet();
     return ContentService.createTextOutput('ok');
   }

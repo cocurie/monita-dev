@@ -847,7 +847,7 @@ bool postToGAS(String queryParams) {
 // 内蔵MQTTクライアント(AT+SM*)・生ソケットへのTLS適用(AT+CASSLCFG)の両方が
 // "operation not allowed"で機能しないことが実機検証で判明した。EMQXはTLS必須(8883番のみ)
 // のため代替不可。既に安定動作しているGASのHTTPS経由（AT+SHREQ/SHREAD）でコマンドを
-// ポーリングする方式に変更した。GAS側の対応はcase02_Gateway/gas/project07_nexco/Code.gs
+// ポーリングする方式に変更した。GAS側の対応はcase02_Gateway/gas/gateway_common/Code.gs
 // のdoGet()内 action=check_cmd / action=set_cmd を参照。
 static char const* GW_DEVICE_ID = "gateway_v11_test";
 
