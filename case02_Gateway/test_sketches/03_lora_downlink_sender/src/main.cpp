@@ -453,6 +453,43 @@ static void queueReport(bool finalResult, uint8_t childId, uint8_t status,
 #endif
 }
 
+// ★2026-08-09追加: 「実際に送信したダウンリンク」の控え。
+//
+// 【なぜ必要か】確認応答を受けた時点でs_pending[]を見てseqを決めていたところ、
+// 送信してから応答が返るまでの間にキャッシュ更新が走って新しい予約(seq)へ
+// 入れ替わっていると、古い応答を新しい予約の完了として報告してしまう。
+// 実機で「seq=7を送信 → キャッシュがseq=8に更新 → seq=7の応答をseq=8として報告」が発生し、
+// 一度も送信していないseq=8が完了扱いで消えた。
+// 送信時点の内容をここに控えておき、応答はこれと突き合わせる。
+struct SentDownlink {
+  bool     valid;
+  uint8_t  childId;
+  uint8_t  attempts;
+  uint32_t seq;
+};
+static SentDownlink s_lastSent[MAX_PENDING_CHILDREN];
+
+static SentDownlink* findLastSent(uint8_t childId) {
+  for (int i = 0; i < MAX_PENDING_CHILDREN; i++) {
+    if (s_lastSent[i].valid && s_lastSent[i].childId == childId) return &s_lastSent[i];
+  }
+  return nullptr;
+}
+
+static void recordSent(uint8_t childId, uint8_t attempts, uint32_t seq) {
+  SentDownlink* e = findLastSent(childId);
+  if (e == nullptr) {
+    for (int i = 0; i < MAX_PENDING_CHILDREN; i++) {
+      if (!s_lastSent[i].valid) { e = &s_lastSent[i]; break; }
+    }
+  }
+  if (e == nullptr) return;
+  e->valid    = true;
+  e->childId  = childId;
+  e->attempts = attempts;
+  e->seq      = seq;
+}
+
 static PendingDownlink* findPending(uint8_t childId) {
   for (int i = 0; i < MAX_PENDING_CHILDREN; i++) {
     if (s_pending[i].active && s_pending[i].childId == childId) return &s_pending[i];
@@ -554,6 +591,7 @@ static void onUplinkReceived(uint8_t childId) {
     while (millis() - t0 < DOWNLINK_RESPONSE_DELAY_MS) { wdtFeed(); yield(); }
   }
   sendDownlinkCommand(childId, p->sleepMin, p->avg, p->median);
+  recordSent(childId, p->attempts, p->seq);  // 確認応答をこの予約に紐付けるための控え
   queueReport(false, childId, 0, p->sleepMin, p->avg, p->median, p->attempts, p->seq);
 #endif  // DIAG_REPEAT_DOWNLINK
 }
@@ -568,9 +606,17 @@ static void onDownlinkAckReceived(const uint8_t* ack, uint8_t len) {
   uint8_t  appliedAvg    = ack[5];
   uint8_t  appliedMedian = ack[6];
 
-  PendingDownlink* p = findPending(childId);
-  uint8_t  attempts = (p != nullptr) ? p->attempts : 0;
-  uint32_t seq      = (p != nullptr) ? p->seq      : 0;
+  // ★seqと試行回数は「実際に送信した時の控え」から取る。
+  //   現在のs_pending[]から取ると、送信〜応答の間にキャッシュ更新で新しい予約へ
+  //   入れ替わっていた場合に、古い応答を新しい予約の完了として誤報告してしまう。
+  SentDownlink* sent = findLastSent(childId);
+  if (sent == nullptr) {
+    Serial.print(F("[DOWNLINK] 送信控えが無い子機0x")); Serial.print(childId, HEX);
+    Serial.println(F(" からの応答のため無視します"));
+    return;
+  }
+  uint8_t  attempts = sent->attempts;
+  uint32_t seq      = sent->seq;
 
 #if DEBUG_MODE
   Serial.print(F("[DOWNLINK] ★子機0x")); Serial.print(childId, HEX);
@@ -581,7 +627,13 @@ static void onDownlinkAckReceived(const uint8_t* ack, uint8_t len) {
 #endif
 
   queueReport(true, childId, status, applied, appliedAvg, appliedMedian, attempts, seq);
-  if (p != nullptr) p->active = false;  // 確認が取れたので再試行を止める
+  sent->valid = false;  // この控えは消費した
+
+  // ★再試行を止めてよいのは「今キャッシュにある予約」＝「今受け取った応答の予約」の時だけ。
+  //   応答待ちの間に新しい予約へ入れ替わっていた場合、その新しい予約はまだ未送信なので
+  //   activeのまま残し、次のアップリンクで送信されるようにする。
+  PendingDownlink* p = findPending(childId);
+  if (p != nullptr && p->seq == seq) p->active = false;
 }
 
 // ★2026-08-09追加: E220の「受信不能ラッチ」解除とUARTE1受信ストールからの復帰。
