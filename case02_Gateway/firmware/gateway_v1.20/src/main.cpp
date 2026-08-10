@@ -207,7 +207,13 @@ static uint8_t  const EXPECTED_PKT_TYPE  = 0x04;             // Flex v3.10 LoRa 
 
 // GAS 送信インターバル。LoRaビルドではコントローラーからBLE経由で変更可能（内蔵フラッシュに保存し
 // 再起動後も維持）。BLEビルドではこの既定値のまま（変更手段なし）。
-static uint32_t const SEND_INTERVAL_DEFAULT_MS = 7200000;  // 既定 120 分
+// ★2026-08-11: 120分 → 60分。子機(Flex v3.20)の送信間隔を60分にしたことに合わせる。
+//   Gatewayは子機ごとに最新1件しか保持しない（updateRecordFromPayload()が上書きする）ため、
+//   送信間隔が子機より長いと、その差の分だけ測定データが失われる。
+//   ※アプリ層WDTはcomputeAppWdtMs(sendIntervalMs)＝送信間隔×1.5で自動追従するので
+//     手当ては不要（CLAUDE.md §7のヒューマンエラー対策）。60分→閾値90分。
+//   ※ハードWDT(WDT_TIMEOUT_MS=120秒)はloop()から常時給餌するため送信間隔とは無関係。
+static uint32_t const SEND_INTERVAL_DEFAULT_MS = 3600000;  // 既定 60 分
 static uint32_t       sendIntervalMs           = SEND_INTERVAL_DEFAULT_MS;  // 実行時可変
 
 // Pkt type と併せて二重チェックする Device ID ホワイトリスト（BLE/LoRa共通）
@@ -224,7 +230,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 87;
+static uint8_t  const GATEWAY_FW_VERSION = 88;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -3047,10 +3053,10 @@ static uint32_t lastSend = 0;
 // アプリ層WDT(computeAppWdtMs)との整合も必ず確認すること）。
 // ★★★ 通しテスト用スイッチ（2026-08-10） ★★★
 // ダウンリンクの通し確認（スプレッドシート指示 → 結果表示まで）を8分以内に収めるため、
-// テスト中だけ確認間隔を短くする。本番運用に戻すときは 0 にすること。
+// テスト中だけ確認間隔を短くする。本番運用時は 0（現在は0＝本番設定）。
 // ※テレメトリ送信間隔(SEND_INTERVAL_DEFAULT_MS)はここでは変えていないので、
 //   アプリ層WDT(computeAppWdtMs)との整合は従来のまま保たれる。
-#define DOWNLINK_E2E_TEST 1
+#define DOWNLINK_E2E_TEST 0
 
 // ★切り分け用（2026-08-10、役目を終えたので0）。起動時に1回だけ、Content-Lengthが付く
 //   固定URLを取得して、モデム・回線が本文を取得できる状態かを確認する。

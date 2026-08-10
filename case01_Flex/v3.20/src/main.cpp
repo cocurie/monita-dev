@@ -118,7 +118,7 @@ static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のとき
 // ============================================================
 #ifdef COMM_MODE_LORA
 static const uint8_t  DEVICE_ID  = 0x0E;  // 子機 ID（iPEC実機テスト用。Gateway側 01_http_post の TARGET_DEVICE_ID と一致させること）
-static const uint8_t  FW_VERSION = 11;    // 子機ファームのバージョン。コミットのたびに+1すること
+static const uint8_t  FW_VERSION = 12;    // 子機ファームのバージョン。コミットのたびに+1すること
 #endif
 
 // ============================================================
@@ -129,15 +129,15 @@ static const uint8_t  FW_VERSION = 11;    // 子機ファームのバージョ�
 // 消費電力への影響はない）。
 // ★★★ 通しテスト用スイッチ（2026-08-10） ★★★
 // ダウンリンクの通し確認（スプレッドシート指示 → 結果表示まで）を8分以内に収めるため、
-// テスト中だけ送信間隔を短くする。本番運用に戻すときは 0 にすること。
+// テスト中だけ送信間隔を短くする。本番運用時は 0（現在は0＝本番設定）。
 // ※WDTは送信間隔から自動計算されるため、ここを変えてもWDT側の修正は不要
 //   （computeWdtTimeoutMs()。CLAUDE.md §7のヒューマンエラー対策）。
-#define DOWNLINK_E2E_TEST 1
+#define DOWNLINK_E2E_TEST 0
 
 #if DOWNLINK_E2E_TEST
 #define SLEEP_MINUTES        2         // 【テスト用】1サイクル後のスリープ時間（分）
 #else
-#define SLEEP_MINUTES        120       // 1サイクル後のスリープ時間（分）
+#define SLEEP_MINUTES        60        // 1サイクル後のスリープ時間（分）
 #endif
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 // ── タレ（ゼロ点補正）操作 ─────────────────────────────────────
