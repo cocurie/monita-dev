@@ -219,7 +219,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 73;
+static uint8_t  const GATEWAY_FW_VERSION = 76;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -387,7 +387,21 @@ static inline void wdtFeed() {
 // するアプリ層ウォッチドッグを設ける。再起動後は setup() が AT&F + CFUN=1,1 で
 // モデムもソフトリセットするため、モデム側スタックの詰まりも合わせて解消される。
 // ══════════════════════════════════════════════
-static uint32_t const APP_WDT_NO_SEND_RESET_MS = 10800000UL;  // 180分: この間GAS送信成功が無ければ再起動（SEND_INTERVAL_DEFAULT_MS=120分より長く取り、1サイクル分の余裕を持たせる）
+// ★2026-08-10: 固定定数をsendIntervalMsから導出する計算式に変更。
+//
+// 【経緯】sendIntervalMsはBLE経由のコントローラー操作やGASの`interval:`コマンドで
+// 実行時に変更できるが、APP_WDT_NO_SEND_RESET_MSは固定定数のままだったため、
+// 送信間隔を長く変更すると（旧来の固定値のままなら）1サイクル分の送信リトライが
+// 完了する前にアプリ層WDTが発動し、正常動作中でも再起動を繰り返す状態になり得た
+// （実際に2026-08-07、送信間隔だけ延ばしてWDT側を放置したことで無限リブートが
+// 発生した実例がある。CLAUDE.md §7参照）。sendIntervalMsから都度計算することで、
+// 実行時に間隔を変えても自動的に追従し、この食い違いを構造的に起こせなくする。
+//
+// マージンは「1サイクル分の送信失敗＋次サイクルでのリトライ成功」を待てる時間。
+// 送信間隔の1.5倍という式は、既存の実運用値（120分間隔→180分)から逆算した係数。
+static uint32_t computeAppWdtMs(uint32_t intervalMs) {
+  return intervalMs + intervalMs / 2;  // intervalMs × 1.5
+}
 static uint32_t lastGasSuccessMs = 0;  // 最後にGAS送信が成功した millis()（setup先頭で初期化）
 
 // 段階的復旧（★2026-07-21 追加、有野川障害の教訓）:
@@ -461,7 +475,7 @@ static void rfProtectObserveCsq(int csq) {
 }
 
 static void appWatchdogCheck() {
-  if (millis() - lastGasSuccessMs >= APP_WDT_NO_SEND_RESET_MS) {
+  if (millis() - lastGasSuccessMs >= computeAppWdtMs(sendIntervalMs)) {
     Serial.println(F("\n‼ アプリWDT: 規定時間 GAS 送信成功なし → NVIC_SystemReset で強制再起動"));
     Serial.flush();
     delay(200);
@@ -497,7 +511,14 @@ static bool sendAtHasTerminator(const String& res, const char* waitForToken) {
   return res.indexOf("OK\r\n") >= 0 || res.indexOf("ERROR") >= 0;
 }
 
+// ★2026-08-10追加: sendAT()/sendATFull()実行中はtrue。loraRxWatchdog()のキック処理
+// （UART書き込み＋delay()）を止めるために参照する。詳細はloraRxWatchdog()のコメント参照。
+static bool s_atBusy = false;
+
 String sendAT(String cmd, int waitMs, const char* waitForToken) {
+  // ★s_atBusyはSerial1.print()の"前"に立てる。送信中のコマンド文字列そのものが
+  // loraKickTx()の割り込みで化ける事象を実機で確認したため。
+  s_atBusy = true;
   Serial1.print(cmd + "\r\n");
   long start = millis();
   String res = "";
@@ -521,6 +542,7 @@ String sendAT(String cmd, int waitMs, const char* waitForToken) {
     }
     yield();
   }
+  s_atBusy = false;
   return res;
 }
 
@@ -766,6 +788,11 @@ bool gasConnect() {
   sendAT("AT+CSSLCFG=\"sni\",1,\"script.google.com\""); delay(200);
   sendAT("AT+SHSSL=1,\"\""); delay(200);
   sendAT("AT+SHCONF=\"BODYLEN\",1024");  delay(200);
+  // ★2026-08-10: 700への拡大を試みたが、SIM7080G AT Command Manual(V1.04)によると
+  // <headerlen>の範囲は 0-350 で、700は範囲外のためAT+SHCONFがERRORを返し、
+  // 設定が反映されないまま以降の通信が悪化する結果になった（03_lora_downlink_senderで
+  // 実機確認済み）。350が仕様上の上限であり、GAS Web Appのリダイレクト先URL
+  // （実測468バイト）を収めることはこのコマンドでは不可能。350へ戻す。
   sendAT("AT+SHCONF=\"HEADERLEN\",350"); delay(200);
   sendAT("AT+SHCONF=\"URL\",\"https://script.google.com\""); delay(200);
 
@@ -868,6 +895,7 @@ static void saveConfig();  // 後方で定義（送信間隔の永続化。LoRa�
 // 本来もっと長いはずのレスポンスが途中で切れてしまう不具合があった（GASの302リダイレクト
 // ページ本文を読もうとした際に発生）。固定時間分は必ず読み切る専用の関数で対応する。
 static String sendATFull(String cmd, int waitMs) {
+  s_atBusy = true;  // 理由はsendAT()のコメント参照
   Serial1.print(cmd); Serial1.print("\r\n");
   String res = "";
   long start = millis();
@@ -876,6 +904,7 @@ static String sendATFull(String cmd, int waitMs) {
     while (Serial1.available()) res += (char)Serial1.read();
     yield();
   }
+  s_atBusy = false;
   return res;
 }
 
@@ -1522,6 +1551,14 @@ static void loraRxWatchdog() {
     s_loraErrSrcAcc |= (uint8_t)(errsrc & 0x0F);
   }
   if (NRF_UARTE1->EVENTS_ERROR) NRF_UARTE1->EVENTS_ERROR = 0;
+
+  // ★2026-08-10追加: AT通信中はキック処理（loraModeNormal()のdelay＋loraKickTx()の
+  // UART書き込み＋delay）を先送りする。sendAT()の待機ループ中はloraPoll()が呼ばれ
+  // 続けるため、その中でここが発火すると、SIM7080Gへ送信中のAT文字列がバイト単位で
+  // 化けてERRORになる事象を03_lora_downlink_sender（同一のGAS通信ロジック）で
+  // 実機確認した。s_loraLastRxMsを更新しないため、AT通信が終わった直後の
+  // loraPoll()呼び出しで改めてこの条件に入り、確実にキックされる。
+  if (s_atBusy) return;
 
   if (millis() - s_loraLastRxMs >= LORA_RX_STALL_MS) {
     s_loraLastRxMs = millis();  // 次の判定まで再度この時間だけ待つ
@@ -2622,7 +2659,7 @@ void setup() {
   NRF_POWER->RESETREAS = 0xFFFFFFFFUL;  // 読み取り後すぐクリア（次回リセット時に前回分と混ざらないように）
 
   wdtInit(WDT_TIMEOUT_MS);  // 無人運用の安全網。以降 120 秒キックが無ければ自動リセット
-  lastGasSuccessMs = millis();  // アプリ層WDTの起点。以降 APP_WDT_NO_SEND_RESET_MS 内に送信成功が無ければ再起動
+  lastGasSuccessMs = millis();  // アプリ層WDTの起点。以降computeAppWdtMs(sendIntervalMs)以内に送信成功が無ければ再起動
 
   i2cBusRecovery();  // Wire.begin()より前に必ず実行（詳細は関数コメント参照）
   Wire.begin();

@@ -207,12 +207,18 @@ function dlSet_(childHex, obj) {
 }
 
 // ステータスコードを日本語の結果表示に変換する
+// ★2026-08-10追加: WDTタイムアウト表示。子機のWDT計算式（送信間隔+マージン）が
+// 正しく機能しているかをスプレッドシート上で確認できるようにするための補足表示。
+function dlWdtSuffix_(d) {
+  return d.appliedWdtMin ? ('　WDT=' + d.appliedWdtMin + '分') : '';
+}
+
 function dlStatusLabel_(d) {
   if (!d) return '';
   if (d.state === 'queued') return '';
   if (d.state === 'sent')   return '送信済み（確認待ち）';
-  if (d.status === DL_STATUS_OK)          return '完了';
-  if (d.status === DL_STATUS_CLAMPED)     return '完了（値を丸めた: 間隔=' + d.appliedSleep + '分, 平均=' + d.appliedAvg + ', メジアン=' + d.appliedMedian + '）';
+  if (d.status === DL_STATUS_OK)          return '完了' + dlWdtSuffix_(d);
+  if (d.status === DL_STATUS_CLAMPED)     return '完了（値を丸めた: 間隔=' + d.appliedSleep + '分, 平均=' + d.appliedAvg + ', メジアン=' + d.appliedMedian + '）' + dlWdtSuffix_(d);
   if (d.status === DL_STATUS_RANGE_ERROR) return '失敗（子機が値域エラーで拒否）';
   if (d.status === DL_STATUS_NO_ACK)      return '失敗（未達。' + (d.attempts || 0) + '回試行しても確認が返らず）';
   return '失敗（不明なステータス: ' + d.status + '）';
@@ -251,17 +257,24 @@ function getKnownChildSettings_(childHex) {
 // Gatewayからの報告にはこのseqを含めてもらい、一致しない報告は無視する。
 // これが無いと、古い予約の「未達」報告が、その後に入れ直した新しい予約を
 // 失敗扱いで上書きして消してしまう（実機で発生）。
-function queueDownlink_(childHex, sleepMin, avg, median, sourceNote) {
+//
+// ★2026-08-10追加: mode='status'（ステータス確認）に対応。
+// 設定変更をしない代わりに、Gatewayは子機へ「変更フラグを一切立てないダウンリンク
+// (flags=0)」を送る。子機はapplyDownlinkPayload()の仕様上、変更が無くても確認応答
+// （現在の送信間隔・平均・メジアン・WDTタイムアウト）を必ず返すため、この応答だけを
+// 目的に使う。sleep/avg/medianは送信フレームには使われないダミー値でよい。
+function queueDownlink_(childHex, sleepMin, avg, median, sourceNote, mode) {
   var prevRec = dlGet_(childHex);
   var nextSeq = (prevRec && prevRec.seq ? prevRec.seq : 0) + 1;
 
   dlSet_(childHex, {
     sleep: sleepMin, avg: avg, median: median,
     state: 'queued', attempts: 0, seq: nextSeq,
+    mode: mode || 'set',
   });
 
-  dlLog_(childHex, nextSeq, '予約',
-         '間隔=' + sleepMin + '分 / 平均=' + avg + ' / メジアン=' + median,
+  dlLog_(childHex, nextSeq, (mode === 'status') ? 'ステータス確認要求' : '予約',
+         (mode === 'status') ? '（設定変更なし）' : ('間隔=' + sleepMin + '分 / 平均=' + avg + ' / メジアン=' + median),
          (prevRec && prevRec.state !== 'done' && prevRec.state !== 'failed')
            ? '★未完了の予約(seq=' + prevRec.seq + ')を上書きしました'
            : sourceNote);
@@ -269,35 +282,19 @@ function queueDownlink_(childHex, sleepMin, avg, median, sourceNote) {
   refreshCmdStatusSheet();
 }
 
-// 送信間隔・平均回数・メジアン回数をまとめて変更する（従来の3ステップ入力）
-function triggerFlexSetAll() {
+// 子機の現在の設定（送信間隔・平均・メジアン・WDTタイムアウト）を確認する。
+// 設定は一切変更しない。子機は次にアップリンクを送ったタイミングで応答するため、
+// 結果は"cmd_status"シート・"downlink_log"シートに反映される。
+function triggerFlexStatusCheck() {
   var ui = SpreadsheetApp.getUi();
-  var deviceIdHex = promptChildHex_(ui, 'Flex設定変更 (1/3)', '対象の子機DeviceIDを16進2桁で入力してください（例: 08）:');
+  var deviceIdHex = promptChildHex_(ui, 'Flex ステータス確認', '対象の子機DeviceIDを16進2桁で入力してください（例: 08）:');
   if (!deviceIdHex) return;
 
-  var r2 = ui.prompt('Flex設定変更 (2/3)', '新しい送信間隔を分単位で入力してください（1〜1440分）:', ui.ButtonSet.OK_CANCEL);
-  if (r2.getSelectedButton() !== ui.Button.OK) return;
-  var sleepMin = parseInt(r2.getResponseText(), 10);
-  if (isNaN(sleepMin) || sleepMin < 1 || sleepMin > 1440) {
-    ui.alert('送信間隔は1〜1440の整数で入力してください。');
-    return;
-  }
-
-  var r3 = ui.prompt('Flex設定変更 (3/3)', '平均回数,メジアン回数をカンマ区切りで入力してください（例: 8,8）:', ui.ButtonSet.OK_CANCEL);
-  if (r3.getSelectedButton() !== ui.Button.OK) return;
-  var parts = r3.getResponseText().split(',');
-  var avg = parseInt(parts[0], 10);
-  var median = parseInt(parts[1], 10);
-  if (isNaN(avg) || isNaN(median) || avg < 1 || avg > 255 || median < 1 || median > 255) {
-    ui.alert('平均回数・メジアン回数はそれぞれ1〜255の整数で入力してください（例: 8,8）。');
-    return;
-  }
-
-  queueDownlink_(deviceIdHex, sleepMin, avg, median, 'スプレッドシートのメニュー（まとめて変更）から予約');
-  ui.alert('子機0x' + deviceIdHex + 'へのダウンリンクを予約しました' +
-           '（送信間隔=' + sleepMin + '分, 平均=' + avg + ', メジアン=' + median + '）。\n\n' +
+  queueDownlink_(deviceIdHex, 0, 0, 0, 'スプレッドシートのメニュー（ステータス確認）から予約', 'status');
+  ui.alert('子機0x' + deviceIdHex + 'のステータス確認を予約しました。\n\n' +
            '子機は省電力のため常時受信していません。次にこの子機がアップリンクを送った' +
-           'タイミング（最大で子機の送信間隔ぶん）で適用され、結果が"cmd_status"シートに反映されます。');
+           'タイミング（最大で子機の送信間隔ぶん）で応答し、現在の送信間隔・平均/メジアン回数・' +
+           'WDTタイムアウトが"cmd_status"シートに反映されます（設定は変更しません）。');
 }
 
 // 送信間隔だけを変更する（平均・メジアンは直近の既知値を引き継ぐ）
@@ -559,7 +556,7 @@ function onOpen() {
     .createMenu('Flex操作')
     .addItem('送信間隔を変更', 'triggerFlexSetInterval')
     .addItem('平均/メジアン回数を変更', 'triggerFlexSetAvgMedian')
-    .addItem('まとめて変更（送信間隔＋平均/メジアン）', 'triggerFlexSetAll')
+    .addItem('ステータス確認', 'triggerFlexStatusCheck')
     .addSeparator()
     .addItem('予約を取り消す', 'triggerCancelFlexReservation')
     .addToUi();
@@ -899,7 +896,7 @@ function doGet(e) {
   // action=check_downlinks: Gatewayが定期的に呼び、未完了の子機宛て予約を一括で取得する。
   //   子機が起きた瞬間に応答しなければならない（受信窓は2秒）ため、Gatewayは事前に
   //   この結果をローカルにキャッシュしておき、アップリンク受信時はネットワークを介さず
-  //   即座にLoRa送信する。1行1件・改行区切りで返す: "08:4:5:5\n0E:60:10:10"
+  //   即座にLoRa送信する。1行1件・改行区切りで返す: "08:4:5:5:0:1:0\n0E:60:10:10:0:1:1"
   //   ★AT+SHREQの512バイト制限に収まるよう、1回に返すのは最大20件までとする。
   if (p.action === 'check_downlinks') {
     var lines = [];
@@ -907,11 +904,13 @@ function doGet(e) {
       var hex = CMD_STATUS_CHILD_IDS[ci];
       var d = dlGet_(hex);
       if (d && (d.state === 'queued' || d.state === 'sent')) {
-        // 形式: HEX2:sleepMin:avg:median:attempts:seq
+        // 形式: HEX2:sleepMin:avg:median:attempts:seq:mode
         // ★attemptsもseqもGAS側を正とする。Gateway側で数えると、再取得のたびに
         //   リセットされたり、予約を入れ直しても古い試行回数を引き継いだりするため。
+        // ★mode: 0=通常の設定変更 / 1=ステータス確認のみ（設定変更フラグを立てずに送る）
         lines.push(hex + ':' + d.sleep + ':' + d.avg + ':' + d.median +
-                   ':' + (d.attempts || 0) + ':' + (d.seq || 0));
+                   ':' + (d.attempts || 0) + ':' + (d.seq || 0) +
+                   ':' + (d.mode === 'status' ? 1 : 0));
       }
     }
     return ContentService.createTextOutput(lines.length ? lines.join('\n') : 'none');
@@ -920,13 +919,17 @@ function doGet(e) {
   // action=downlink_result: Gatewayがダウンリンクの最終結果を報告する。
   //   子機から確認フレーム(PktType 0x05)を受け取った場合はその中身を、規定回数送っても
   //   確認が返らなかった場合は status=99（未達）をGateway自身が報告する。
-  //   例: ...?action=downlink_result&child=08&status=0&sleep=4&avg=5&median=5&attempts=1
+  //   ★2026-08-10追加: wdt=<分>（子機が計算式で導出したWDTタイムアウト）。
+  //   WDT計算式が正しく機能しているかをスプレッドシート上で確認できるようにするため。
+  //   例: ...?action=downlink_result&child=08&status=0&sleep=4&avg=5&median=5&attempts=1&wdt=19
   if (p.action === 'downlink_result') {
     var childHex = String(p.child || '').toUpperCase();
     if (!/^[0-9A-F]{2}$/.test(childHex)) {
       return ContentService.createTextOutput('error: bad child id');
     }
-    var applied = (p.sleep || '?') + ' / ' + (p.avg || '?') + ' / ' + (p.median || '?');
+    var wdtMin = parseInt(p.wdt || '0', 10);
+    var applied = (p.sleep || '?') + ' / ' + (p.avg || '?') + ' / ' + (p.median || '?') +
+                  (wdtMin ? ('（WDT=' + wdtMin + '分）') : '');
     var statusNum = parseInt(p.status || '0', 10);
 
     var rec = dlGet_(childHex);
@@ -946,6 +949,7 @@ function doGet(e) {
     rec.appliedSleep  = parseInt(p.sleep  || '0', 10);
     rec.appliedAvg    = parseInt(p.avg    || '0', 10);
     rec.appliedMedian = parseInt(p.median || '0', 10);
+    rec.appliedWdtMin = wdtMin;
     rec.state = (rec.status === DL_STATUS_OK || rec.status === DL_STATUS_CLAMPED) ? 'done' : 'failed';
     dlSet_(childHex, rec);
 

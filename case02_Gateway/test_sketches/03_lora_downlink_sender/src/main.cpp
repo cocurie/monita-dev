@@ -29,6 +29,11 @@
  *   ★同じ理由で、AT応答待ちや長い待機中もloraPoll()を回し続ける（sendAT/sendATFull/
  *     loraDelay）。子機の窓は2秒しかないため、ここで止まると応答が間に合わない。
  *
+ * 【GAS通信はAT+HTTPTOFS方式（★2026-08-10全面移行）】
+ *   AT+SH*系（AT+SHCONN/SHREQ/SHREAD）はGASの302応答を安定して処理できないことが
+ *   実機とcurlでの実測で確定したため使用しない。詳細はhttpGetViaFs()の先頭コメント参照。
+ *   AT+SH*系とAT+HTTPTOFSは併用不可（混ぜるとAT+SHCONNがERRORになる）。
+ *
  *   本番のgateway_v11_test/v3.10_loraとはGW_DEVICE_IDが別なので、通常運用の
  *   Gatewayオペレーションには一切影響しない。
  *
@@ -83,6 +88,17 @@
 // GAS スクリプトID・コマンド確認用デバイスID（本番gateway_v11_testとは別ID）
 const char* GAS_SCRIPT_ID = "AKfycbzKVvW6vEUvJ28c_xJbHoS2ulvHiPD4OsNONdrTrf6u4kLebl4G7ADI6-YsAFSy2BBB/exec";
 static char const* GW_DEVICE_ID = "lora_downlink_test";
+
+// ★2026-08-10 検証済み（不採用）: スプレッドシート「ウェブに公開」CSV。
+// 動機はリダイレクトを無くして1リクエスト・短いURLにすること。結果:
+//   ・AT+HTTPTOFSは307を追従できる（status=200が返る）。ここは期待どおりだった
+//   ・しかしリダイレクト先の応答が Transfer-Encoding: chunked（Content-Lengthが無い）で、
+//     本文を1バイトも書けない。実機で5回中0回成功
+// GASの2段構え（1段目の302本文からHREFを取り出す）を維持する。再検証する場合のみ1にする。
+#define PROBE_PUBLISHED_CSV 0  // 実機で5回中0回。chunked応答を扱えず断念（下記参照）
+const char* PUBLISHED_CSV_URL =
+  "https://docs.google.com/spreadsheets/d/e/2PACX-1vTbWcfaLESOGmG3h11bOv6n2H9wNGOCtQ9Gn8J9-"
+  "FsdqlZzeUZ4I9SrWTwrtG81sWAAlHqc91TH_vqR/pub?gid=1939102783&single=true&output=csv";
 
 // ============================================================
 // ピン割当（Gateway v1.1実機。gateway_v1.1/platformio.iniのコメント参照）
@@ -318,11 +334,17 @@ enum DownlinkFlag {
 
 // GASから受け取ったパラメータでダウンリンクを送信する（時刻補正は今回のスプレッドシート
 // テストでは対象外のため常にフラグを立てない。将来対象に含める場合はDL_FLAG_TIMEを追加する）
+//
+// ★2026-08-10追加: statusOnly=trueの場合は変更フラグを一切立てない(flags=0)。
+// 子機は変更が無くても確認応答（現在の設定値・WDTタイムアウト）を必ず返すため、
+// 設定を変えずに「ステータス確認」だけを行いたい時に使う。sleepMinutes等の値は
+// 送信はされるが子機側では無視される（flags=0のため）。
 static void sendDownlinkCommand(uint8_t targetDeviceId, uint16_t sleepMinutes,
-                                 uint8_t samplesPerAvg, uint8_t measureCount) {
+                                 uint8_t samplesPerAvg, uint8_t measureCount,
+                                 bool statusOnly = false) {
   loraModeNormal();  // Configモードへ入らず、Normalモードのまま送信する（実機確認済みの方式）
 
-  uint8_t flags = DL_FLAG_SLEEP_MIN | DL_FLAG_AVG_MEDIAN;
+  uint8_t flags = statusOnly ? 0 : (DL_FLAG_SLEEP_MIN | DL_FLAG_AVG_MEDIAN);
 
   uint8_t y, mo, da, h, mi, se;
   getBuildTime(&y, &mo, &da, &h, &mi, &se);
@@ -410,7 +432,8 @@ struct PendingDownlink {
   uint8_t  avg;
   uint8_t  median;
   uint8_t  attempts;
-  uint32_t seq;      // 予約の通し番号。報告に含めてGAS側で新旧を判別させる
+  uint32_t seq;         // 予約の通し番号。報告に含めてGAS側で新旧を判別させる
+  bool     statusOnly;  // ★2026-08-10追加: trueなら設定変更フラグを立てずに送る（ステータス確認）
 };
 static PendingDownlink s_pending[MAX_PENDING_CHILDREN];
 
@@ -428,13 +451,14 @@ struct DownlinkReport {
   uint8_t  median;
   uint8_t  attempts;
   uint32_t seq;
+  uint16_t wdtMin;  // ★2026-08-10追加: 子機の確認応答に載る、適用後有効になるWDTタイムアウト（分）
 };
 #define MAX_REPORTS 8
 static DownlinkReport s_reports[MAX_REPORTS];
 
 static void queueReport(bool finalResult, uint8_t childId, uint8_t status,
                         uint16_t sleepMin, uint8_t avg, uint8_t median,
-                        uint8_t attempts, uint32_t seq) {
+                        uint8_t attempts, uint32_t seq, uint16_t wdtMin = 0) {
   for (int i = 0; i < MAX_REPORTS; i++) {
     if (s_reports[i].used) continue;
     s_reports[i].used        = true;
@@ -446,6 +470,7 @@ static void queueReport(bool finalResult, uint8_t childId, uint8_t status,
     s_reports[i].median      = median;
     s_reports[i].attempts    = attempts;
     s_reports[i].seq         = seq;
+    s_reports[i].wdtMin      = wdtMin;
     return;
   }
 #if DEBUG_MODE
@@ -590,7 +615,7 @@ static void onUplinkReceived(uint8_t childId) {
     uint32_t t0 = millis();
     while (millis() - t0 < DOWNLINK_RESPONSE_DELAY_MS) { wdtFeed(); yield(); }
   }
-  sendDownlinkCommand(childId, p->sleepMin, p->avg, p->median);
+  sendDownlinkCommand(childId, p->sleepMin, p->avg, p->median, p->statusOnly);
   recordSent(childId, p->attempts, p->seq);  // 確認応答をこの予約に紐付けるための控え
   queueReport(false, childId, 0, p->sleepMin, p->avg, p->median, p->attempts, p->seq);
 #endif  // DIAG_REPEAT_DOWNLINK
@@ -598,6 +623,7 @@ static void onUplinkReceived(uint8_t childId) {
 
 // 子機からの確認応答を受けた時の処理。予約を完了扱いにし、結果をGASへ報告する。
 //   ack: [0]0x05 [1]DeviceID [2]status [3-4]適用sleepMin(BE) [5]適用avg [6]適用median
+//        [7-8]適用後に有効になるWDTタイムアウト(分,BE) ★2026-08-10追加
 static void onDownlinkAckReceived(const uint8_t* ack, uint8_t len) {
   if (len < 7) return;
   uint8_t  childId = ack[1];
@@ -605,6 +631,8 @@ static void onDownlinkAckReceived(const uint8_t* ack, uint8_t len) {
   uint16_t applied = ((uint16_t)ack[3] << 8) | ack[4];
   uint8_t  appliedAvg    = ack[5];
   uint8_t  appliedMedian = ack[6];
+  // 旧フレーム(7バイト)との互換のため、WDT欄が無い場合は0扱いにする
+  uint16_t appliedWdtMin = (len >= 9) ? (((uint16_t)ack[7] << 8) | ack[8]) : 0;
 
   // ★seqと試行回数は「実際に送信した時の控え」から取る。
   //   現在のs_pending[]から取ると、送信〜応答の間にキャッシュ更新で新しい予約へ
@@ -623,10 +651,11 @@ static void onDownlinkAckReceived(const uint8_t* ack, uint8_t len) {
   Serial.print(F(" から確認応答: status=")); Serial.print(status);
   Serial.print(F(" 適用値 間隔=")); Serial.print(applied);
   Serial.print(F("分 平均=")); Serial.print(appliedAvg);
-  Serial.print(F(" メジアン=")); Serial.println(appliedMedian);
+  Serial.print(F(" メジアン=")); Serial.print(appliedMedian);
+  Serial.print(F(" WDT=")); Serial.print(appliedWdtMin); Serial.println(F("分"));
 #endif
 
-  queueReport(true, childId, status, applied, appliedAvg, appliedMedian, attempts, seq);
+  queueReport(true, childId, status, applied, appliedAvg, appliedMedian, attempts, seq, appliedWdtMin);
   sent->valid = false;  // この控えは消費した
 
   // ★再試行を止めてよいのは「今キャッシュにある予約」＝「今受け取った応答の予約」の時だけ。
@@ -652,6 +681,16 @@ static uint32_t s_loraRekicks   = 0;
 static uint8_t  s_loraErrSrcAcc = 0;
 #define LORA_RX_STALL_MS 30000UL
 
+// ★2026-08-10追加: sendAT()の待機ループ中はloraPoll()が呼ばれ続けるため、その中で
+// loraRxWatchdog()がストールを検出すると、SIM7080Gへの AT+SHREQ 文字列送信の
+// 真っ最中に loraKickTx()（E220への書き込み＋delay(200)）が割り込むことがあった。
+// 実機でこの割り込みと同時にSIM7080G側へ送るAT文字列がバイト単位で化ける事象
+// （GAS_SCRIPT_IDの一部が別の文字に置き換わりERRORになる）を確認した。
+// AT通信中はキック処理（実際にUARTへ書き込み、delay()するもの）だけを止める。
+// 受信そのもの・ストール検出のカウントは止めない（次にAT通信が終わった時点で
+// 改めてキックされる）。
+static bool s_atBusy = false;
+
 static void loraKickTx() {
   const uint8_t dummy[3] = {0x00, 0x00, 0x00};
   loraSerial.write(dummy, sizeof(dummy));
@@ -669,6 +708,10 @@ static void loraRxWatchdog() {
   if (NRF_UARTE1->EVENTS_ERROR) NRF_UARTE1->EVENTS_ERROR = 0;
 
   if (millis() - s_loraLastRxMs < LORA_RX_STALL_MS) return;
+
+  // ★AT通信中はキック処理を先送りする。s_loraLastRxMsを更新しないため、
+  // AT通信が終わった直後のloraPoll()呼び出しで改めてこの条件に入り、確実にキックされる。
+  if (s_atBusy) return;
 
   s_loraLastRxMs = millis();
   s_loraRekicks++;
@@ -739,8 +782,44 @@ static bool sendAtHasTerminator(const String& res, const char* waitForToken) {
   return res.indexOf("OK\r\n") >= 0 || res.indexOf("ERROR") >= 0;
 }
 
+// ★2026-08-10追加: ATコマンドを小分けにして送る。
+//
+// 【なぜ必要か】XIAOとSIM7080Gの間にハードウェアフロー制御(RTS/CTS)が配線されていない。
+// そのため115200bpsで長いATコマンドを一気に流し込むと、モデム側のUART受信バッファが
+// 溢れてバイトを取りこぼす。実機で以下の文字化けを確認した:
+//   ・約500文字の AT+HTTPTOFS（リダイレクト先URL付き）→ URL途中に制御文字が混入
+//     例: ...MyQC1Sxc7ONhXx@[0x04]BDE[0x05]QD[0x00]Hna1wWm1cYgbU4M9...
+//   ・約180文字の AT+SHREQ でも低頻度で発生（例: AT+SHREQ → AT#R[0x05]Q=）
+// コマンド長に比例して発生率が上がる（500文字級はほぼ毎回）。
+// 64バイトずつflush()しながら送り、モデム側が捌く時間を与えることで回避する。
+static void writeAtCommand(const String& cmd) {
+  // 送信開始前に受信バッファを空にしておく（前のコマンドの残骸を持ち越さない）
+  while (Serial1.available()) Serial1.read();
+
+  // ★2026-08-10: 64バイト/15msでもURLの切り詰めが残ったため32バイト/25msへ強化。
+  //   500文字のコマンドで約400msかかるが、GAS通信は30秒に1回なので許容する。
+  const size_t CHUNK = 32;
+  size_t len = cmd.length();
+  for (size_t i = 0; i < len; i += CHUNK) {
+    size_t n = (i + CHUNK < len) ? CHUNK : (len - i);
+    Serial1.print(cmd.substring(i, i + n));
+    Serial1.flush();   // このチャンクの送出完了を待つ
+    // ★送信中も受信バッファを読み捨てる。エコーが有効なまま残っていた場合、
+    //   送信中に同じ量が返ってきてnRF52の受信リングバッファを溢れさせ、
+    //   以降の応答受信まで壊してしまうため（ATE0で切っているはずだが保険）。
+    while (Serial1.available()) Serial1.read();
+    delay(25);         // モデム側の受信処理に猶予を与える
+    while (Serial1.available()) Serial1.read();
+  }
+  Serial1.print("\r\n");
+  Serial1.flush();
+}
+
 static String sendAT(String cmd, int waitMs = 5000, const char* waitForToken = nullptr) {
-  Serial1.print(cmd + "\r\n");
+  // ★s_atBusyはコマンド送信の"前"に立てる。送信中のコマンド文字列そのものが
+  // loraKickTx()の割り込みで化ける事象を実機で確認したため（詳細はloraRxWatchdog()参照）。
+  s_atBusy = true;
+  writeAtCommand(cmd);
   long start = millis();
   String res = "";
   while (millis() - start < waitMs) {
@@ -760,11 +839,13 @@ static String sendAT(String cmd, int waitMs = 5000, const char* waitForToken = n
     }
     yield();
   }
+  s_atBusy = false;
   return res;
 }
 
 static String sendATFull(String cmd, int waitMs) {
-  Serial1.print(cmd); Serial1.print("\r\n");
+  s_atBusy = true;  // 理由はsendAT()のコメント参照
+  writeAtCommand(cmd);
   String res = "";
   long start = millis();
   while (millis() - start < waitMs) {
@@ -773,37 +854,8 @@ static String sendATFull(String cmd, int waitMs) {
     loraPoll();
     yield();
   }
+  s_atBusy = false;
   return res;
-}
-
-// ★2026-08-08修正: 従来は本文以降の残りバイト全部（AT応答の終端"\r\n\r\nOK\r\n"を含む）を
-// そのまま本文とみなしていたため、"none"のはずのcmdが"none\r\n\r\nOK"のような余分な文字列に
-// なり、cmd=="none"の比較が一致せず異常な挙動（"OK"だけが残って見える等）を起こしていた。
-// AT+SHREQの応答に含まれるDataLenが本文の正確なバイト数なので、それだけを切り出す。
-static String extractShreadBody(const String& raw, int expectedLen) {
-  int bi = raw.indexOf("+SHREAD: ");
-  if (bi < 0) return "";
-  int nlAfterLen = raw.indexOf('\n', bi);
-  if (nlAfterLen < 0) return "";
-  int bodyStart = nlAfterLen + 1;
-  int available = raw.length() - bodyStart;
-  int len = (expectedLen >= 0 && expectedLen < available) ? expectedLen : available;
-  return raw.substring(bodyStart, bodyStart + len);
-}
-
-static void parseShreqResult(const String& result, int* outStatusCode, int* outDataLen) {
-  *outStatusCode = 0;
-  *outDataLen = 0;
-  int si = result.indexOf("+SHREQ: ");
-  if (si < 0) return;
-  String s = result.substring(si + 8);
-  int c1 = s.indexOf(",");
-  int c2 = s.indexOf(",", c1 + 1);
-  if (c1 < 0 || c2 < c1) return;
-  *outStatusCode = s.substring(c1 + 1, c2).toInt();
-  int c3 = c2 + 1;
-  while (c3 < (int)s.length() && isDigit(s[c3])) c3++;
-  *outDataLen = s.substring(c2 + 1, c3).toInt();
 }
 
 void simStage(const char* name, bool ok) {
@@ -874,116 +926,274 @@ bool initNetwork() {
   return ipOk;
 }
 
-bool gasConnect() {
-  Serial.println(F("[GAS] SSL設定中..."));
-  sendAT("AT+SHDISC", 2000); delay(300);
-  sendAT("AT+CSSLCFG=\"ignorertctime\",1,1"); delay(200);
-  sendAT("AT+CSSLCFG=\"sslversion\",1,3");    delay(200);
-  sendAT("AT+CSSLCFG=\"sni\",1,\"script.google.com\""); delay(200);
-  sendAT("AT+SHSSL=1,\"\""); delay(200);
-  sendAT("AT+SHCONF=\"BODYLEN\",1024");  delay(200);
-  sendAT("AT+SHCONF=\"HEADERLEN\",350"); delay(200);
-  sendAT("AT+SHCONF=\"URL\",\"https://script.google.com\""); delay(200);
+// ============================================================
+// ★2026-08-10: GAS通信をAT+HTTPTOFS方式へ全面移行（AT+SH*系は使わない）
+//
+// 【AT+SH*系をやめた理由】実機とcurlでの実測により、以下が確定した:
+//   ・GoogleはHTTP/1.1で Content-Length を返さず Transfer-Encoding: chunked を使う
+//   ・その Transfer-Encoding は応答ヘッダーのオフセット978に位置する
+//   ・Locationヘッダーだけで470バイト、応答ヘッダー全体は1010バイト
+//   ・一方 AT+SHCONF="HEADERLEN" の仕様上の最大値は350（マニュアルV1.04 §13.2.1）
+//   → モデムは Transfer-Encoding を構造的に見られず、+SHREQ が DataLen=0 を返すことがある。
+//   さらに2段目（googleusercontent.comへの再接続）も不安定で、実機で常用に耐えなかった。
+//
+// 【AT+HTTPTOFSの実機確認結果（2026-08-10）】
+//   ・302応答でも status=200 / DataLen=671 で本文を確実に取得できる（chunkedを正しく処理）
+//   ・ただし リダイレクトは追従しない。302のHTMLページ本体がそのまま得られる
+//   → 1段目でこのHTMLからLocation URLを取り出し、2段目で同じくHTTPTOFSで取得する
+//
+// 【AT+SH*系と混ぜてはいけない】
+//   HTTPTOFS実行後に AT+SHCONN が ERROR になる事象を実機で確認した（同じHTTP/SSL
+//   リソースを共有しているため状態が壊れると思われる）。この2系統は併用せず、
+//   本スケッチではHTTPTOFSに一本化する。
+//
+// 【報告系(downlink_sent/result)は1段目だけでよい】
+//   GAS Web Appは doGet() を実行し終えてからリダイレクトを返す。つまり副作用
+//   （Script Propertiesの更新等）は1段目の時点で確定している。本文が不要な用途では
+//   リダイレクトを追う必要がない。
+// ============================================================
+#define HTTPTOFS_DIR_INDEX 3            // 3 = "/customer/"（AT+CFSRFILEの<index>）
+#define HTTPTOFS_FILENAME  "gasdl.txt"
 
-  Serial.println(F("[GAS] 接続中(AT+SHCONN、最大15秒)..."));
-  String conn = sendAT("AT+SHCONN", 15000);
-  if (conn.indexOf("OK") < 0) {
-    Serial.print(F("✗ 接続失敗（CSQ=")); Serial.print(getSimCsq()); Serial.println(F("）"));
-    return false;
-  }
-  return true;
+// AT+CFSRFILE の応答から本文を取り出す。
+// 応答形式: "AT+CFSRFILE=...\r\nOK\r\n\r\n+CFSRFILE: <len>\r\n<data>\r\n\r\nOK\r\n"
+static String extractCfsrfileBody(const String& raw, int expectedLen) {
+  int bi = raw.indexOf("+CFSRFILE: ");
+  if (bi < 0) return "";
+  int nl = raw.indexOf('\n', bi);
+  if (nl < 0) return "";
+  int bodyStart = nl + 1;
+  int available = raw.length() - bodyStart;
+  int len = (expectedLen > 0 && expectedLen < available) ? expectedLen : available;
+  return raw.substring(bodyStart, bodyStart + len);
 }
 
-void gasDisconnect() { sendAT("AT+SHDISC"); }
+// 任意のURLをAT+HTTPTOFSで取得する。成功時は本文、失敗時は空文字列。
+// wantBody=false なら本文の読み出しを省略する（副作用だけが目的の報告系で使う）。
+// AT+HTTPTOFSのダウンロード状態がIdle(0)になるまで待つ。
+// ★発行"前"にも必要。前回の状態が残っているうちに次のAT+HTTPTOFSを出すと、
+//   ERRORで弾かれるか、受け付けても0バイトしか書かれない（実機で確認）。
+static bool waitHttpToFsIdle(int maxWaitMs) {
+  long start = millis();
+  while (millis() - start < maxWaitMs) {
+    String rl = sendAT("AT+HTTPTOFSRL?", 3000);
+    int ri = rl.indexOf("+HTTPTOFSRL: ");
+    if (ri >= 0 && rl.substring(ri + 13).toInt() == 0) return true;
+    delay(250);
+  }
+  return false;
+}
 
-// GASへGETし、応答本文を文字列で返す（失敗時は空文字列）。
-// GAS Web Appは必ず一度302でscript.googleusercontent.comへリダイレクトされ、
-// SIM7080GのAT+SHREQは3xxを自動追従しないため、ここで自前で追跡している
-// （詳細は [[sim7080g_gas_webapp_redirect_handling]]）。
-static String gasGetText(const String& queryParams) {
-  if (!gasConnect()) return "";
+// ★2026-08-10: モデム内部のHTTP/ファイル系リソース枯渇からの復旧。
+// 起動直後は成功するのに、サイクルを重ねるほど「status=200 len=0」が増えて最後は
+// ほぼ全滅する事象を実機で確認した（CFSINITはOK、HTTPTOFSRLも0,0,0で、AT手順側に
+// 問題は見えない）。マニュアルの<StatusCode>には602 No memory / 604 Stack Busyが
+// 定義されており、モジュール内部の枯渇と考えられる。段階的に強い手段で復旧する。
+static int s_fsFailStreak = 0;
+static bool s_netOk = false;
 
-  String path = "/macros/s/";
-  path += GAS_SCRIPT_ID;
-  path += "?";
-  path += queryParams;
+static void recoverHttpStack() {
+  if (s_fsFailStreak == 3) {
+    // 第1段階: PDPコンテキストを張り直してHTTP/ソケット資源を解放させる
+    Serial.println(F("[GAS] 復旧: PDPコンテキストを張り直します"));
+    sendAT("AT+CNACT=0,0", 15000);
+    loraDelay(3000);
+    sendAT("AT+CNACT=0,1", 15000);
+    loraDelay(3000);
+  } else if (s_fsFailStreak >= 6) {
+    // 第2段階: モデム再起動（PDP張り直しでも戻らない場合）
+    Serial.println(F("[GAS] 復旧: モデムを再起動します"));
+    s_fsFailStreak = 0;
+    sendAT("AT+CFUN=1,1", 10000);
+    loraDelay(8000);
+    for (int t = 0; t < 20; t++) {
+      if (sendAT("AT", 1000).indexOf("OK") >= 0) break;
+      loraDelay(500);
+    }
+    sendAT("ATE0", 2000);
+    s_netOk = initNetwork();
+  }
+}
 
-  String result = sendAT("AT+SHREQ=\"" + path + "\",1", 30000, "+SHREQ:");
+static String httpGetViaFs(const String& url, bool wantBody) {
+  // ★AT+HTTPTOFSの"発行前"にAT+HTTPTOFSRL?を打ってはいけない。
+  //   実機で、直前に状態読み出しを入れた途端に「status=200 len=0」が起動直後から
+  //   100%発生するようになった（外すと元に戻る）。完了待ちは発行"後"だけにする。
+  loraDelay(300);
+
+  // ★CFSINIT/CFSTERMは「フラッシュバッファの確保/解放」。ダウンロードを挟むと
+  //   確保状態が無効になるらしく、ダウンロード前に確保したままCFSRFILEすると
+  //   空が返ることがあった（実機で発生）。削除用と読み出し用でペアを分ける。
+  // ★2026-08-10: 確保が残っていると AT+HTTPTOFS が書き込めず「status=200 len=0」になる
+  //   （実機で AT+CFSINIT が ERROR を返した回だけ len=0 になることを確認）。
+  //   前回の解放漏れを取り除くため、まず無条件に CFSTERM する（未確保なら ERROR だが無害）。
+  sendAT("AT+CFSTERM", 3000);
+
+  String delRes = sendAT("AT+CFSINIT", 3000);
+  if (delRes.indexOf("OK") < 0) {
+    Serial.println(F("[GAS] 警告: AT+CFSINITがERROR（確保が残っている可能性）"));
+  }
+  delRes += sendAT("AT+CFSDFILE=" + String(HTTPTOFS_DIR_INDEX) + ",\"" + HTTPTOFS_FILENAME + "\"", 3000);
+  delRes += sendAT("AT+CFSTERM", 3000);
+
+  String res = sendAT("AT+HTTPTOFS=\"" + url + "\",\"/customer/" + HTTPTOFS_FILENAME + "\",50,5",
+                      60000, "+HTTPTOFS:");
+
+  // 応答: +HTTPTOFS: <StatusCode>,<DataLen>
   int statusCode = 0, dataLen = 0;
-  parseShreqResult(result, &statusCode, &dataLen);
+  int si = res.indexOf("+HTTPTOFS: ");
+  if (si >= 0) {
+    String s = res.substring(si + 11);
+    int c1 = s.indexOf(',');
+    if (c1 > 0) {
+      statusCode = s.substring(0, c1).toInt();
+      int e = c1 + 1;
+      while (e < (int)s.length() && isDigit(s[e])) e++;
+      dataLen = s.substring(c1 + 1, e).toInt();
+    }
+  }
+  Serial.print(F("[GAS] HTTPTOFS status=")); Serial.print(statusCode);
+  Serial.print(F(" len=")); Serial.println(dataLen);
 
-  if ((statusCode != 200 && statusCode != 302) || dataLen <= 0) {
-    Serial.print(F("[GAS] 応答異常 ステータスコード=")); Serial.println(statusCode);
-    gasDisconnect();
+  if (statusCode != 200 || (wantBody && dataLen <= 0)) {
+#if DEBUG_MODE
+    // ★失敗時は原因を追えるよう生の応答とファイルシステム状態を出す。
+    // len=0が続く場合、フラッシュの空き不足・ファイル削除失敗・書き込み失敗などが疑われる。
+    Serial.print(F("[DEBUG] 削除シーケンス応答=[")); Serial.print(delRes); Serial.println(F("]"));
+    Serial.print(F("[DEBUG] HTTPTOFS raw=[")); Serial.print(res); Serial.println(F("]"));
+    Serial.print(F("[DEBUG] ダウンロード状態: ")); Serial.println(sendAT("AT+HTTPTOFSRL?", 3000));
+    // ★CFSGFIS/CFSGFRSはAT+CFSINITでフラッシュバッファを確保していないとERRORになる。
+    //   確保せずに呼んでいたため、これまでERRORしか見えていなかった。
+    sendAT("AT+CFSINIT", 3000);
+    Serial.print(F("[DEBUG] ファイルサイズ: "));
+    Serial.println(sendAT("AT+CFSGFIS=" + String(HTTPTOFS_DIR_INDEX) + ",\"" + HTTPTOFS_FILENAME + "\"", 3000));
+    // ★AT+CFSGFRSは"読み出しコマンド"。末尾の?を落とすとERRORになる（過去の誤り）。
+    Serial.print(F("[DEBUG] FS空き容量: ")); Serial.println(sendAT("AT+CFSGFRS?", 3000));
+    sendAT("AT+CFSTERM", 3000);
+#endif
+    s_fsFailStreak++;
+    recoverHttpStack();
+    return "";
+  }
+  s_fsFailStreak = 0;
+  if (!wantBody) return "ok";        // 本文不要（副作用だけが目的）
+
+  // ★2026-08-10追加: ダウンロード完了を待つ。
+  // AT+HTTPTOFSは非同期で、+HTTPTOFS URCが返った時点ではファイル書き込みが
+  // 完了していないことがある（マニュアルに状態確認用のAT+HTTPTOFSRLが用意されている
+  // ことがその裏付け）。実機で「status=200 len=671なのに読み出すと空」という事象が
+  // 頻発したのはこれが原因と考えられる。<status> 0=Idle（完了）/ 1=ダウンロード中。
+  waitHttpToFsIdle(10000);
+
+  // ★実際のファイルサイズを確認してから読む。
+  // 古いファイルが残っていた場合にそれを読んでしまうと、期限切れのリダイレクトURLを
+  // 掴んでGoogleの「ページが見つかりません」ページに飛ばされる（実機で発生）。
+  // ★CFSGFISはCFSINITでフラッシュバッファを確保していないと正しい値を返さない
+  //   （確保せずに呼んでいたため「期待=671 実際=0」で正常なデータを捨てていた）。
+  //   サイズ確認と読み出しを同じCFSINIT/CFSTERMの中で行う。
+  sendAT("AT+CFSINIT", 3000);
+
+  int fileSize = 0;
+  String gfis = sendAT("AT+CFSGFIS=" + String(HTTPTOFS_DIR_INDEX) + ",\"" + HTTPTOFS_FILENAME + "\"", 3000);
+  int gi = gfis.indexOf("+CFSGFIS: ");
+  if (gi >= 0) fileSize = gfis.substring(gi + 10).toInt();
+
+  if (fileSize != dataLen) {
+    sendAT("AT+CFSTERM", 3000);
+    Serial.print(F("[GAS] ファイルサイズ不一致（期待=")); Serial.print(dataLen);
+    Serial.print(F(" 実際=")); Serial.print(fileSize); Serial.println(F("）→ 破棄"));
     return "";
   }
 
-  String cmd;
+  String fileRes = sendATFull("AT+CFSRFILE=" + String(HTTPTOFS_DIR_INDEX) + ",\"" + HTTPTOFS_FILENAME +
+                              "\",0," + String(dataLen) + ",0", 5000);
+  sendAT("AT+CFSTERM", 3000);
 
-  if (statusCode == 302) {
-    // GAS Web AppのdoGet()は必ず一度302でscript.googleusercontent.com/macros/echo?...へ
-    // リダイレクトされる。実際の応答本文はそちらにあるため自前で追いかける
-    // （詳細はgateway_v1.1のcheckRemoteCmd()コメント、[[sim7080g_gas_webapp_redirect_handling]]参照）。
-    String redirectBody = sendATFull("AT+SHREAD=0," + String(dataLen), 3000);
-    gasDisconnect();
-    String html = extractShreadBody(redirectBody, dataLen);
-    int hi = html.indexOf("HREF=\"");
-    if (hi < 0) { Serial.println(F("[GAS] リダイレクト先URLが見つからない")); return ""; }
-    hi += 6;
-    int hEnd = html.indexOf("\"", hi);
-    if (hEnd < 0) { Serial.println(F("[GAS] リダイレクト先URLの終端が見つからない")); return ""; }
-    String redirectUrl = html.substring(hi, hEnd);
-    redirectUrl.replace("&amp;", "&");
-
-    int hostStart = redirectUrl.indexOf("://") + 3;
-    int pathStart = redirectUrl.indexOf("/", hostStart);
-    if (pathStart < 0) { Serial.println(F("[GAS] リダイレクト先URLの形式が不正")); return ""; }
-    String redirectHost = redirectUrl.substring(hostStart, pathStart);
-    String redirectPath = redirectUrl.substring(pathStart);
-
-    sendAT("AT+CSSLCFG=\"ignorertctime\",1,1", 200);
-    sendAT("AT+CSSLCFG=\"sslversion\",1,3", 200);
-    sendAT("AT+CSSLCFG=\"sni\",1,\"" + redirectHost + "\"", 200);
-    sendAT("AT+SHSSL=1,\"\"", 200);
-    sendAT("AT+SHCONF=\"URL\",\"https://" + redirectHost + "\"", 200);
-
-    String conn2 = sendAT("AT+SHCONN", 15000);
-    if (conn2.indexOf("OK") < 0) { Serial.println(F("[GAS] リダイレクト先への接続に失敗")); return ""; }
-
-    String result2 = sendAT("AT+SHREQ=\"" + redirectPath + "\",1", 30000, "+SHREQ:");
-    int statusCode2 = 0, dataLen2 = 0;
-    parseShreqResult(result2, &statusCode2, &dataLen2);
-    if (statusCode2 != 200 || dataLen2 <= 0) {
-      Serial.print(F("[GAS] リダイレクト先の応答が異常 ステータスコード=")); Serial.println(statusCode2);
-      gasDisconnect();
-      return "";
-    }
-
-    String body2 = sendATFull("AT+SHREAD=0," + String(dataLen2), 3000);
-    gasDisconnect();
-    cmd = extractShreadBody(body2, dataLen2);
-  } else {
-    String body = sendATFull("AT+SHREAD=0," + String(dataLen), 3000);
-    gasDisconnect();
-    cmd = extractShreadBody(body, dataLen);
-  }
-
-  cmd.trim();
-  return cmd;
+  String body = extractCfsrfileBody(fileRes, dataLen);
+  body.trim();
+  return body;
 }
 
-// 応答だけ確認すればよい単発GET（報告系。本文は読まない）
+// 302のHTMLページ本体から <A HREF="..."> のURLを取り出す（&amp;も復元する）
+static String extractRedirectUrl(const String& html) {
+  int hi = html.indexOf("HREF=\"");
+  if (hi < 0) return "";
+  hi += 6;
+  int hEnd = html.indexOf("\"", hi);
+  if (hEnd < 0) return "";
+  String url = html.substring(hi, hEnd);
+  url.replace("&amp;", "&");
+  return url;
+}
+
+// GASへGETし、応答本文を文字列で返す（失敗時は空文字列）。
+// GAS Web Appは必ず一度302でscript.googleusercontent.comへリダイレクトされるため、
+// 1段目でリダイレクト先URLを取り出し、2段目でその本文を取得する。
+// どちらもAT+HTTPTOFS経由（理由はhttpGetViaFs()の先頭コメント参照）。
+static String gasGetText(const String& queryParams) {
+  String url1 = "https://script.google.com/macros/s/";
+  url1 += GAS_SCRIPT_ID;
+  url1 += "?";
+  url1 += queryParams;
+
+  // ★URLの切り詰め（フロー制御なしUARTの取りこぼし）が起きると、Googleの404ページが
+  //   返ってくる。1回だけ即リトライする（次サイクルまで30秒待たずに済む）。
+  String html;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    // 連続で叩くとモデムが601（ネットワークエラー）を返すことがあるため間隔を空ける
+    if (attempt > 0) delay(1000);
+    Serial.println(attempt == 0 ? F("[GAS] 1段目を取得中...") : F("[GAS] 1段目を再取得中..."));
+    html = httpGetViaFs(url1, true);
+    if (html.length() == 0) continue;
+    // Googleのエラーページ（404等）を本文として扱わない。URLが途中で切れた証拠。
+    if (html.indexOf("<!DOCTYPE html>") >= 0 && html.indexOf("HREF=\"") < 0) {
+      Serial.println(F("[GAS] Googleのエラーページが返された（URLが壊れている可能性）"));
+      html = "";
+      continue;
+    }
+    break;
+  }
+  if (html.length() == 0) {
+    Serial.println(F("[GAS] 1段目の取得に失敗"));
+    return "";
+  }
+
+  // GASが（リダイレクトせず）直接本文を返した場合はそのまま使う
+  if (html.indexOf("Moved Temporarily") < 0 && html.indexOf("HREF=\"") < 0) {
+    return html;
+  }
+
+  String url2 = extractRedirectUrl(html);
+  if (url2.length() == 0) {
+    Serial.println(F("[GAS] リダイレクト先URLが取り出せない"));
+    return "";
+  }
+
+  // 2段目も1段目と同様にリトライする（リダイレクト先URLは時限性があるので使い回してよい）
+  String body;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) delay(1000);
+    Serial.println(attempt == 0 ? F("[GAS] 2段目（リダイレクト先）を取得中...")
+                                : F("[GAS] 2段目を再取得中..."));
+    body = httpGetViaFs(url2, true);
+    if (body.length() > 0) break;
+  }
+#if DEBUG_MODE
+  Serial.print(F("[DEBUG] 本文=[")); Serial.print(body); Serial.println(F("]"));
+#endif
+  return body;
+}
+
+// 応答だけ確認すればよい単発GET（報告系。本文は読まない）。
+// ★GAS Web AppはdoGet()を実行し終えてからリダイレクトを返すため、
+//   1段目が成功した時点でGAS側の処理（Script Propertiesの更新等）は完了している。
+//   本文が不要なこの用途では、リダイレクトを追う必要がない。
 static bool gasSimpleGet(const String& queryParams) {
-  if (!gasConnect()) return false;
-  String scriptPath = "/macros/s/";
-  scriptPath += GAS_SCRIPT_ID;
-  scriptPath += "?";
-  scriptPath += queryParams;
-  String result = sendAT("AT+SHREQ=\"" + scriptPath + "\",1", 30000, "+SHREQ:");
-  int statusCode = 0, dataLen = 0;
-  parseShreqResult(result, &statusCode, &dataLen);
-  gasDisconnect();
-  return statusCode == 200 || statusCode == 302;
+  String url = "https://script.google.com/macros/s/";
+  url += GAS_SCRIPT_ID;
+  url += "?";
+  url += queryParams;
+  return httpGetViaFs(url, false).length() > 0;
 }
 
 // ============================================================
@@ -991,10 +1201,12 @@ static bool gasSimpleGet(const String& queryParams) {
 // ============================================================
 
 // GASから未完了の子機宛て予約を一括取得し、ローカルキャッシュへ反映する。
-// 応答形式: 1行1件の "HEX2:sleepMin:avg:median"、無ければ "none"
-//   例) "08:4:5:5\n0E:60:10:10"
+// 応答形式: 1行1件の "HEX2:sleepMin:avg:median:attempts:seq:mode"、無ければ "none"
+//   例) "08:4:5:5:0:1:0\n0E:0:0:0:0:2:1"（0Eはステータス確認のみ、mode=1）
 void refreshDownlinkCache() {
-  String body = gasGetText("action=check_downlinks&device_id=" + String(GW_DEVICE_ID));
+  String q = "action=check_downlinks&device_id=" + String(GW_DEVICE_ID);
+
+  String body = gasGetText(q);
   if (body.length() == 0) {
     Serial.println(F("[CACHE] 予約の取得に失敗（次サイクルで再試行します）"));
     return;
@@ -1019,43 +1231,52 @@ void refreshDownlinkCache() {
     line.trim();
     if (line.length() == 0) continue;
 
-    // 形式: HEX2:sleepMin:avg:median:attempts:seq（6項目）
-    int pos[5];
+    // 形式: HEX2:sleepMin:avg:median:attempts:seq:mode（7項目）
+    int pos[6];
     int found = 0;
     int from = 0;
-    while (found < 5) {
+    while (found < 6) {
       int c = line.indexOf(':', from);
       if (c < 0) break;
       pos[found++] = c;
       from = c + 1;
     }
-    if (found < 5) {
+    if (found < 6) {
       Serial.print(F("[CACHE] 書式不正のため無視: ")); Serial.println(line);
       continue;
     }
 
-    uint8_t  childId  = (uint8_t)strtoul(line.substring(0, pos[0]).c_str(), nullptr, 16);
-    uint16_t sleepMin = (uint16_t)line.substring(pos[0] + 1, pos[1]).toInt();
-    uint8_t  avg      = (uint8_t)line.substring(pos[1] + 1, pos[2]).toInt();
-    uint8_t  median   = (uint8_t)line.substring(pos[2] + 1, pos[3]).toInt();
-    uint8_t  attempts = (uint8_t)line.substring(pos[3] + 1, pos[4]).toInt();
-    uint32_t seq      = (uint32_t)line.substring(pos[4] + 1).toInt();
+    uint8_t  childId    = (uint8_t)strtoul(line.substring(0, pos[0]).c_str(), nullptr, 16);
+    uint16_t sleepMin   = (uint16_t)line.substring(pos[0] + 1, pos[1]).toInt();
+    uint8_t  avg        = (uint8_t)line.substring(pos[1] + 1, pos[2]).toInt();
+    uint8_t  median     = (uint8_t)line.substring(pos[2] + 1, pos[3]).toInt();
+    uint8_t  attempts   = (uint8_t)line.substring(pos[3] + 1, pos[4]).toInt();
+    uint32_t seq        = (uint32_t)line.substring(pos[4] + 1, pos[5]).toInt();
+    bool     statusOnly = line.substring(pos[5] + 1).toInt() != 0;
 
-    if (childId == 0 || sleepMin < 1 || sleepMin > 1440 || avg < 1 || median < 1) {
+    // ★ステータス確認(statusOnly)はsleep/avg/medianを使わない（GAS側は0を送ってくる）ので
+    //   値域チェックの対象外にする。通常の設定変更だけ範囲を検証する。
+    if (childId == 0) {
+      Serial.print(F("[CACHE] 値が範囲外のため無視: ")); Serial.println(line);
+      continue;
+    }
+    if (!statusOnly && (sleepMin < 1 || sleepMin > 1440 || avg < 1 || median < 1)) {
       Serial.print(F("[CACHE] 値が範囲外のため無視: ")); Serial.println(line);
       continue;
     }
 
-    s_pending[slot].active   = true;
-    s_pending[slot].childId  = childId;
-    s_pending[slot].sleepMin = sleepMin;
-    s_pending[slot].avg      = avg;
-    s_pending[slot].median   = median;
-    s_pending[slot].attempts = attempts;  // ★GAS側が正（Gatewayが再起動しても引き継がれる）
-    s_pending[slot].seq      = seq;
+    s_pending[slot].active     = true;
+    s_pending[slot].childId    = childId;
+    s_pending[slot].sleepMin   = sleepMin;
+    s_pending[slot].avg        = avg;
+    s_pending[slot].median     = median;
+    s_pending[slot].attempts   = attempts;  // ★GAS側が正（Gatewayが再起動しても引き継がれる）
+    s_pending[slot].seq        = seq;
+    s_pending[slot].statusOnly = statusOnly;
     slot++;
 
     Serial.print(F("[CACHE] 予約: 子機0x")); Serial.print(childId, HEX);
+    if (statusOnly) { Serial.print(F(" ステータス確認のみ")); }
     Serial.print(F(" 間隔=")); Serial.print(sleepMin);
     Serial.print(F("分 平均=")); Serial.print(avg);
     Serial.print(F(" メジアン=")); Serial.print(median);
@@ -1084,6 +1305,7 @@ void processReportQueue() {
       q += "&median=";   q += String(s_reports[i].median);
       q += "&attempts="; q += String(s_reports[i].attempts);
       q += "&seq=";      q += String(s_reports[i].seq);
+      q += "&wdt=";      q += String(s_reports[i].wdtMin);
     } else {
       q  = "action=downlink_sent&child="; q += childHex;
       q += "&attempts="; q += String(s_reports[i].attempts);
@@ -1108,7 +1330,6 @@ static void loraUartBegin() {
   delay(500);
 }
 
-static bool s_netOk = false;
 
 void setup() {
   wdtInit(WDT_TIMEOUT_MS);
@@ -1175,12 +1396,58 @@ void setup() {
 
   sendAT("AT&F", 3000); delay(500);
   sendAT("AT+CFUN=1,1", 3000); delay(5000);
-  sendAT("ATE0", 2000);
+
+  // ★2026-08-10修正: AT+CFUN=1,1 はモジュールを再起動させるため、delay(5000)だけでは
+  // 再起動が完了していないことがあり、直後のATE0が失われてエコーが有効なまま残っていた
+  // （実機ログで、送信したコマンドがそのまま復唱されて返ってきていた）。
+  //
+  // 【エコーが致命的な理由】エコーが有効だと、こちらが500バイトのATコマンドを送っている
+  // 最中にモジュールが同じ500バイトを返してくる。writeAtCommand()の送信中(約120ms)は
+  // Serial1を読んでいないため、nRF52のUART受信リングバッファが溢れ、以降の応答受信まで
+  // 巻き込んで壊れる。長いコマンドほど失敗しやすかった原因の一つ。
+  {
+    bool ready = false;
+    for (int t = 0; t < 20 && !ready; t++) {
+      String r = sendAT("AT", 1000);
+      if (r.indexOf("OK") >= 0) ready = true;
+      else delay(500);
+    }
+    simStage("モデム再起動後のAT疎通", ready);
+
+    // エコーを確実に切る（効いたかどうかを応答の中身で検証する）
+    bool echoOff = false;
+    for (int t = 0; t < 5 && !echoOff; t++) {
+      String r = sendAT("ATE0", 2000);
+      // エコーが切れていれば応答にコマンド文字列("ATE0")は含まれない
+      if (r.indexOf("OK") >= 0 && r.indexOf("ATE0") < 0) echoOff = true;
+      else delay(300);
+    }
+    simStage("エコー無効化 (ATE0)", echoOff);
+  }
 
   Serial.println(F("[   ] ネットワーク初期化..."));
   s_netOk = initNetwork();
   simStage("ネットワーク接続", s_netOk);
   Serial.println(F("=====================================\n"));
+
+#if PROBE_PUBLISHED_CSV
+  // 起動時に一度だけ、公開CSVを直接取得してみる（307追従の可否を実機で確認する）
+  if (s_netOk) {
+    Serial.println(F("\n===== 公開CSV 取得テスト（5回） ====="));
+    // 307の追従自体は成功している（status=200が返る）。問題はchunked応答の本文長。
+    // 常に0バイトなのか、GASと同様にたまに取れるのかを見る。
+    int ok = 0;
+    for (int i = 0; i < 5; i++) {
+      String csv = httpGetViaFs(PUBLISHED_CSV_URL, true);
+      Serial.print(F("[PROBE] ")); Serial.print(i + 1); Serial.print(F("回目: "));
+      if (csv.length() > 0) { ok++; Serial.print(F("成功 本文=[")); Serial.print(csv); Serial.println(F("]")); }
+      else Serial.println(F("0バイト"));
+      loraDelay(2000);
+    }
+    Serial.print(F("[PROBE] 結果: 5回中 ")); Serial.print(ok); Serial.println(F(" 回成功"));
+    Serial.println(F("================================\n"));
+  }
+#endif
 
   if (s_netOk) refreshDownlinkCache();
 
@@ -1215,7 +1482,7 @@ void loop() {
         if (!s_pending[i].active) continue;
         Serial.print(F("[DIAG] 定期送信: 宛先=0x")); Serial.println(s_pending[i].childId, HEX);
         sendDownlinkCommand(s_pending[i].childId, s_pending[i].sleepMin,
-                            s_pending[i].avg, s_pending[i].median);
+                            s_pending[i].avg, s_pending[i].median, s_pending[i].statusOnly);
         break;  // 1周期につき1台だけ（連続送信で電波を占有しないため）
       }
     }
@@ -1234,10 +1501,16 @@ void loop() {
     Serial.println(F("ms"));
   }
 
-  // 報告はキャッシュ更新より優先して送る（スプレッドシートへの結果反映を早くするため）
+  // 報告はキャッシュ更新より優先して送る（スプレッドシートへの結果反映を早くするため）。
+  //
+  // ★2026-08-10修正: 従来はここで無条件にreturnしていたため、報告のGAS送信が
+  // （302リダイレクト追跡の一時的な失敗等で）連続して失敗し続けると、下のキャッシュ
+  // 更新チェックに永久に到達できなくなり、新しい予約を何分も拾えなくなるバグがあった
+  // （実機で予約から送信まで約5分かかる事象として発覚）。
+  // report処理を「試すだけ」にして、成功・失敗に関わらずキャッシュ更新のタイマー
+  // チェックへ必ず進むようにする。
   if (s_netOk && hasQueuedReports()) {
     processReportQueue();
-    return;
   }
 
   if (now - s_lastCheckMs >= CHECK_CMD_INTERVAL_MS) {

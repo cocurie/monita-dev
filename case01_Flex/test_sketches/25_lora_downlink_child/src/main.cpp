@@ -99,20 +99,23 @@ static const uint8_t FW_VERSION = 1;
 // ダウンリンク結果のステータスコード（GAS・Gatewayファームと一致させること）
 #define DL_STATUS_OK          0   // 要求通り適用
 #define DL_STATUS_RANGE_ERROR 1   // 値域エラー（受け付けられない値だったので拒否）
-#define DL_STATUS_CLAMPED     2   // クランプ適用（WDT制約等で要求と異なる値を適用）
+// ★2026-08-10: DL_STATUS_CLAMPED(2)は廃止せず番号を予約のまま残す（GAS側のenumと
+//   ずれさせないため）。クランプによる制約自体は下記の「再起動してWDTを張り直す」
+//   方式に置き換えたため、このファームからは使わなくなった。
 
-// ★ダウンリンクで設定できる送信間隔の上限。
+// ★2026-08-10: 「ダウンリンクで設定できる送信間隔の上限」という制約そのものを撤去した。
 //
-// 【なぜ上限が要るか】nRF52840のWDTは一度TASKS_STARTを叩くと、リセットするまで
-// タイムアウト値(CRV)の変更もSTOPもできない。したがって「スリープ中にWDTが焚かれない」
-// ことを保証するには、ランタイムで設定できるスリープ時間をWDTタイムアウトより
-// 確実に短い範囲に制限する必要がある。ここを守らないと、設定変更した瞬間から
-// 正常動作中に無限リブートを起こす（CLAUDE.md §7 の観点そのもの）。
-// 本テストスケッチは WDT_TIMEOUT_MS = 10分 なので、余裕を見て 8分を上限とする。
-// ★本番ファーム(v3.10_lora)へ統合する際は、そちらのWDT_TIMEOUT_MS(130分)に合わせて
-//   この値を見直すこと。あるいは「適用→フラッシュ保存→NVIC_SystemReset()」として
-//   setup()でWDTを張り直せば、上限そのものを無くせる。
-#define DL_MAX_SLEEP_MINUTES 8
+// 【旧方式の問題】nRF52840のWDTは一度TASKS_STARTを叩くとリセットするまでタイムアウト値
+// (CRV)の変更もSTOPもできない。そのため以前は「ランタイムで設定できるスリープ時間を
+// 固定WDTタイムアウトより確実に短い範囲へクランプする」方式にしていたが、これは
+// 「要求された値をそのまま設定できない」という制約を生んでいた。
+//
+// 【新方式】設定を変更したら、確認応答を送ったあとで自ら NVIC_SystemReset() する。
+// setup()は起動のたびに「今のsleepMinutesからWDTタイムアウトを計算式で導出して
+// wdtInit()する」ため、次に起きた時には新しい送信間隔に対して安全なWDTが張られている。
+// これによりクランプが不要になり、要求通りの値をそのまま適用できる。
+// マージンの考え方はv3.10_lora本番ファームと統一（WDT_MARGIN_MINUTES参照）。
+#define WDT_MARGIN_MINUTES 15
 
 // ★切り分け用: 1 にすると「スリープもアップリンク送信も一切せず、ひたすら受信し続ける」
 //   RX専用モードになる。
@@ -256,7 +259,12 @@ static void loadSettings() {
 // ============================================================
 // ウォッチドッグタイマー（nRF52840 内蔵 WDT）
 // ============================================================
-static uint32_t const WDT_TIMEOUT_MS = 10UL * 60UL * 1000UL;  // 10分（送信間隔+RXウィンドウに余裕を持たせた値）
+// ★2026-08-10: 固定10分 → s_settings.sleepMinutesから計算する式に変更。
+// setup()でloadSettings()の後（＝実際に使うsleepMinutesが確定した後）に呼ぶこと。
+// マージンはv3.10_lora本番ファームと同じ考え方（起床後の活動時間をカバーする固定値）。
+static uint32_t computeWdtTimeoutMs() {
+  return (uint32_t)(s_settings.sleepMinutes + WDT_MARGIN_MINUTES) * 60UL * 1000UL;
+}
 
 static void wdtInit(uint32_t timeoutMs) {
   NRF_WDT->CONFIG  = (WDT_CONFIG_SLEEP_Run << WDT_CONFIG_SLEEP_Pos);
@@ -594,7 +602,7 @@ enum LoraRxState { LORA_WAIT_SYNC, LORA_WAIT_LEN, LORA_WAIT_BODY, LORA_WAIT_CKSU
 //   ・適用結果（成功／値域エラー／クランプ）をスプレッドシートまで返せる
 // ようになる。送信コストは適用時のみの約50ms(43mA)で、実質無視できる。
 //
-// レイアウト（7バイト。アップリンク(0x04)とは別のPktTypeなので既存の解析に影響しない）:
+// レイアウト（9バイト。アップリンク(0x04)とは別のPktTypeなので既存の解析に影響しない）:
 //   [0] PktType = 0x05
 //   [1] DeviceID
 //   [2] status（DL_STATUS_*）
@@ -602,10 +610,16 @@ enum LoraRxState { LORA_WAIT_SYNC, LORA_WAIT_LEN, LORA_WAIT_BODY, LORA_WAIT_CKSU
 //         ※ダウンリンク側のsleepMinutesと同じバイト順に揃えている
 //   [5] 実際に適用した平均回数
 //   [6] 実際に適用したメジアン回数
+//   [7-8] 適用後に有効になるWDTタイムアウト（分）uint16 ビッグエンディアン
+//         ★2026-08-10追加。WDTがsleepMinutesから計算式で正しく導出されているかを
+//         スプレッドシート側で確認できるようにするため（ヒューマンエラー対策の検証用）。
+//         送信間隔変更時は「再起動後に有効になる新しい値」、変更が無ければ「現在有効な値」。
 static const uint8_t DOWNLINK_ACK_PKT_TYPE = 0x05;
 
 static void sendDownlinkAck(uint8_t status, uint16_t sleepMin, uint8_t avg, uint8_t median) {
-  uint8_t ack[7];
+  uint16_t wdtMin = (uint16_t)(sleepMin + WDT_MARGIN_MINUTES);
+
+  uint8_t ack[9];
   ack[0] = DOWNLINK_ACK_PKT_TYPE;
   ack[1] = DEVICE_ID;
   ack[2] = status;
@@ -613,12 +627,15 @@ static void sendDownlinkAck(uint8_t status, uint16_t sleepMin, uint8_t avg, uint
   ack[4] = (uint8_t)(sleepMin & 0xFF);
   ack[5] = avg;
   ack[6] = median;
+  ack[7] = (uint8_t)(wdtMin >> 8);
+  ack[8] = (uint8_t)(wdtMin & 0xFF);
 
 #if DEBUG_MODE
   Serial.print("[DOWNLINK] 確認応答を送信: status="); Serial.print(status);
   Serial.print(" 適用値 間隔="); Serial.print(sleepMin);
   Serial.print("分 平均="); Serial.print(avg);
-  Serial.print(" メジアン="); Serial.println(median);
+  Serial.print(" メジアン="); Serial.print(median);
+  Serial.print(" WDT="); Serial.print(wdtMin); Serial.println("分");
 #endif
 
   statusSendGreen();
@@ -687,37 +704,30 @@ static bool applyDownlinkPayload(const uint8_t *payload, uint8_t len) {
 #endif
   }
 
-  // ★2026-08-09: 検証・クランプ・確認応答を追加。
+  // ★2026-08-09: 検証・確認応答を追加。2026-08-10: クランプを撤去。
   // 「要求値をそのまま適用できたか」をstatusで区別してGatewayへ返し、
   // スプレッドシートまで結果が届くようにする。
   uint8_t status = DL_STATUS_OK;
+  bool sleepChanged = false;  // trueならWDT再計算のため確認応答後に自ら再起動する
 
   if (flags & DL_FLAG_SLEEP_MIN) {
     uint16_t newSleepMin = ((uint16_t)payload[11] << 8) | payload[12];
-    if (newSleepMin == 0) {
+    if (newSleepMin == 0 || newSleepMin > 1440) {
       status = DL_STATUS_RANGE_ERROR;
 #if DEBUG_MODE
-      Serial.println("[DOWNLINK] 値域エラー: 送信間隔が0です");
+      Serial.println("[DOWNLINK] 値域エラー: 送信間隔は1〜1440分の範囲で指定してください");
 #endif
-    } else {
-      if (newSleepMin > DL_MAX_SLEEP_MINUTES) {
-        // WDTタイムアウトを超えるスリープは無限リブートを招くため上限で頭打ちにする
-        // （拒否ではなく丸めて適用し、実際の値をGatewayへ返す）
+    } else if (newSleepMin != s_settings.sleepMinutes) {
+      // ★WDTタイムアウトの上限によるクランプは行わない。setup()が
+      //   computeWdtTimeoutMs()でs_settings.sleepMinutesから毎回タイムアウトを
+      //   算出し直すため、値を保存→確認応答→自ら再起動すれば、次の起動時に
+      //   新しい間隔に対して安全なWDTが自動的に張られる。
+      s_settings.sleepMinutes = newSleepMin;
+      changed = true;
+      sleepChanged = true;
 #if DEBUG_MODE
-        Serial.print("[DOWNLINK] 送信間隔"); Serial.print(newSleepMin);
-        Serial.print("分はWDT制約の上限"); Serial.print(DL_MAX_SLEEP_MINUTES);
-        Serial.println("分を超えるため、上限値へ丸めます");
+      Serial.print("[DOWNLINK] 送信頻度を変更: "); Serial.print(newSleepMin); Serial.println("分");
 #endif
-        newSleepMin = DL_MAX_SLEEP_MINUTES;
-        status = DL_STATUS_CLAMPED;
-      }
-      if (newSleepMin != s_settings.sleepMinutes) {
-        s_settings.sleepMinutes = newSleepMin;
-        changed = true;
-#if DEBUG_MODE
-        Serial.print("[DOWNLINK] 送信頻度を変更: "); Serial.print(newSleepMin); Serial.println("分");
-#endif
-      }
     }
   }
 
@@ -750,6 +760,20 @@ static bool applyDownlinkPayload(const uint8_t *payload, uint8_t len) {
   // 既に要求と同じ設定だった場合（changed==false）も、子機は要求された状態にあるので
   // Gatewayにとっては成功であり、ここで返さないと永久に再試行され続けてしまう。
   sendDownlinkAck(status, s_settings.sleepMinutes, s_settings.samplesPerAvg, s_settings.measureCount);
+
+  // ★2026-08-10追加: 送信間隔が変わった場合は確認応答を送った"あとで"自ら再起動する。
+  // nRF52のWDTは一度START すると再設定できないため、新しい間隔に対して安全な
+  // WDTタイムアウトを張り直すには再起動を挟むしかない。確認応答の送信(loraSendFrame
+  // 内のSerial1.flush())が完了してから再起動すること（先に再起動すると応答が
+  // 届かずGatewayが再試行を続けてしまう）。
+  if (sleepChanged) {
+#if DEBUG_MODE
+    Serial.println("[DOWNLINK] 送信間隔が変わったためWDTを再設定します。再起動します...");
+    Serial.flush();
+#endif
+    delay(100);  // 確認応答のUART送出が完了する猶予
+    NVIC_SystemReset();
+  }
 
   return true;
 }
@@ -991,7 +1015,12 @@ static bool peripheralsBegin() {
 }
 
 void setup() {
-  wdtInit(WDT_TIMEOUT_MS);
+  // ★2026-08-10: wdtInit()はloadSettings()の"後"に呼ぶよう順序を変更。
+  // WDTのタイムアウトはs_settings.sleepMinutesから計算するため、実際に使う値が
+  // 確定してからでないと正しいタイムアウトを算出できない。nRF52のWDTは一度START
+  // すると再設定できないため、この起動シーケンス内で2回計算し直すことはできない
+  // （＝1回で正しい値を出す必要がある）。boot直後の数秒間（RGB点灯・デバッグ表示）は
+  // WDT保護が効かない状態になるが、固定の短い区間なのでハングのリスクは実質無い。
 
   rgbHwBegin();
   statusBootBlue();
@@ -1008,6 +1037,12 @@ void setup() {
 #endif
 
   loadSettings();
+  wdtInit(computeWdtTimeoutMs());
+#if DEBUG_MODE
+  Serial.print("[WDT] タイムアウト="); Serial.print(s_settings.sleepMinutes + WDT_MARGIN_MINUTES);
+  Serial.println("分で起動しました");
+#endif
+
   peripheralsBegin();
   loraUartBegin();
 

@@ -100,7 +100,7 @@ using namespace Adafruit_LittleFS_Namespace;
 // ============================================================
 #ifdef COMM_MODE_BLE
 static const uint8_t  DEVICE_ID           = 0x01;  // 子機 ID（複数台時は変える: 0x01〜0xFF）
-static const uint8_t  FW_VERSION          = 3;     // 子機ファームのバージョン。コミットのたびに+1すること
+static const uint8_t  FW_VERSION          = 4;     // 子機ファームのバージョン。コミットのたびに+1すること
 static const uint32_t MEASURE_INTERVAL_MIN = 20;   // 計測間隔（分）
 static const uint32_t ADV_DURATION_MIN     = 10;   // アドバタイズ継続時間（分）
 static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のときアドバタイズ
@@ -118,7 +118,7 @@ static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のとき
 // ============================================================
 #ifdef COMM_MODE_LORA
 static const uint8_t  DEVICE_ID  = 0x0E;  // 子機 ID（iPEC実機テスト用。Gateway側 01_http_post の TARGET_DEVICE_ID と一致させること）
-static const uint8_t  FW_VERSION = 9;     // 子機ファームのバージョン。コミットのたびに+1すること
+static const uint8_t  FW_VERSION = 10;    // 子機ファームのバージョン。コミットのたびに+1すること
 #endif
 
 // ============================================================
@@ -511,7 +511,18 @@ static int32_t loraSleepJitterSeconds(uint16_t jitterMaxSec) {
 // これによりタイムアウトは「スリープ時間」「活動時間」の長い方だけを
 // 超える値であればよい（合計値をカバーする必要はない）。
 // ============================================================
-static uint32_t const WDT_TIMEOUT_MS = 130UL * 60UL * 1000UL;  // 130分（VL53L4CD 2段メジアン化で計測時間が最大約10分に伸びたため余裕を持たせた値）
+// ★2026-08-10: WDT_TIMEOUT_MSをSLEEP_MINUTESから自動計算する式に変更。
+//
+// 【経緯】これまでSLEEP_MINUTESとWDT_TIMEOUT_MSは別々の定数として手書きしており、
+// 送信間隔だけ変更してWDTを変え忘れるヒューマンエラーが複数回発生していた
+// （2026-08-07、gateway_v1.1で実際に無限リブートを起こして発覚。CLAUDE.md §7参照）。
+// WDTを送信間隔からの計算式で導出することで、この食い違いを構造的に起こせなくする。
+//
+// マージンはスリープ時間そのものではなく「起床後の活動時間（測定・LoRa送受信等）」を
+// カバーするためのもの。旧値は+10分（VL53L4CD 2段メジアン化で計測時間が最大約10分に
+// 伸びたため）だったが、+15分に広げて余裕を持たせる。
+#define WDT_MARGIN_MINUTES 15
+static uint32_t const WDT_TIMEOUT_MS = (SLEEP_MINUTES + WDT_MARGIN_MINUTES) * 60UL * 1000UL;
 
 static void wdtInit(uint32_t timeoutMs) {
   NRF_WDT->CONFIG  = (WDT_CONFIG_SLEEP_Run << WDT_CONFIG_SLEEP_Pos);  // スリープ中も継続動作

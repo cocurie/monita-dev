@@ -43,6 +43,15 @@ static int const LORA_M0M1_PIN = 2;  // D2: E220 M0・M1 共通駆動
 #define LORA_MODE_SWITCH_DELAY_MS 100U
 #define MAX_PAYLOAD 24
 
+// ★2026-08-07追加（切り分け用）: 1 にすると受信と並行して定期的にPINGを送信する。
+//   Flex基板が1台しかなく「Gatewayの送信」と「Flexの受信」の検証が循環していたため、
+//   受信が実証済みのこのスケッチに送信だけを足して双方向テストできるようにした。
+//   相手は 18_lora_child（RX_DUMP_ENABLED=1 で受信バイトをダンプするようにしたもの）。
+//   Flex側に [RX raw] が出ればGatewayの送信は電波に乗っている＝Flexの受信も生きている。
+//   切り分けが済んだら 0 に戻してよい。
+#define TX_PING_ENABLED   1
+#define TX_PING_INTERVAL_MS 3000UL
+
 static const uint8_t TARGET_DEVICE_ID = 0x0E;  // このDeviceIDのフレームのみ表示する
 
 // UARTE1（第2ハードウェアUART）をRX専用として使う。gateway_v1.1と同じ構成。
@@ -321,10 +330,38 @@ void setup() {
   s_lastStatsMs = millis();
 }
 
+#if TX_PING_ENABLED
+// Flex側(18_lora_child, RX_DUMP_ENABLED=1)で [RX raw] として見えるはずの
+// 分かりやすいマーカー列を送る。フレーム形式は問わない（届いたかどうかだけ見る）。
+static uint32_t s_lastPingMs = 0;
+static uint32_t s_pingCount  = 0;
+
+static void sendPing() {
+  s_pingCount++;
+  const uint8_t ping[8] = {0xAA, 0x06, 'P', 'I', 'N', 'G', 0x00, 0x55};
+
+  loraModeNormal();  // 念のためNormal（透過送受信）モードを確定させる
+  loraSerial.write(ping, sizeof(ping));
+  loraSerial.flush();
+
+  Serial.print(F("[TX PING] #"));
+  Serial.print(s_pingCount);
+  Serial.println(F("  (Flex側に [RX raw] が出れば送信成功)"));
+}
+#endif
+
 void loop() {
   loraPoll();
 
   uint32_t now = millis();
+
+#if TX_PING_ENABLED
+  if (now - s_lastPingMs >= TX_PING_INTERVAL_MS) {
+    s_lastPingMs = now;
+    sendPing();
+  }
+#endif
+
   if (now - s_lastStatsMs >= STATS_INTERVAL_MS) {
     s_lastStatsMs = now;
     printStats();

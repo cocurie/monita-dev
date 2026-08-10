@@ -40,6 +40,14 @@
 #define LORA_BAUD   9600
 #define SEND_INTERVAL_MS 2000UL
 
+// ★2026-08-07追加（切り分け用）: 1 にすると送信の合間に受信バイトをそのままダンプする。
+//   Flex基板が1台しかなく「Gatewayの送信」と「Flexの受信」の検証が循環していたため、
+//   送信が実証済みのこのスケッチに受信ダンプだけを足して双方向テストできるようにした。
+//   相手は 19_lora_parent（TX_PING_ENABLED=1 で定期送信するようにしたもの）。
+//   切り分けが済んだら 0 に戻してよい。
+#define RX_DUMP_ENABLED 1
+static uint32_t s_rxDumpBytes = 0;
+
 // D10 = MOSFET_GATE → 3V3_SW ON/OFF（HIGHで周辺レール給電。本番 v3.10_lora/main.cpp と同一）
 // ★これをONにしないとTCA9534・E220に電源が入らず、Wire（I2C）アクセスが
 //   応答なしのまま永久にハングする（Adafruit nRF52コアのWireはタイムアウトを
@@ -304,5 +312,28 @@ void loop() {
     Serial.print(F(" CH=")); for (int i = 0; i < 4; i++) { Serial.print(ch[i]); Serial.print(' '); }
     Serial.println();
   }
+
+#if RX_DUMP_ENABLED
+  // ★2026-08-07追加: 送信の合間に受信バイトをそのままダンプする（切り分け用）。
+  //
+  // 【なぜこのスケッチに足すのか】
+  //   Flex基板が1台しかないため、「Gatewayの送信」と「Flexの受信」を
+  //   別々に検証できず切り分けが循環していた。このスケッチは
+  //   「Flexからの送信が確実に電波に乗る」ことが実証済みなので、
+  //   ここに受信ダンプだけを足せば、Gateway側(19_lora_parent + TX追加)が
+  //   受信できているかを見ながら、同時にFlexの受信可否も確認できる。
+  //   フレーム解析はせず生バイトをそのまま出す（届いてさえいれば必ず見える）。
+  while (Serial1.available()) {
+    uint8_t b = (uint8_t)Serial1.read();
+    s_rxDumpBytes++;
+    Serial.print(F("[RX raw] 0x"));
+    if (b < 0x10) Serial.print('0');
+    Serial.print(b, HEX);
+    Serial.print(F("  (累計="));
+    Serial.print(s_rxDumpBytes);
+    Serial.println(F(")"));
+  }
+#endif
+
   yield();
 }
