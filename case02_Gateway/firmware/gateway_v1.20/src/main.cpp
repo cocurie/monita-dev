@@ -224,7 +224,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 83;
+static uint8_t  const GATEWAY_FW_VERSION = 87;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -863,6 +863,15 @@ static bool waitHttpToFsIdle(int maxWaitMs) {
 
 // モデム内部のHTTP/ファイル系リソース不調からの段階的復旧。
 static int s_fsFailStreak = 0;
+static int s_lastHttpStatus = 0;  // 直近のhttpGetViaFs()が受けたHTTPステータス（切り分け用）
+
+// ★2026-08-10: GAS取得の成功率を実測するためのカウンタ。
+// GASの応答はchunked（Content-Lengthなし）で、モジュールが本文長を決められず
+// 「status=200 len=0」になることが断続的に起こる。一方Content-Length付きのURLは
+// 今のところ失敗していない。リトライで吸収できる水準なのか、取得元を
+// Content-Lengthが付く場所へ移す必要があるのかを、推測ではなく実測で判断する。
+static uint32_t s_gasFetchTry = 0;
+static uint32_t s_gasFetchOk  = 0;
 static void recoverHttpStack() {
   if (s_fsFailStreak == 3) {
     Serial.println(F("[GAS] 復旧: PDPコンテキストを張り直します"));
@@ -912,8 +921,11 @@ static String httpGetViaFs(const String& url, bool wantBody) {
       dataLen = t.substring(c1 + 1, e).toInt();
     }
   }
+  s_lastHttpStatus = statusCode;
   Serial.print(F("[GAS] HTTPTOFS status=")); Serial.print(statusCode);
   Serial.print(F(" len=")); Serial.println(dataLen);
+
+  if (wantBody) s_gasFetchTry++;
 
   if (statusCode != 200 || (wantBody && dataLen <= 0)) {
     Serial.print(F("[DEBUG] HTTPTOFS raw=[")); Serial.print(res); Serial.println(F("]"));
@@ -922,6 +934,7 @@ static String httpGetViaFs(const String& url, bool wantBody) {
     return "";
   }
   s_fsFailStreak = 0;
+  if (wantBody) s_gasFetchOk++;
   if (!wantBody) return "ok";
 
   // ★AT+HTTPTOFSは非同期。+HTTPTOFS URCが返った時点ではファイル書き込みが
@@ -3039,9 +3052,19 @@ static uint32_t lastSend = 0;
 //   アプリ層WDT(computeAppWdtMs)との整合は従来のまま保たれる。
 #define DOWNLINK_E2E_TEST 1
 
-// ★切り分け用（2026-08-10）。起動時に1回だけ、Content-Lengthが付く固定URLを取得して
-//   モデム・回線が本文を取得できる状態かを確認する。確認が済んだら0に戻すこと。
-#define PROBE_CONTENT_LENGTH_URL 1
+// ★切り分け用（2026-08-10、役目を終えたので0）。起動時に1回だけ、Content-Lengthが付く
+//   固定URLを取得して、モデム・回線が本文を取得できる状態かを確認する。
+//
+// 【この確認で分かったこと】GAS取得が「status=200 len=0」で失敗し続けた時間帯でも、
+// Content-Length付きのURL（www.google.com/robots.txt 6624B、humans.txt 286B）は
+// 同一ホスト・同一タイミングで確実に取得できた。つまり電源・回線・本文サイズは要因では
+// なく、GASのchunked応答（Content-Lengthなし）をモジュールが安定して扱えないのが原因。
+// ただし「必ず失敗する」ではなく「不安定」で、定常状態の実測は約79%（3時間強の運転で
+// 26/33）。予約確認のサイクル単位では14回中14回とも、リトライを含めて取得できている
+// （最悪でモデム再起動を挟んで2分19秒）。したがってリトライで吸収できると判断し、
+// 取得元をContent-Lengthが付く場所へ移す構成変更は見送った。
+// 同種の切り分けが再び必要になったら1に戻す。
+#define PROBE_CONTENT_LENGTH_URL 0
 
 #if DOWNLINK_E2E_TEST
 #define CMD_CHECK_INTERVAL_MS (3UL * 60UL * 1000UL)    // 【テスト用】3分
@@ -3546,17 +3569,33 @@ void setup() {
   //   失敗する → モデムまたは回線が本文を取得できない状態。chunkedとは別の問題。
   //   確認が済んだらPROBE_CONTENT_LENGTH_URLを0に戻すこと。
   if (netOk) {
-    Serial.println(F("\n===== Content-Length付きURLの取得テスト ====="));
-    String probe = httpGetViaFs("https://www.google.com/robots.txt", true);
-    Serial.print(F("[PROBE] 取得バイト数=")); Serial.println(probe.length());
-    if (probe.length() > 0) {
-      Serial.print(F("[PROBE] ★成功。先頭: "));
-      Serial.println(probe.substring(0, 40));
-      Serial.println(F("[PROBE] → モデム・回線は正常。GASのchunked応答が扱えないのが原因"));
+    // ★対照実験（2026-08-10）。同一ホスト(www.google.com)で条件を1つずつ変えて比較する。
+    //   A: Content-Lengthあり・大(6624B)
+    //   B: Content-Lengthあり・小(286B)   ← 本文サイズの影響を切り分けるため
+    //   C: 本編のGAS取得（chunked・671B）  ← このあと実行される
+    //   AとBが成功してCだけ失敗するなら、ホスト・TLS・本文サイズは要因から外れ、
+    //   残る違いは応答形式（chunked）だけになる。
+    //   ※前回 example.com で試したときは status=601（Network Error）で、そもそも
+    //     到達できておらず対照にならなかった。同一ホストに揃えたのはそのため。
+    Serial.println(F("\n===== 応答形式の対照テスト ====="));
+
+    String probeA = httpGetViaFs("https://www.google.com/robots.txt", true);
+    int statusA = s_lastHttpStatus;
+    Serial.print(F("[PROBE] A: Content-Lengthあり(6624B) status=")); Serial.print(statusA);
+    Serial.print(F(" 取得=")); Serial.println(probeA.length());
+
+    String probeB = httpGetViaFs("https://www.google.com/humans.txt", true);
+    int statusB = s_lastHttpStatus;
+    Serial.print(F("[PROBE] B: Content-Lengthあり(286B)  status=")); Serial.print(statusB);
+    Serial.print(F(" 取得=")); Serial.println(probeB.length());
+
+    if (probeA.length() > 0 && probeB.length() > 0) {
+      Serial.println(F("[PROBE] Content-Length付きは大小とも取得できる"));
+      Serial.println(F("[PROBE] → このあとのGAS取得(chunked)が失敗するなら、応答形式が要因"));
     } else {
-      Serial.println(F("[PROBE] 失敗 → chunkedとは別の問題（モデムまたは回線側）"));
+      Serial.println(F("[PROBE] Content-Length付きでも失敗 → 応答形式とは別の問題"));
     }
-    Serial.println(F("==========================================\n"));
+    Serial.println(F("=================================\n"));
   }
 #endif
 
@@ -3645,7 +3684,9 @@ void loop() {
   //     更新し合うので二重に走ることはない。
   if (now - lastCmdCheck >= CMD_CHECK_INTERVAL_MS) {
     lastCmdCheck = now;
-    Serial.println(F("\n=== ダウンリンク予約の確認 ==="));
+    Serial.print(F("\n=== ダウンリンク予約の確認（本文取得の累計 "));
+    Serial.print(s_gasFetchOk); Serial.print(F("/")); Serial.print(s_gasFetchTry);
+    Serial.println(F(" 成功） ==="));
     if (ensureNetworkReady()) {
       checkRemoteCmd();
       processReportQueue();
