@@ -27,6 +27,8 @@
 //     - v5: LoRaダウンリンク（Class A + 確認応答方式）のリモート制御機能を追加（2026-08-09〜10）
 //       check_downlinks / downlink_sent / downlink_result アクション、cmd_status・downlink_logシート、
 //       Gateway操作/Flex操作メニュー
+//     - v7: 子機データ用シート(child_XX)を自動作成するようにした（2026-08-10）。
+//       従来はシートが無いとデータを黙って捨てていた（送信側は成功に見えるため気づけない）
 //     - v6: check_cmd に dl=1 パラメータを追加（2026-08-10）。本番Gateway(v1.20)への統合用。
 //       dl=1 のときだけ応答を複数行化し、2行目以降にダウンリンク予約を返す。
 //       dl未指定なら従来とまったく同じ1行応答（gateway_v1.1はこちら）。
@@ -881,6 +883,29 @@ function getDeviceSheetNameByMac(ss, mac) {
   return null;  // 登録されていないMACは無視
 }
 
+// 子機データ用シートを取得する。無ければ作成して見出し行を付ける。
+// ★2026-08-10追加。従来はシートが存在しないとデータを黙って捨てていた
+//   （Gatewayは送信成功、GASも302を返すため、送信側のログからは気づけない）。
+//   LoRa子機は getDeviceSheetNameByMac() が 'child_<HEX>' を自動で決めるので、
+//   台数を増やすたびに手でシートを作る運用は現実的でない。
+function getOrCreateDeviceSheet_(ss, sheetName) {
+  var sheet = ss.getSheetByName(sheetName);
+  if (sheet) return sheet;
+
+  sheet = ss.insertSheet(sheetName);
+  // databoxと同じ16列構成に揃える（列の意味はファイル冒頭「スプレッドシート列構成」参照）
+  sheet.appendRow([
+    '受信日時', 'DeviceID', '温度(℃)',
+    'CH1 メジアン(με)', 'CH2 メジアン(με)', 'CH3 メジアン(με)', 'CH4 メジアン(με)',
+    'CH1 Max(με)', 'CH1 Min(με)', 'CH2 Max(με)', 'CH2 Min(με)',
+    'CH3 Max(με)', 'CH3 Min(με)', 'CH4 Max(με)', 'CH4 Min(με)',
+    'LTE-M RSSI(CSQ)',
+  ]);
+  sheet.setFrozenRows(1);
+  console.log('子機シートを新規作成しました: ' + sheetName);
+  return sheet;
+}
+
 
 // ================================
 // Webhook 受信本体（GET）
@@ -1132,7 +1157,14 @@ function doGet(e) {
 
       // DeviceID → シート名（「シート名編集」シートで紐付け。未登録は 'databox' へ）
       var sheetName = getDeviceSheetNameByMac(ss, mac) || 'databox';
-      var sheet = ss.getSheetByName(sheetName);
+      // ★子機シート(child_XX)は無ければ自動作成する。databox等の既存シートを取り違えて
+      //   作ってしまわないよう、自動作成の対象は 'child_' で始まる名前だけに限定する。
+      var sheet;
+      if (sheetName.indexOf('child_') === 0) {
+        sheet = getOrCreateDeviceSheet_(ss, sheetName);
+      } else {
+        sheet = ss.getSheetByName(sheetName);
+      }
       if (!sheet) {
         console.log('シートが見つかりません: ' + sheetName);
         continue;

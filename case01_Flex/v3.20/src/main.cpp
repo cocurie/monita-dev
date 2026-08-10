@@ -127,7 +127,18 @@ static const uint8_t  FW_VERSION = 11;    // 子機ファームのバージョ�
 
 // USB Serial デバッグログは常時有効（USB未接続時は write() が即座に破棄されるため
 // 消費電力への影響はない）。
+// ★★★ 通しテスト用スイッチ（2026-08-10） ★★★
+// ダウンリンクの通し確認（スプレッドシート指示 → 結果表示まで）を8分以内に収めるため、
+// テスト中だけ送信間隔を短くする。本番運用に戻すときは 0 にすること。
+// ※WDTは送信間隔から自動計算されるため、ここを変えてもWDT側の修正は不要
+//   （computeWdtTimeoutMs()。CLAUDE.md §7のヒューマンエラー対策）。
+#define DOWNLINK_E2E_TEST 1
+
+#if DOWNLINK_E2E_TEST
+#define SLEEP_MINUTES        2         // 【テスト用】1サイクル後のスリープ時間（分）
+#else
 #define SLEEP_MINUTES        120       // 1サイクル後のスリープ時間（分）
+#endif
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 // ── タレ（ゼロ点補正）操作 ─────────────────────────────────────
 // 【操作方法】D0 のタクトスイッチを押しながら電源スイッチ(S1)を ON にし、
@@ -566,7 +577,10 @@ static ChildSettings s_settings = {
 #endif
 
 #ifdef COMM_MODE_LORA
-static const char SETTINGS_FILE[] = "/child_settings.bin";
+// ★ファイル名は検証用テストスケッチ(25_lora_downlink_child)の"/child_settings.bin"と
+//   意図的に分けている。同じ基板に両方を書き込むことがあるため、同名だと相手の保存内容を
+//   読んでしまう危険がある（SETTINGS_VERSIONが偶然一致すると検出できない）。
+static const char SETTINGS_FILE[] = "/flex_settings.bin";
 
 static void saveSettings() {
   if (!InternalFS.begin()) return;
