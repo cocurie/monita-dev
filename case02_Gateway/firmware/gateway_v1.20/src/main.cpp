@@ -219,7 +219,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 76;
+static uint8_t  const GATEWAY_FW_VERSION = 77;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -998,6 +998,242 @@ void sendLogDumpToGAS() {
   Serial.println(ok ? F(" → GASへ送信成功") : F(" → GASへ送信失敗"));
 }
 
+// ══════════════════════════════════════════════
+// LoRaダウンリンク（Class A + 確認応答方式。★v1.20で追加）
+// ══════════════════════════════════════════════
+// 【全体像】スプレッドシート → GAS → Gateway → LoRa → 子機(Flex v3.20) の順に設定変更を
+// 届け、子機からの確認応答を逆順で返す。設計・実機検証の経緯は
+// case02_Gateway/test_sketches/03_lora_downlink_sender を参照。
+//
+// 【なぜキャッシュが要るか】子機は省電力のため、自分がアップリンクを送った直後の
+// 2秒間しか受信できない。その2秒の間にGASへHTTPSで問い合わせる（数秒〜数十秒かかる）
+// ことは不可能なので、Gatewayは事前に「どの子機に何を送るか」をローカルに持っておき、
+// アップリンクを受けた瞬間にネットワークを介さず即座にLoRa送信する。
+// 予約の取得はcheckRemoteCmd()の応答に相乗りしている（HTTPリクエストを増やさないため）。
+//
+// 【送りっぱなしにしない】送信しただけでは予約を消さず、子機からの確認フレーム
+// (PktType 0x05)を受けて初めて完了とする。取りこぼしても失われず、子機の次サイクルで
+// 自動的に再試行される。規定回数試しても確認が返らなければ未達としてGASへ報告する。
+#ifdef COMM_MODE_LORA
+
+#define MAX_PENDING_CHILDREN   14   // 子機DeviceID 0x01〜0x0E
+#define DOWNLINK_MAX_ATTEMPTS  3    // この回数送っても確認が返らなければ未達として打ち切る
+
+// ダウンリンク結果のステータスコード（子機ファーム・GASと一致させること）
+#define DL_STATUS_OK          0
+#define DL_STATUS_RANGE_ERROR 1
+#define DL_STATUS_CLAMPED     2
+#define DL_STATUS_NO_ACK      99   // Gateway自身が付ける「未達」
+
+struct PendingDownlink {
+  bool     active;
+  uint8_t  childId;
+  uint16_t sleepMin;
+  uint8_t  avg;
+  uint8_t  median;
+  uint8_t  attempts;
+  uint32_t seq;         // 予約の通し番号。報告に含めてGAS側で新旧を判別させる
+  bool     statusOnly;  // trueなら設定変更フラグを立てずに送る（ステータス確認）
+};
+static PendingDownlink s_pending[MAX_PENDING_CHILDREN];
+
+// GASへの報告キュー。
+// ★loraPoll()はsendAT()の待機ループからも呼ばれるため、その中で直接HTTPS通信を
+//   始めると再帰的にAT通信が入れ子になって破綻する。受信処理では「キューに積む」だけにし、
+//   実際の送信はloop()の安全な場所で行う。
+struct DownlinkReport {
+  bool     used;
+  bool     finalResult;  // true=downlink_result（最終）/ false=downlink_sent（中間報告）
+  uint8_t  childId;
+  uint8_t  status;
+  uint16_t sleepMin;
+  uint8_t  avg;
+  uint8_t  median;
+  uint8_t  attempts;
+  uint32_t seq;
+  uint16_t wdtMin;  // 子機の確認応答に載る、適用後に有効になるWDTタイムアウト（分）
+};
+#define MAX_REPORTS 8
+static DownlinkReport s_reports[MAX_REPORTS];
+
+static void queueReport(bool finalResult, uint8_t childId, uint8_t status,
+                        uint16_t sleepMin, uint8_t avg, uint8_t median,
+                        uint8_t attempts, uint32_t seq, uint16_t wdtMin = 0) {
+  for (int i = 0; i < MAX_REPORTS; i++) {
+    if (s_reports[i].used) continue;
+    s_reports[i].used        = true;
+    s_reports[i].finalResult = finalResult;
+    s_reports[i].childId     = childId;
+    s_reports[i].status      = status;
+    s_reports[i].sleepMin    = sleepMin;
+    s_reports[i].avg         = avg;
+    s_reports[i].median      = median;
+    s_reports[i].attempts    = attempts;
+    s_reports[i].seq         = seq;
+    s_reports[i].wdtMin      = wdtMin;
+    return;
+  }
+  Serial.println(F("[REPORT] キューが満杯のため報告を破棄しました"));
+}
+
+// ★「実際に送信したダウンリンク」の控え。
+//
+// 【なぜ必要か】確認応答を受けた時点でs_pending[]を見てseqを決めていたところ、
+// 送信してから応答が返るまでの間にキャッシュ更新が走って新しい予約(seq)へ
+// 入れ替わっていると、古い応答を新しい予約の完了として報告してしまう。
+// 実機で「seq=7を送信 → キャッシュがseq=8に更新 → seq=7の応答をseq=8として報告」が発生し、
+// 一度も送信していないseq=8が完了扱いで消えた。送信時点の内容をここに控えて突き合わせる。
+struct SentDownlink {
+  bool     valid;
+  uint8_t  childId;
+  uint8_t  attempts;
+  uint32_t seq;
+};
+static SentDownlink s_lastSent[MAX_PENDING_CHILDREN];
+
+static SentDownlink* findLastSent(uint8_t childId) {
+  for (int i = 0; i < MAX_PENDING_CHILDREN; i++) {
+    if (s_lastSent[i].valid && s_lastSent[i].childId == childId) return &s_lastSent[i];
+  }
+  return nullptr;
+}
+
+static void recordSent(uint8_t childId, uint8_t attempts, uint32_t seq) {
+  SentDownlink* e = findLastSent(childId);
+  if (e == nullptr) {
+    for (int i = 0; i < MAX_PENDING_CHILDREN; i++) {
+      if (!s_lastSent[i].valid) { e = &s_lastSent[i]; break; }
+    }
+  }
+  if (e == nullptr) return;
+  e->valid    = true;
+  e->childId  = childId;
+  e->attempts = attempts;
+  e->seq      = seq;
+}
+
+static PendingDownlink* findPending(uint8_t childId) {
+  for (int i = 0; i < MAX_PENDING_CHILDREN; i++) {
+    if (s_pending[i].active && s_pending[i].childId == childId) return &s_pending[i];
+  }
+  return nullptr;
+}
+
+// check_cmdの応答2行目以降（"HEX2:sleepMin:avg:median:attempts:seq:mode"）を
+// 予約キャッシュへ取り込む。bodyは応答全文（1行目のコマンドを含む）。
+// ★キャッシュは毎回作り直す。GAS側が正なので、消えた予約はここで自動的に落ちる。
+static void applyDownlinkCache(const String& body) {
+  for (int i = 0; i < MAX_PENDING_CHILDREN; i++) s_pending[i].active = false;
+
+  int slot = 0;
+  int from = body.indexOf('\n');           // 1行目（コマンド）は読み飛ばす
+  if (from < 0) {
+    Serial.println(F("[CACHE] 保留中のダウンリンク予約はありません"));
+    return;
+  }
+  from++;
+
+  while (from < (int)body.length() && slot < MAX_PENDING_CHILDREN) {
+    int nl = body.indexOf('\n', from);
+    String line = (nl < 0) ? body.substring(from) : body.substring(from, nl);
+    from = (nl < 0) ? body.length() : nl + 1;
+    line.trim();
+    if (line.length() == 0) continue;
+
+    // ':'の位置を6個探す（7フィールド）
+    int pos[6];
+    int found = 0, scan = 0;
+    while (found < 6) {
+      int c = line.indexOf(':', scan);
+      if (c < 0) break;
+      pos[found++] = c;
+      scan = c + 1;
+    }
+    if (found < 6) {
+      Serial.print(F("[CACHE] 書式不正のため無視: ")); Serial.println(line);
+      continue;
+    }
+
+    uint8_t  childId    = (uint8_t)strtoul(line.substring(0, pos[0]).c_str(), nullptr, 16);
+    uint16_t sleepMin   = (uint16_t)line.substring(pos[0] + 1, pos[1]).toInt();
+    uint8_t  avg        = (uint8_t)line.substring(pos[1] + 1, pos[2]).toInt();
+    uint8_t  median     = (uint8_t)line.substring(pos[2] + 1, pos[3]).toInt();
+    uint8_t  attempts   = (uint8_t)line.substring(pos[3] + 1, pos[4]).toInt();
+    uint32_t seq        = (uint32_t)line.substring(pos[4] + 1, pos[5]).toInt();
+    bool     statusOnly = line.substring(pos[5] + 1).toInt() != 0;
+
+    // ★ステータス確認(statusOnly)はsleep/avg/medianを使わない（GAS側は0を送ってくる）ので
+    //   値域チェックの対象外にする。通常の設定変更だけ範囲を検証する。
+    if (childId == 0 ||
+        (!statusOnly && (sleepMin < 1 || sleepMin > 1440 || avg < 1 || median < 1))) {
+      Serial.print(F("[CACHE] 値が範囲外のため無視: ")); Serial.println(line);
+      continue;
+    }
+
+    s_pending[slot].active     = true;
+    s_pending[slot].childId    = childId;
+    s_pending[slot].sleepMin   = sleepMin;
+    s_pending[slot].avg        = avg;
+    s_pending[slot].median     = median;
+    s_pending[slot].attempts   = attempts;  // ★GAS側が正（Gatewayが再起動しても引き継がれる）
+    s_pending[slot].seq        = seq;
+    s_pending[slot].statusOnly = statusOnly;
+    slot++;
+
+    Serial.print(F("[CACHE] 予約: 子機0x")); Serial.print(childId, HEX);
+    if (statusOnly) Serial.print(F(" ステータス確認のみ"));
+    Serial.print(F(" 間隔=")); Serial.print(sleepMin);
+    Serial.print(F("分 平均=")); Serial.print(avg);
+    Serial.print(F(" メジアン=")); Serial.print(median);
+    Serial.print(F(" 試行済=")); Serial.print(attempts);
+    Serial.print(F(" seq=")); Serial.println(seq);
+  }
+  Serial.print(F("[CACHE] 有効な予約 ")); Serial.print(slot); Serial.println(F(" 件を保持しました"));
+}
+
+// 溜まった報告をGASへ送る。★loop()の安全な場所からのみ呼ぶこと
+// （loraPoll()の中から呼ぶとAT通信が入れ子になって破綻する）。
+static void processReportQueue() {
+  for (int i = 0; i < MAX_REPORTS; i++) {
+    if (!s_reports[i].used) continue;
+
+    // GAS側は child を大文字16進2桁で判定する（/^[0-9A-F]{2}$/）ため、ここで整形する
+    char childHex[3];
+    snprintf(childHex, sizeof(childHex), "%02X", s_reports[i].childId);
+
+    String q;
+    if (s_reports[i].finalResult) {
+      q  = "action=downlink_result&child="; q += childHex;
+      q += "&status=";   q += String(s_reports[i].status);
+      q += "&sleep=";    q += String(s_reports[i].sleepMin);
+      q += "&avg=";      q += String(s_reports[i].avg);
+      q += "&median=";   q += String(s_reports[i].median);
+      q += "&attempts="; q += String(s_reports[i].attempts);
+      q += "&seq=";      q += String(s_reports[i].seq);
+      q += "&wdt=";      q += String(s_reports[i].wdtMin);
+    } else {
+      q  = "action=downlink_sent&child="; q += childHex;
+      q += "&attempts="; q += String(s_reports[i].attempts);
+      q += "&seq=";      q += String(s_reports[i].seq);
+    }
+
+    Serial.print(F("[REPORT] GASへ報告: ")); Serial.println(q);
+    if (postToGAS(q)) {
+      s_reports[i].used = false;
+    } else {
+      Serial.println(F("[REPORT] 報告に失敗。次サイクルで再送します"));
+      return;  // 通信不調とみなし、残りは次回に回す
+    }
+  }
+}
+
+static bool hasQueuedReports() {
+  for (int i = 0; i < MAX_REPORTS; i++) if (s_reports[i].used) return true;
+  return false;
+}
+
+#endif  // COMM_MODE_LORA
+
 void checkRemoteCmd() {
   if (!gasConnect()) return;
 
@@ -1005,6 +1241,12 @@ void checkRemoteCmd() {
   path += GAS_SCRIPT_ID;
   path += "?action=check_cmd&device_id=";
   path += GW_DEVICE_ID;
+#ifdef COMM_MODE_LORA
+  // ★v1.20: dl=1 を付けると、応答の2行目以降にLoRaダウンリンクの予約が相乗りしてくる。
+  //   予約取得のためにHTTPリクエストを増やさずに済む（通信時間・失敗ポイントを増やさない）。
+  //   dl=1を送らない旧ファーム(gateway_v1.1)には従来どおり1行だけが返る（GAS側で分岐）。
+  path += "&dl=1";
+#endif
 
   String result = sendAT("AT+SHREQ=\"" + path + "\",1", 30000, "+SHREQ:");
   int statusCode = 0, dataLen = 0;
@@ -1092,6 +1334,15 @@ void checkRemoteCmd() {
   }
 
   cmd.trim();
+
+#ifdef COMM_MODE_LORA
+  // ★v1.20: 2行目以降のダウンリンク予約をキャッシュへ取り込み、cmdは1行目だけに絞る。
+  //   （この分離をしないと "none\n08:..." のような文字列をコマンドとして判定してしまう）
+  applyDownlinkCache(cmd);
+  int nlPos = cmd.indexOf('\n');
+  if (nlPos >= 0) cmd = cmd.substring(0, nlPos);
+  cmd.trim();
+#endif
 
   if (cmd.length() == 0 || cmd == "none") {
     Serial.println(F("[CMD] 保留コマンドなし"));
@@ -1612,6 +1863,204 @@ static bool loraFeedByte(uint8_t b) {
   }
 }
 
+// ── LoRa送信（★v1.20で追加。v1.1は受信専用だった） ──────────────────
+static void loraPrintFrameHex(const uint8_t *msd, uint8_t msdLen, uint8_t sum) {
+  Serial.print(F("[LORA] TXフレーム(HEX): AA "));
+  if (msdLen < 0x10) Serial.print('0');
+  Serial.print(msdLen, HEX);
+  Serial.print(' ');
+  for (uint8_t i = 0; i < msdLen; i++) {
+    if (msd[i] < 0x10) Serial.print('0');
+    Serial.print(msd[i], HEX);
+    Serial.print(' ');
+  }
+  if (sum < 0x10) Serial.print('0');
+  Serial.println(sum, HEX);
+}
+
+// ★フレーム全体をRAM上に組み立ててから1回のブロック書き込みで送る。
+//   バイト単位のwrite()だとFlex側に届かない実機不具合があった（19_lora_parentのPING送信で
+//   実績のある方式に揃えている）。
+static void loraSendFrame(const uint8_t *msd, uint8_t msdLen) {
+  uint8_t sum = (uint8_t)(0xAAU + msdLen);
+  for (uint8_t i = 0; i < msdLen; i++) sum = (uint8_t)(sum + msd[i]);
+
+  loraPrintFrameHex(msd, msdLen, sum);
+
+  uint8_t frame[3 + 32];  // [SYNC][LEN][payload...][checksum]
+  uint8_t n = 0;
+  frame[n++] = 0xAA;
+  frame[n++] = msdLen;
+  for (uint8_t i = 0; i < msdLen; i++) frame[n++] = msd[i];
+  frame[n++] = sum;
+
+  loraSerial.write(frame, n);
+  loraSerial.flush();
+}
+
+// ── ダウンリンク送信・確認応答（★v1.20で追加） ──────────────────────
+static const uint16_t DOWNLINK_COMPANY_ID   = 0xC0DE;  // 要: 子機ファームと一致させること
+static const uint8_t  DOWNLINK_PKT_TYPE     = 0x81;
+static const uint8_t  DOWNLINK_ACK_PKT_TYPE = 0x05;
+
+enum DownlinkFlag {
+  DL_FLAG_TIME       = 1u << 0,
+  DL_FLAG_SLEEP_MIN  = 1u << 1,
+  DL_FLAG_AVG_MEDIAN = 1u << 2,
+};
+
+// ★アップリンクを検知してから応答するまでの待ち時間。
+//
+// 【なぜ「即座」ではダメだったか】実機の計測で以下が判明した（子機の送信開始を0msとする）:
+//     85ms  子機のアップリンク送出完了
+//    110ms  Gatewayが検知 → 即座に応答すると…
+//    229ms  ダウンリンクが電波に乗る
+//    289ms  子機のE220がUARTへ出力するが、子機はまだ送信直後で受信が止まっており取りこぼす
+//    450ms  子機が受信復活＆受信窓を開く（もう手遅れ）
+//   つまりダウンリンクが「窓が開く前」に通り過ぎていた。窓を10秒に広げても改善しなかったのは
+//   このためで、受信機の故障でもタイミングの偶然でもなく、構造的に早すぎたのが原因。
+//
+// 【この値の決め方】子機が窓を開けるのは自分の送信開始から約450ms後。Gatewayの検知は
+// 約110ms後なので、そこから350ms以上待てば窓に入る。余裕を見て400msとし、実際の送出は
+// 検知から約520ms後（子機の窓が開いた70ms後）になる。子機の窓が2秒あるので十分内側。
+#define DOWNLINK_RESPONSE_DELAY_MS 400UL
+
+// GASから受け取ったパラメータでダウンリンクを送信する。
+// ★statusOnly=trueなら変更フラグを一切立てない(flags=0)。子機は変更が無くても確認応答
+//   （現在の設定値・WDTタイムアウト）を必ず返すため、設定を変えずに「ステータス確認」だけ
+//   行いたい時に使う。sleepMinutes等の値は送信されるが子機側では無視される。
+static void sendDownlinkCommand(uint8_t targetDeviceId, uint16_t sleepMinutes,
+                                uint8_t samplesPerAvg, uint8_t measureCount,
+                                bool statusOnly) {
+  loraModeNormal();  // Configモードへ入らず、Normalモードのまま送信する（実機確認済みの方式）
+
+  uint8_t flags = statusOnly ? 0 : (DL_FLAG_SLEEP_MIN | DL_FLAG_AVG_MEDIAN);
+
+  // 時刻欄はDL_FLAG_TIMEを立てていないため子機側で無視されるが、GatewayにはDS3231が
+  // あるので実時刻を載せておく（将来この機能を有効にする際にそのまま使える）。
+  DateTime now = rtc.now();
+
+  uint8_t payload[15];
+  payload[0]  = (uint8_t)(DOWNLINK_COMPANY_ID >> 8);
+  payload[1]  = (uint8_t)(DOWNLINK_COMPANY_ID & 0xFF);
+  payload[2]  = DOWNLINK_PKT_TYPE;
+  payload[3]  = targetDeviceId;
+  payload[4]  = flags;
+  payload[5]  = (uint8_t)(now.year() % 100);
+  payload[6]  = now.month();
+  payload[7]  = now.day();
+  payload[8]  = now.hour();
+  payload[9]  = now.minute();
+  payload[10] = now.second();
+  payload[11] = (uint8_t)(sleepMinutes >> 8);
+  payload[12] = (uint8_t)(sleepMinutes & 0xFF);
+  payload[13] = samplesPerAvg;
+  payload[14] = measureCount;
+
+  Serial.print(F("[DOWNLINK] 送信: 宛先=0x")); Serial.print(targetDeviceId, HEX);
+  Serial.print(F(" sleepMin=")); Serial.print(sleepMinutes);
+  Serial.print(F(" avg=")); Serial.print(samplesPerAvg);
+  Serial.print(F(" median=")); Serial.println(measureCount);
+
+  loraSendFrame(payload, sizeof(payload));
+  delay(300);  // 送信完了待ち（AUX未接続のため固定ディレイ）
+
+  // ★送信直後にUARTE1のDMA受信を明示的に再武装する。
+  // 実機で「ダウンリンクを1回送信した直後からGatewayの受信が完全に止まる」事象を確認した。
+  // 子機はこの直後（2秒の受信窓の中）に確認応答を返してくるため、ここで取りこぼすと
+  // 永久に確認が取れず再試行を繰り返すことになる。ストール検出を待たずに復帰させる。
+  NRF_UARTE1->TASKS_STARTRX = 1;
+}
+
+// 子機のアップリンクを検知したときの処理。予約があればダウンリンクを送る。
+static void onUplinkReceived(uint8_t childId) {
+  PendingDownlink* p = findPending(childId);
+  if (p == nullptr) return;
+
+  // ★AT通信中はダウンリンクを送らない。
+  //   sendAT()の待機ループからloraPoll()が呼ばれるため、ここでLoRa送信（UARTへの書き込みと
+  //   delay）を行うと、SIM7080Gへ送信中のATコマンド文字列がバイト単位で化ける事象を実機で
+  //   確認している（loraRxWatchdog()のs_atBusyと同じ理由）。
+  //   予約はactiveのまま残るので、子機の次の起床で改めて送信される（1周期遅れるだけ）。
+  if (s_atBusy) {
+    Serial.print(F("[DOWNLINK] 子機0x")); Serial.print(childId, HEX);
+    Serial.println(F(" のアップリンクを検知しましたが、AT通信中のため次サイクルに見送ります"));
+    return;
+  }
+
+  if (p->attempts >= DOWNLINK_MAX_ATTEMPTS) {
+    // 規定回数送っても確認が返らなかった → 未達として打ち切り、GASへ報告する
+    Serial.print(F("[DOWNLINK] 子機0x")); Serial.print(childId, HEX);
+    Serial.print(F(" へ")); Serial.print(p->attempts);
+    Serial.println(F("回送信しましたが確認が返りません。未達として打ち切ります"));
+    queueReport(true, childId, DL_STATUS_NO_ACK, 0, 0, 0, p->attempts, p->seq);
+    p->active = false;
+    return;
+  }
+
+  p->attempts++;
+  Serial.print(F("[DOWNLINK] 子機0x")); Serial.print(childId, HEX);
+  Serial.print(F(" のアップリンクを検知（")); Serial.print(p->attempts);
+  Serial.print(F("回目/")); Serial.print(DOWNLINK_MAX_ATTEMPTS);
+  Serial.print(F("）→ ")); Serial.print(DOWNLINK_RESPONSE_DELAY_MS);
+  Serial.println(F("ms待ってから送信します（子機が受信窓を開くのを待つ）"));
+
+  // ★即座に送ると子機の受信窓が開く前に到着してしまう（DOWNLINK_RESPONSE_DELAY_MS参照）。
+  //   ここでloraPoll()付きの待機を使ってはいけない。この関数自体がloraPoll()から
+  //   呼ばれているため、待機中に別の子機のアップリンクが来ると再帰してしまう。
+  //   受信バイトはUARTE割り込みでリングバッファに積まれるので、ここでポーリングを止めても
+  //   取りこぼしにはならず、処理が数百ms遅れるだけで済む。
+  {
+    uint32_t t0 = millis();
+    while (millis() - t0 < DOWNLINK_RESPONSE_DELAY_MS) { wdtFeed(); yield(); }
+  }
+  sendDownlinkCommand(childId, p->sleepMin, p->avg, p->median, p->statusOnly);
+  recordSent(childId, p->attempts, p->seq);  // 確認応答をこの予約に紐付けるための控え
+  queueReport(false, childId, 0, p->sleepMin, p->avg, p->median, p->attempts, p->seq);
+}
+
+// 子機からの確認応答を受けた時の処理。予約を完了扱いにし、結果をGASへ報告する。
+//   ack: [0]0x05 [1]DeviceID [2]status [3-4]適用sleepMin(BE) [5]適用avg [6]適用median
+//        [7-8]適用後に有効になるWDTタイムアウト(分,BE)
+static void onDownlinkAckReceived(const uint8_t* ack, uint8_t len) {
+  if (len < 7) return;
+  uint8_t  childId       = ack[1];
+  uint8_t  status        = ack[2];
+  uint16_t applied       = ((uint16_t)ack[3] << 8) | ack[4];
+  uint8_t  appliedAvg    = ack[5];
+  uint8_t  appliedMedian = ack[6];
+  // 旧フレーム(7バイト)との互換のため、WDT欄が無い場合は0扱いにする
+  uint16_t appliedWdtMin = (len >= 9) ? (((uint16_t)ack[7] << 8) | ack[8]) : 0;
+
+  // ★seqと試行回数は「実際に送信した時の控え」から取る。
+  //   現在のs_pending[]から取ると、送信〜応答の間にキャッシュ更新で新しい予約へ
+  //   入れ替わっていた場合に、古い応答を新しい予約の完了として誤報告してしまう。
+  SentDownlink* sent = findLastSent(childId);
+  if (sent == nullptr) {
+    Serial.print(F("[DOWNLINK] 送信控えが無い子機0x")); Serial.print(childId, HEX);
+    Serial.println(F(" からの応答のため無視します"));
+    return;
+  }
+  uint8_t  attempts = sent->attempts;
+  uint32_t seq      = sent->seq;
+
+  Serial.print(F("[DOWNLINK] ★子機0x")); Serial.print(childId, HEX);
+  Serial.print(F(" から確認応答: status=")); Serial.print(status);
+  Serial.print(F(" 適用値 間隔=")); Serial.print(applied);
+  Serial.print(F("分 平均=")); Serial.print(appliedAvg);
+  Serial.print(F(" メジアン=")); Serial.print(appliedMedian);
+  Serial.print(F(" WDT=")); Serial.print(appliedWdtMin); Serial.println(F("分"));
+
+  queueReport(true, childId, status, applied, appliedAvg, appliedMedian, attempts, seq, appliedWdtMin);
+  sent->valid = false;  // この控えは消費した
+
+  // ★再試行を止めてよいのは「今キャッシュにある予約」＝「今受け取った応答の予約」の時だけ。
+  //   応答待ちの間に新しい予約へ入れ替わっていた場合、その新しい予約はまだ未送信なので
+  //   activeのまま残し、次のアップリンクで送信されるようにする。
+  PendingDownlink* p = findPending(childId);
+  if (p != nullptr && p->seq == seq) p->active = false;
+}
+
 // loop() から毎回呼ぶ。受信バッファを読み切り、完成したフレームがあればレコードへ反映する。
 static void loraPoll() {
   while (loraSerial.available()) {
@@ -1622,6 +2071,14 @@ static void loraPoll() {
       s_loraFramesOk++;
       uint8_t pktType  = s_loraBody[0];
       uint8_t deviceId = s_loraBody[1];
+
+      // ★v1.20: ダウンリンクの確認応答（子機→Gateway）。センサデータではないので
+      //   レコード更新には回さず、ここで処理を終える。
+      if (pktType == DOWNLINK_ACK_PKT_TYPE) {
+        onDownlinkAckReceived(s_loraBody, s_loraLen);
+        continue;
+      }
+
       if (!isAllowedFlexPacket(pktType, deviceId)) {
         continue;  // 想定外のPktType/DeviceIDは棄却（ログは出さない）
       }
@@ -1636,6 +2093,10 @@ static void loraPoll() {
       // LoRaにはBLEのようなMACアドレスが無いため、DeviceIDで一意化した疑似MACを使う
       uint8_t pseudoMac[6] = {0, 0, 0, 0, 0, deviceId};
       updateRecordFromPayload(pseudoMac, s_loraBody, s_loraLen, rssiDbm);
+
+      // ★v1.20: 子機が起きた＝受信窓が開く直前。予約があればここでダウンリンクを送る。
+      //   センサデータの取り込みを先に済ませてから呼ぶこと（この中で数百ms待つため）。
+      onUplinkReceived(deviceId);
     }
   }
 
@@ -2424,6 +2885,20 @@ void flushRecords() {
 static uint32_t lastSend = 0;
 
 #ifdef COMM_MODE_LORA
+// ★v1.20: ダウンリンク予約の確認間隔。
+//
+// 【なぜ送信サイクルと分けるか】テレメトリ送信は120分間隔だが、その周期でしか予約を
+// 取りに行かないと「Gatewayが予約を知るまで最大120分 → 子機に届くまでさらに最大120分」で、
+// スプレッドシートで指示してから結果が戻るまで最悪6時間かかる。
+// Gatewayは AC 電源なので、予約確認だけを短い周期で回しても電力の問題は無い
+// （増えるのはLTE-Mのデータ通信量のみ。1回あたり1〜2KB程度）。
+// テレメトリ送信の周期はここでは変えない（送信間隔を変える場合はCLAUDE.md §7に従い
+// アプリ層WDT(computeAppWdtMs)との整合も必ず確認すること）。
+#define CMD_CHECK_INTERVAL_MS (15UL * 60UL * 1000UL)   // 15分
+static uint32_t lastCmdCheck = 0;
+#endif
+
+#ifdef COMM_MODE_LORA
 // ══════════════════════════════════════════════
 // コントローラー連携（BLE GATT サーバ）— LoRaビルド専用（v1.1新規）
 //
@@ -2893,7 +3368,12 @@ void setup() {
   Serial.println(F("=====================================\n"));
 
 // 起動直後にも一度コマンドを確認する（次の定期送信を待たずに動作確認できるようにするため）
-  if (netOk) checkRemoteCmd();
+  if (netOk) {
+    checkRemoteCmd();  // 起動直後に一度、コマンドとダウンリンク予約を取得する
+#ifdef COMM_MODE_LORA
+    lastCmdCheck = millis();  // 直後にもう一度走らないよう15分タイマーを起点合わせする
+#endif
+  }
 
 #if BOOT_SCAN_SEND
   if (netOk) {
@@ -2959,6 +3439,23 @@ void loop() {
   }
 
 #if LTEM_SEND_ENABLED
+#ifdef COMM_MODE_LORA
+  // ★v1.20: テレメトリ送信サイクルとは別に、ダウンリンク予約を短い周期で確認する。
+  //   ここではデータ送信(flushRecords)は行わない。予約の取得と結果報告だけを行う。
+  //   ※この直後の送信ブロックが動く場合はそちらでも確認するが、lastCmdCheckを
+  //     更新し合うので二重に走ることはない。
+  if (now - lastCmdCheck >= CMD_CHECK_INTERVAL_MS) {
+    lastCmdCheck = now;
+    Serial.println(F("\n=== ダウンリンク予約の確認 ==="));
+    if (ensureNetworkReady()) {
+      checkRemoteCmd();
+      processReportQueue();
+    } else {
+      Serial.println(F("[CACHE] ネットワーク未接続のため確認をスキップします"));
+    }
+  }
+#endif
+
   if (now - lastSend >= sendIntervalMs) {
     lastSend = now;
     Serial.println(F("\n=== 定期送信 ==="));
@@ -3004,6 +3501,13 @@ void loop() {
     // 確認する（flushRecords()内は子機データ0件だと早期returnするため、ここで独立して呼ぶ）。
     if (ensureNetworkReady()) {
       checkRemoteCmd();
+#ifdef COMM_MODE_LORA
+      lastCmdCheck = millis();  // ここで確認したので、15分タイマーも仕切り直す
+      // ★v1.20: ダウンリンクの送信・確認応答の報告をGASへ流す。
+      //   loraPoll()の中（＝AT通信の待機ループ内）から送るとAT通信が入れ子になって
+      //   破綻するため、キューに積んでおいたものをここで安全にまとめて送る。
+      processReportQueue();
+#endif
     }
     // ★2026-08-04: stopコマンドで一時停止中はGASへの送信をスキップする（BLE/LoRa受信・
     // check_cmdの確認は上で既に実行済みなので、再開/送信コマンドはこの後も受け取れる）。

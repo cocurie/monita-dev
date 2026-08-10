@@ -27,6 +27,10 @@
 //     - v5: LoRaダウンリンク（Class A + 確認応答方式）のリモート制御機能を追加（2026-08-09〜10）
 //       check_downlinks / downlink_sent / downlink_result アクション、cmd_status・downlink_logシート、
 //       Gateway操作/Flex操作メニュー
+//     - v6: check_cmd に dl=1 パラメータを追加（2026-08-10）。本番Gateway(v1.20)への統合用。
+//       dl=1 のときだけ応答を複数行化し、2行目以降にダウンリンク予約を返す。
+//       dl未指定なら従来とまったく同じ1行応答（gateway_v1.1はこちら）。
+//       check_downlinks は検証用テストスケッチが使い続けるため残してある。
 //
 //   対応する子機ファーム:
 //     - project07_NEXCO/firmware/src/main.cpp（COMM_MODE_BLE、本番項目用）
@@ -204,6 +208,31 @@ function dlGet_(childHex) {
 function dlSet_(childHex, obj) {
   obj.updated = new Date().toISOString();
   PropertiesService.getScriptProperties().setProperty(dlKey_(childHex), JSON.stringify(obj));
+}
+
+// 未完了（queued / sent）の予約を、Gatewayが解釈する1行1件の形式で組み立てる。
+// 形式: HEX2:sleepMin:avg:median:attempts:seq:mode
+//   ★attemptsもseqもGAS側を正とする。Gateway側で数えると、再取得のたびにリセットされたり、
+//     予約を入れ直しても古い試行回数を引き継いだりするため。
+//   ★mode: 0=通常の設定変更 / 1=ステータス確認のみ（設定変更フラグを立てずに送る）
+// ★AT+SHREQ経由の応答サイズに収まるよう、1回に返すのは最大DOWNLINK_MAX_LINES件までとする。
+//   14台×約20バイト＝約280バイトで、check_cmdのコマンド行と合わせても十分小さい。
+// check_downlinks（テストスケッチ用）と check_cmd（本番Gateway用、2行目以降に相乗り）の
+// 両方から呼ばれる。表現を1か所に集約し、片方だけ形式が変わる事故を防ぐ。
+var DOWNLINK_MAX_LINES = 20;
+
+function buildDownlinkLines_() {
+  var lines = [];
+  for (var ci = 0; ci < CMD_STATUS_CHILD_IDS.length && lines.length < DOWNLINK_MAX_LINES; ci++) {
+    var hex = CMD_STATUS_CHILD_IDS[ci];
+    var d = dlGet_(hex);
+    if (d && (d.state === 'queued' || d.state === 'sent')) {
+      lines.push(hex + ':' + d.sleep + ':' + d.avg + ':' + d.median +
+                 ':' + (d.attempts || 0) + ':' + (d.seq || 0) +
+                 ':' + (d.mode === 'status' ? 1 : 0));
+    }
+  }
+  return lines;
 }
 
 // ステータスコードを日本語の結果表示に変換する
@@ -875,10 +904,40 @@ function doGet(e) {
   //   その場合コマンドが「消費済みなのに実行されない」まま失われていた。
   //   「読む」と「消費する」を分離し、Gatewayが実際に受け取れて実行する直前にだけ
   //   action=ack_cmdで明示的に消費するようにした（失敗時は次サイクルで再送される）。
+  //
+  // ★2026-08-10拡張: dl=1 が指定されたときだけ、応答を複数行化して2行目以降に
+  //   LoRaダウンリンクの予約を相乗りさせる。
+  //
+  //   【なぜ相乗りさせるか】本番Gateway(v1.20)は既に毎サイクルこのcheck_cmdでGASから本文を
+  //   読んでいる。予約取得のためにHTTPリクエストを1本増やすと、通信時間と失敗ポイントが
+  //   増えるうえ、本番のGAS通信方式(AT+SH*)をAT+HTTPTOFSへ移行する必要が出てくる
+  //   （両者は混在できず、稼働中のテレメトリ送信経路に手を入れることになる）。
+  //   既存の応答に相乗りさせれば、実績のある送信経路を一切触らずに済む。
+  //
+  //   【なぜdl=1で明示的に要求させるか】gateway_v1.1のcheckRemoteCmd()は応答本文全体を
+  //   1つの文字列として扱い、cmd == "none" / cmd == "reset" のように完全一致で判定している。
+  //   無条件に複数行を返すと "none\n08:4:5:5:0:1:0" となって "none" に一致せず、
+  //   旧ファームが未知のコマンドを受け取ったものとして誤動作する。
+  //   dl=1 を送らない旧ファームには従来とまったく同じ1行だけを返すことで、
+  //   GAS側を先に更新しても稼働中のgateway_v1.1が壊れないようにする。
+  //
+  //   応答形式:
+  //     dl未指定  : "none" または "reset" 等のコマンド1行のみ（★従来と完全に同一）
+  //     dl=1      : 1行目 = コマンド（無ければ "none"）
+  //                 2行目以降 = 予約 "HEX2:sleepMin:avg:median:attempts:seq:mode"
+  //
+  //   dl=1 の例（コマンドは無いが予約が2件ある場合）:
+  //     none
+  //     08:4:5:5:0:1:0
+  //     0E:60:10:10:0:1:1
   if (p.action === 'check_cmd') {
     var deviceId = p.device_id || 'default';
     var cmd = PropertiesService.getScriptProperties().getProperty('pending_cmd_' + deviceId) || '';
-    return ContentService.createTextOutput(cmd || 'none');
+    if (p.dl !== '1') {
+      return ContentService.createTextOutput(cmd || 'none');  // 旧ファーム互換（1行のみ）
+    }
+    var out = [cmd || 'none'].concat(buildDownlinkLines_());
+    return ContentService.createTextOutput(out.join('\n'));
   }
 
   // action=ack_cmd: Gatewayがコマンドを実際に受け取り、実行する直前に呼ぶ。ここで初めて
@@ -899,20 +958,7 @@ function doGet(e) {
   //   即座にLoRa送信する。1行1件・改行区切りで返す: "08:4:5:5:0:1:0\n0E:60:10:10:0:1:1"
   //   ★AT+SHREQの512バイト制限に収まるよう、1回に返すのは最大20件までとする。
   if (p.action === 'check_downlinks') {
-    var lines = [];
-    for (var ci = 0; ci < CMD_STATUS_CHILD_IDS.length && lines.length < 20; ci++) {
-      var hex = CMD_STATUS_CHILD_IDS[ci];
-      var d = dlGet_(hex);
-      if (d && (d.state === 'queued' || d.state === 'sent')) {
-        // 形式: HEX2:sleepMin:avg:median:attempts:seq:mode
-        // ★attemptsもseqもGAS側を正とする。Gateway側で数えると、再取得のたびに
-        //   リセットされたり、予約を入れ直しても古い試行回数を引き継いだりするため。
-        // ★mode: 0=通常の設定変更 / 1=ステータス確認のみ（設定変更フラグを立てずに送る）
-        lines.push(hex + ':' + d.sleep + ':' + d.avg + ':' + d.median +
-                   ':' + (d.attempts || 0) + ':' + (d.seq || 0) +
-                   ':' + (d.mode === 'status' ? 1 : 0));
-      }
-    }
+    var lines = buildDownlinkLines_();
     return ContentService.createTextOutput(lines.length ? lines.join('\n') : 'none');
   }
 

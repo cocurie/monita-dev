@@ -118,7 +118,7 @@ static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のとき
 // ============================================================
 #ifdef COMM_MODE_LORA
 static const uint8_t  DEVICE_ID  = 0x0E;  // 子機 ID（iPEC実機テスト用。Gateway側 01_http_post の TARGET_DEVICE_ID と一致させること）
-static const uint8_t  FW_VERSION = 10;    // 子機ファームのバージョン。コミットのたびに+1すること
+static const uint8_t  FW_VERSION = 11;    // 子機ファームのバージョン。コミットのたびに+1すること
 #endif
 
 // ============================================================
@@ -203,9 +203,16 @@ const uint8_t CH_ASSIGN[4] = {1, 1, 1, 1};
 static const float STRAIN_SCALE = 1110.0f;  // 1.0f = 生値そのまま出力（未キャリブレーション）
 
 // HX711 1回の平均を求めるための生サンプル数（有野川子基板と同じ2段方式）
+// ★COMM_MODE_LORAではダウンリンクで変更できるため、ここは「初期値」。
+//   実行時の値は s_settings.samplesPerAvg / ACTIVE_SAMPLES_PER_AVG を使う。
 #define SAMPLES_PER_AVG 5
 // 平均値を何回取得してメジアンを求めるか（最大・最小はペイロードに含めない）
 #define MEASURE_COUNT   5
+// ★MEASURE_COUNTはダウンリンクで実行時に変更できるが、計測値を溜める配列は
+//   コンパイル時に確保する必要がある。その配列サイズの上限＝設定できる上限。
+//   これを超える値をダウンリンクで指定された場合は値域エラーとして拒否する
+//   （クランプせず拒否するのは、要求と異なる値で黙って動くのを避けるため）。
+#define MEASURE_COUNT_MAX 20
 
 // ── VL53L4CD（ToF距離センサ）測定パラメータ ─────────────────────────
 // タイミングバジェット（積分時間）[ms]。VL53L4CD_SetRangeTiming() の第1引数。
@@ -522,7 +529,98 @@ static int32_t loraSleepJitterSeconds(uint16_t jitterMaxSec) {
 // カバーするためのもの。旧値は+10分（VL53L4CD 2段メジアン化で計測時間が最大約10分に
 // 伸びたため）だったが、+15分に広げて余裕を持たせる。
 #define WDT_MARGIN_MINUTES 15
-static uint32_t const WDT_TIMEOUT_MS = (SLEEP_MINUTES + WDT_MARGIN_MINUTES) * 60UL * 1000UL;
+
+// ============================================================
+// ランタイム設定（COMM_MODE_LORA: ダウンリンクで変更可能。フラッシュに保存して再起動後も保持）
+// ============================================================
+// ★v3.20で追加。SLEEP_MINUTES / SAMPLES_PER_AVG / MEASURE_COUNT は「初期値」に降格し、
+//   実行時は s_settings の値を使う。LoRa以外のビルドでは s_settings は常に初期値のまま
+//   （ダウンリンク経路が無いため）で、挙動はv3.10と変わらない。
+// ★保存内容の互換性が壊れる変更をしたら SETTINGS_VERSION を上げること。
+//   バージョンが一致しない保存内容は破棄して初期値に戻る。
+#define SETTINGS_VERSION 1
+
+struct ChildSettings {
+  uint8_t  version;        // SETTINGS_VERSION。一致しない保存内容は破棄する
+  uint16_t sleepMinutes;
+  uint8_t  samplesPerAvg;
+  uint8_t  measureCount;
+};
+
+static ChildSettings s_settings = {
+  SETTINGS_VERSION,
+  SLEEP_MINUTES,
+  SAMPLES_PER_AVG,
+  MEASURE_COUNT,
+};
+
+// 実行時に参照する値。LoRa以外はコンパイル時定数のままにして最適化を妨げない。
+#ifdef COMM_MODE_LORA
+  #define ACTIVE_SLEEP_MINUTES   (s_settings.sleepMinutes)
+  #define ACTIVE_SAMPLES_PER_AVG (s_settings.samplesPerAvg)
+  #define ACTIVE_MEASURE_COUNT   (s_settings.measureCount)
+#else
+  #define ACTIVE_SLEEP_MINUTES   SLEEP_MINUTES
+  #define ACTIVE_SAMPLES_PER_AVG SAMPLES_PER_AVG
+  #define ACTIVE_MEASURE_COUNT   MEASURE_COUNT
+#endif
+
+#ifdef COMM_MODE_LORA
+static const char SETTINGS_FILE[] = "/child_settings.bin";
+
+static void saveSettings() {
+  if (!InternalFS.begin()) return;
+  InternalFS.remove(SETTINGS_FILE);
+  File f(InternalFS);
+  if (f.open(SETTINGS_FILE, FILE_O_WRITE)) {
+    f.write((const uint8_t*)&s_settings, sizeof(s_settings));
+    f.close();
+    Serial.println("[SETTINGS] flashへ保存しました");
+  }
+}
+
+static void loadSettings() {
+  if (!InternalFS.begin()) return;
+  File f(InternalFS);
+  if (f.open(SETTINGS_FILE, FILE_O_READ)) {
+    // ★一旦テンポラリへ読み、バージョンが一致した場合のみ採用する。
+    //   直接s_settingsへ読むと、破棄すべき旧データで初期値を上書きしてしまう。
+    ChildSettings tmp = {0, 0, 0, 0};
+    if ((size_t)f.size() == sizeof(tmp)) {
+      f.read((uint8_t*)&tmp, sizeof(tmp));
+      if (tmp.version == SETTINGS_VERSION) {
+        s_settings = tmp;
+        Serial.println("[SETTINGS] flashから復元しました");
+      } else {
+        Serial.print("[SETTINGS] 保存内容のバージョンが古いため破棄し、初期値を使います（保存=");
+        Serial.print(tmp.version); Serial.print(" / 現在=");
+        Serial.print(SETTINGS_VERSION); Serial.println("）");
+      }
+    } else {
+      Serial.println("[SETTINGS] 保存内容のサイズが不一致のため破棄し、初期値を使います");
+    }
+    f.close();
+  }
+  // ★念のための健全性チェック。フラッシュ内容が壊れていた場合に
+  //   0除算や配列外アクセスを起こさないよう、ここで初期値へ戻す。
+  if (s_settings.sleepMinutes == 0 || s_settings.sleepMinutes > 1440) s_settings.sleepMinutes = SLEEP_MINUTES;
+  if (s_settings.samplesPerAvg == 0) s_settings.samplesPerAvg = SAMPLES_PER_AVG;
+  if (s_settings.measureCount == 0 || s_settings.measureCount > MEASURE_COUNT_MAX) s_settings.measureCount = MEASURE_COUNT;
+
+  Serial.print("[SETTINGS] sleepMinutes="); Serial.print(s_settings.sleepMinutes);
+  Serial.print(" samplesPerAvg="); Serial.print(s_settings.samplesPerAvg);
+  Serial.print(" measureCount="); Serial.println(s_settings.measureCount);
+}
+#endif  // COMM_MODE_LORA
+
+// ★WDTタイムアウトは実行時の送信間隔から毎回算出する。
+//   setup()では必ず loadSettings() の"後"に wdtInit(computeWdtTimeoutMs()) を呼ぶこと
+//   （先に呼ぶと、復元前の初期値に対するタイムアウトで張ってしまう）。
+//   nRF52のWDTは一度TASKS_STARTすると CRV を変更できず停止もできないため、
+//   ダウンリンクで送信間隔が変わった場合は再起動して張り直す（applyDownlinkPayload参照）。
+static uint32_t computeWdtTimeoutMs() {
+  return (uint32_t)(ACTIVE_SLEEP_MINUTES + WDT_MARGIN_MINUTES) * 60UL * 1000UL;
+}
 
 static void wdtInit(uint32_t timeoutMs) {
   NRF_WDT->CONFIG  = (WDT_CONFIG_SLEEP_Run << WDT_CONFIG_SLEEP_Pos);  // スリープ中も継続動作
@@ -966,7 +1064,7 @@ static void handleBootTare() {
 // ※ レンジは BLE/LoRaモードのみペイロードに使用する（Sigfoxモードでは未使用）。
 // ※ 最大・最小の値自体はペイロードに含めない（rangeのみ使用）。
 static float medianWithRange(float *a, int n, float *outRange) {
-  float t[MEASURE_COUNT];
+  float t[MEASURE_COUNT_MAX];   // ★実行時のnは可変なので上限で確保する
   memcpy(t, a, sizeof(float) * (size_t)n);
   for (int i = 0; i < n - 1; i++)
     for (int j = 0; j < n - i - 1; j++)
@@ -1016,12 +1114,12 @@ static void hxBegin(uint8_t ch) {
 // HX711_SAMPLE_TIMEOUT_MS の定義箇所のコメントを参照）。
 static bool hxReadAvg(float *outAvg) {
   float sum = 0;
-  for (int i = 0; i < SAMPLES_PER_AVG; i++) {
+  for (int i = 0; i < ACTIVE_SAMPLES_PER_AVG; i++) {
     if (!hx.wait_ready_timeout(HX711_SAMPLE_TIMEOUT_MS)) {
       Serial.print("[HX TIMEOUT] sample ");
       Serial.print(i);
       Serial.print("/");
-      Serial.println(SAMPLES_PER_AVG);
+      Serial.println(ACTIVE_SAMPLES_PER_AVG);
       s_errors |= ERR_HX711_TIMEOUT;
       statusErrorRed();
       *outAvg = 0;
@@ -1031,7 +1129,7 @@ static bool hxReadAvg(float *outAvg) {
     // read() だとタレ値が反映されないため get_value() を使う
     sum += hx.get_value();
   }
-  *outAvg = sum / SAMPLES_PER_AVG;
+  *outAvg = sum / ACTIVE_SAMPLES_PER_AVG;
   return true;
 }
 
@@ -1039,8 +1137,8 @@ static bool hxReadAvg(float *outAvg) {
 // outRange が非NULLの場合、MEASURE_COUNT回の平均値群の最大-最小（ブレ幅）も返す。
 // 最大・最小はペイロードには含めない（rangeのみBLE/LoRaモードで使用）。
 static bool hxRead(int *out, float *outRange = nullptr) {
-  float avgs[MEASURE_COUNT];
-  for (int i = 0; i < MEASURE_COUNT; i++) {
+  float avgs[MEASURE_COUNT_MAX];   // ★実行時の回数は可変なので上限で確保する
+  for (int i = 0; i < ACTIVE_MEASURE_COUNT; i++) {
     if (!hxReadAvg(&avgs[i])) {
       *out = 0;
       if (outRange != nullptr) {
@@ -1051,7 +1149,7 @@ static bool hxRead(int *out, float *outRange = nullptr) {
   }
 
   float range = 0;
-  *out = (int)medianWithRange(avgs, MEASURE_COUNT, &range);
+  *out = (int)medianWithRange(avgs, ACTIVE_MEASURE_COUNT, &range);
   if (outRange != nullptr) {
     *outRange = range;
   }
@@ -1873,6 +1971,254 @@ static void loraSendFrame(const uint8_t *msd, uint8_t msdLen) {
 //   [13]    Hour
 //   [14]    Minute
 //   [15-18] CH1〜CH4 Range（uint8_t、0〜255にクランプ）
+// ============================================================
+// LoRaダウンリンク受信（★v3.20で追加。Class A + 確認応答方式）
+// ============================================================
+// 【方式】子機は電池駆動でスリープするため常時受信できない。そこで自分のデータを
+// 送信した"直後"に短時間だけ受信窓を開き、そこにGatewayが応答を差し込む
+// （LoRaWANのClass Aと同じ考え方）。Gatewayは予約を事前にローカルへキャッシュして
+// おり、子機の起床を検知してから400ms待って送信してくる。
+//
+// 【確認応答が必要な理由】送りっぱなしにすると、子機が受け損ねた場合にコマンドが
+// 黙って消える。Gatewayは「送った」ことしか分からず、再試行も報告もできない。
+// 適用のたびに短い確認フレームを返すことで、Gatewayは確認が取れるまで予約を保持し、
+// 次サイクルで自動再試行できる。「指示が消える」が「1周期遅れる」に変わる。
+//
+// 設計・実機検証の経緯は case01_Flex/test_sketches/25_lora_downlink_child を参照。
+
+#define DOWNLINK_RX_WINDOW_MS 2000UL   // 受信窓（ms）。nRF52840の消費電流が大きいため2秒に抑える
+
+// 確認応答のstatus
+#define DL_STATUS_OK          0   // 要求通り適用
+#define DL_STATUS_RANGE_ERROR 1   // 値域エラー（受け付けられない値だったので拒否）
+
+static const uint16_t DOWNLINK_COMPANY_ID  = 0xC0DE;  // 要: Gateway側と一致させること
+static const uint8_t  DOWNLINK_PKT_TYPE    = 0x81;
+static const uint8_t  DOWNLINK_ACK_PKT_TYPE = 0x05;
+// [0-1]CompanyID [2]PktType [3]DeviceID [4]Flags [5-10]時刻 [11-12]SleepMin [13]Avg [14]Median
+static const uint8_t  DOWNLINK_PAYLOAD_LEN = 15;
+
+enum DownlinkFlag {
+  DL_FLAG_TIME       = 1u << 0,
+  DL_FLAG_SLEEP_MIN  = 1u << 1,
+  DL_FLAG_AVG_MEDIAN = 1u << 2,
+};
+
+enum LoraRxState { LORA_WAIT_SYNC, LORA_WAIT_LEN, LORA_WAIT_BODY, LORA_WAIT_CKSUM, LORA_WAIT_RSSI };
+
+// ★送信するとE220がRF受信をやめてしまう（受信ラッチ）。窓を開ける直前に数バイト送って
+// 解除し、UARTEのDMA受信を再武装する。19_lora_parentのloraKickTx()と違い、ここでは
+// 受信バッファを捨てない（Gatewayの応答が直後に届くため、捨てると本命を取りこぼす）。
+static void loraReviveRx() {
+  const uint8_t dummy[3] = {0x00, 0x00, 0x00};  // 受信側は0xAAを探すためフレーム誤認しない
+  Serial1.write(dummy, sizeof(dummy));
+  Serial1.flush();
+  delay(120);                     // キックのRF送出完了待ち（AUX未接続のため固定ディレイ）
+  NRF_UARTE0->TASKS_STARTRX = 1;  // DMA受信を再武装
+}
+
+// 確認応答フレーム（子機→Gateway、9バイト）
+//   [0] PktType = 0x05（アップリンク0x04とは別なので既存の解析に影響しない）
+//   [1] DeviceID
+//   [2] status（DL_STATUS_*）
+//   [3-4] 適用した送信間隔（分）uint16 ビッグエンディアン
+//   [5] 適用した平均回数 / [6] 適用したメジアン回数
+//   [7-8] 適用後に有効になるWDTタイムアウト（分）uint16 ビッグエンディアン
+//         ★WDTが送信間隔から計算式で正しく導出されているかをスプレッドシート側で
+//           確認できるようにするため（ヒューマンエラー対策の検証用）。
+static void sendDownlinkAck(uint8_t status, uint16_t sleepMin, uint8_t avg, uint8_t median) {
+  uint16_t wdtMin = (uint16_t)(sleepMin + WDT_MARGIN_MINUTES);
+
+  uint8_t ack[9];
+  ack[0] = DOWNLINK_ACK_PKT_TYPE;
+  ack[1] = DEVICE_ID;
+  ack[2] = status;
+  ack[3] = (uint8_t)(sleepMin >> 8);
+  ack[4] = (uint8_t)(sleepMin & 0xFF);
+  ack[5] = avg;
+  ack[6] = median;
+  ack[7] = (uint8_t)(wdtMin >> 8);
+  ack[8] = (uint8_t)(wdtMin & 0xFF);
+
+  Serial.print("[DOWNLINK] 確認応答を送信: status="); Serial.print(status);
+  Serial.print(" 適用値 間隔="); Serial.print(sleepMin);
+  Serial.print("分 平均="); Serial.print(avg);
+  Serial.print(" メジアン="); Serial.print(median);
+  Serial.print(" WDT="); Serial.print(wdtMin); Serial.println("分");
+
+  loraSendFrame(ack, sizeof(ack));
+  delay(LORA_TX_COMPLETE_DELAY_MS);  // 送信完了待ち（AUX未接続のため固定ディレイ）
+}
+
+// 受信したダウンリンクフレームを検証・適用する。
+// true : 自分宛ての有効なダウンリンクとして処理した（＝受信窓を閉じてよい）
+// false: 他機宛て・別種のフレーム・壊れたフレーム（＝受信窓を継続すべき）
+static bool applyDownlinkPayload(const uint8_t *payload, uint8_t len) {
+  if (len != DOWNLINK_PAYLOAD_LEN) {
+    Serial.print("[DOWNLINK] payload長不一致: "); Serial.println(len);
+    return false;
+  }
+
+  uint16_t companyId = ((uint16_t)payload[0] << 8) | payload[1];
+  if (companyId != DOWNLINK_COMPANY_ID) {
+    Serial.print("[DOWNLINK] Company ID不一致（無関係な信号として破棄）: 0x");
+    Serial.println(companyId, HEX);
+    return false;
+  }
+  if (payload[2] != DOWNLINK_PKT_TYPE) {
+    Serial.print("[DOWNLINK] PktType不一致: 0x"); Serial.println(payload[2], HEX);
+    return false;
+  }
+  if (payload[3] != DEVICE_ID) {
+    Serial.print("[DOWNLINK] 宛先違い（自分宛てではない）: 0x"); Serial.println(payload[3], HEX);
+    return false;
+  }
+
+  uint8_t flags = payload[4];
+  bool changed = false;
+  uint8_t status = DL_STATUS_OK;
+  bool sleepChanged = false;  // trueなら確認応答後に自ら再起動してWDTを張り直す
+
+  Serial.println("[DOWNLINK] ★自分宛ての有効なコマンドを受信しました");
+
+  if (flags & DL_FLAG_TIME) {
+    uint8_t yr2 = payload[5], month = payload[6], day = payload[7];
+    uint8_t hour = payload[8], minute = payload[9], sec = payload[10];
+    // ★テストスケッチではログ出力のみだったが、本番はDS3231が載っているので実際に書き込む。
+    if (ds3231SetTime(yr2, month, day, hour, minute, sec)) {
+      Serial.print("[DOWNLINK] DS3231へ時刻を書き込みました: 20");
+      Serial.print(yr2); Serial.print("-"); Serial.print(month); Serial.print("-");
+      Serial.print(day);  Serial.print(" "); Serial.print(hour);  Serial.print(":");
+      Serial.print(minute); Serial.print(":"); Serial.println(sec);
+    } else {
+      s_errors |= ERR_DS3231_I2C;
+      status = DL_STATUS_RANGE_ERROR;
+      Serial.println("[DOWNLINK] DS3231への時刻書き込みに失敗しました");
+    }
+  }
+
+  if (flags & DL_FLAG_SLEEP_MIN) {
+    uint16_t newSleepMin = ((uint16_t)payload[11] << 8) | payload[12];
+    if (newSleepMin == 0 || newSleepMin > 1440) {
+      status = DL_STATUS_RANGE_ERROR;
+      Serial.println("[DOWNLINK] 値域エラー: 送信間隔は1〜1440分の範囲で指定してください");
+    } else if (newSleepMin != s_settings.sleepMinutes) {
+      // ★WDTタイムアウト上限によるクランプは行わない。setup()がcomputeWdtTimeoutMs()で
+      //   毎回算出し直すため、保存→確認応答→再起動すれば新しい間隔に対して安全な
+      //   WDTが自動的に張られる。
+      s_settings.sleepMinutes = newSleepMin;
+      changed = true;
+      sleepChanged = true;
+      Serial.print("[DOWNLINK] 送信間隔を変更: "); Serial.print(newSleepMin); Serial.println("分");
+    }
+  }
+
+  if (flags & DL_FLAG_AVG_MEDIAN) {
+    uint8_t newAvg = payload[13];
+    uint8_t newMedian = payload[14];
+    if (newAvg == 0 || newMedian == 0) {
+      status = DL_STATUS_RANGE_ERROR;
+      Serial.println("[DOWNLINK] 値域エラー: 平均回数またはメジアン回数が0です");
+    } else if (newMedian > MEASURE_COUNT_MAX) {
+      // ★配列サイズの上限。クランプせず拒否する（要求と異なる値で黙って動かないため）。
+      status = DL_STATUS_RANGE_ERROR;
+      Serial.print("[DOWNLINK] 値域エラー: メジアン回数の上限は");
+      Serial.print(MEASURE_COUNT_MAX); Serial.println("です");
+    } else if (newAvg != s_settings.samplesPerAvg || newMedian != s_settings.measureCount) {
+      s_settings.samplesPerAvg = newAvg;
+      s_settings.measureCount  = newMedian;
+      changed = true;
+      Serial.print("[DOWNLINK] 平均回数/メジアン回数を変更: ");
+      Serial.print(newAvg); Serial.print(" / "); Serial.println(newMedian);
+    }
+  }
+
+  if (changed) saveSettings();
+
+  // ★確認応答は「変更があったか」に関わらず必ず返す。既に要求と同じ設定だった場合
+  //   （changed==false）も子機は要求された状態にあるのでGatewayにとっては成功であり、
+  //   ここで返さないと永久に再試行され続けてしまう。
+  sendDownlinkAck(status, s_settings.sleepMinutes, s_settings.samplesPerAvg, s_settings.measureCount);
+
+  // ★送信間隔が変わった場合は確認応答を送った"あとで"自ら再起動する。
+  //   nRF52のWDTは一度TASKS_STARTするとCRVを変更できず停止もできないため、新しい間隔に
+  //   対して安全なWDTを張り直すには再起動を挟むしかない。先に再起動すると応答が届かず
+  //   Gatewayが再試行を続けてしまうので、順序を入れ替えないこと。
+  if (sleepChanged) {
+    Serial.println("[DOWNLINK] 送信間隔が変わったためWDTを再設定します。再起動します...");
+    Serial.flush();
+    delay(100);  // 確認応答のUART送出が完了する猶予
+    NVIC_SystemReset();
+  }
+
+  return true;
+}
+
+// 送信直後に受信窓を開き、ダウンリンクが来ていれば適用する。
+// フレーム形式: [0xAA][LEN][payload...][checksum][RSSI]（REG3=0x80でRSSIバイトが付加される）
+static void downlinkRxWindow(uint32_t windowMs) {
+  LoraRxState state = LORA_WAIT_SYNC;
+  uint8_t body[32];
+  uint8_t len = 0, idx = 0, sum = 0;
+  bool got = false;
+  uint32_t rawByteCount = 0;
+  uint32_t start = millis();
+
+  Serial.print("[DOWNLINK] RXウィンドウ開始 "); Serial.print(windowMs); Serial.println("ms...");
+
+  while (!got && (millis() - start) < windowMs) {
+    wdtFeed();
+    while (Serial1.available()) {
+      uint8_t rxByte = (uint8_t)Serial1.read();
+      rawByteCount++;
+      switch (state) {
+        case LORA_WAIT_SYNC:
+          if (rxByte == 0xAA) { sum = rxByte; state = LORA_WAIT_LEN; }
+          break;
+        case LORA_WAIT_LEN:
+          len = rxByte;
+          sum = (uint8_t)(sum + rxByte);
+          idx = 0;
+          if (len == 0 || len > sizeof(body)) { state = LORA_WAIT_SYNC; break; }
+          state = LORA_WAIT_BODY;
+          break;
+        case LORA_WAIT_BODY:
+          body[idx++] = rxByte;
+          sum = (uint8_t)(sum + rxByte);
+          if (idx >= len) state = LORA_WAIT_CKSUM;
+          break;
+        case LORA_WAIT_CKSUM:
+          if (rxByte == sum) {
+            state = LORA_WAIT_RSSI;  // REG3=0x80によりRSSIバイトが後続する
+          } else {
+            Serial.println("[DOWNLINK] checksum不一致、破棄");
+            state = LORA_WAIT_SYNC;
+          }
+          break;
+        case LORA_WAIT_RSSI:
+          // ★自分宛てとして実際に処理できた場合のみ窓を閉じる。他機のアップリンクなど
+          //   「自分宛てでない正しい形のフレーム」を1つ拾っただけで閉じてしまうと、
+          //   その直後に届く本命のダウンリンクを取りこぼす。
+          got = applyDownlinkPayload(body, len);
+          state = LORA_WAIT_SYNC;
+          break;
+      }
+      if (got) break;
+    }
+  }
+
+  if (!got) {
+    Serial.print("[DOWNLINK] RXウィンドウ内に受信なし（生バイト受信数=");
+    Serial.print(rawByteCount);
+    // 切り分け用: 0x0のまま受信0なら「UARTは正常だがE220が何も出力していない」＝RF側の問題。
+    // bit0=OVERRUN / bit1=PARITY / bit2=FRAMING / bit3=BREAK
+    uint32_t errsrc = NRF_UARTE0->ERRORSRC;
+    if (errsrc) NRF_UARTE0->ERRORSRC = errsrc;  // 書き戻すとクリアされる
+    Serial.print(" UARTE0_ERRORSRC=0x"); Serial.print(errsrc, HEX);
+    Serial.println("）");
+  }
+}
+
 static void sendLoRa() {
   // ★一時的な緩和（iPEC疎通テスト用）: センサー・ADC未実装のためHX711/DS18B20が
   //   毎回タイムアウト/未検出エラーになるが、本テストの目的はLoRa→Gateway→iPEC
@@ -1926,6 +2272,13 @@ static void sendLoRa() {
   Serial.print("RANGE="); for (int i=0;i<4;i++){Serial.print(chRange[i]); Serial.print(" ");}
   Serial.print("BATT="); Serial.print(battV);
   Serial.print(" TIME="); Serial.print(msd[13]); Serial.print(":"); Serial.println(msd[14]);
+
+  // ★v3.20: 送信直後にダウンリンクの受信窓を開く（Class A方式）。
+  //   Gatewayはアップリンク検知から400ms待って応答してくるので、ここで待ち受ける。
+  //   送信によりE220のRF受信が止まっているため、窓を開ける直前にキックで復活させる。
+  //   E220は透過モードのままなのでM0/M1の切り替えは不要（送受信兼用）。
+  loraReviveRx();
+  downlinkRxWindow(DOWNLINK_RX_WINDOW_MS);
 }
 #endif  // COMM_MODE_LORA
 
@@ -2033,7 +2386,16 @@ void setup() {
     Serial.flush();
   }
 
-  wdtInit(WDT_TIMEOUT_MS);  // 無人運用の安全網。以降 65 分キックが無ければ自動リセット
+  // ★v3.20: WDTは送信間隔から算出するため、必ず保存済み設定を読んだ"後"に張る。
+  //   （先に張ると、ダウンリンクで変更された間隔ではなく初期値に対するタイムアウトになり、
+  //    間隔を延ばした直後に無限リブートを起こす。CLAUDE.md §7 のヒューマンエラー対策）
+#ifdef COMM_MODE_LORA
+  loadSettings();
+#endif
+  wdtInit(computeWdtTimeoutMs());  // 無人運用の安全網。送信間隔+WDT_MARGIN_MINUTES でリセット
+  Serial.print("[WDT] タイムアウト="); Serial.print(computeWdtTimeoutMs() / 60000UL);
+  Serial.print("分（送信間隔"); Serial.print(ACTIVE_SLEEP_MINUTES);
+  Serial.print("分 + マージン"); Serial.print(WDT_MARGIN_MINUTES); Serial.println("分）");
 
   rgbHwBegin();
   rgbOff();
@@ -2125,12 +2487,12 @@ void setup() {
 
 #ifdef COMM_MODE_SIGFOX
   sendSigfox();
-  deepSleep(SLEEP_MINUTES);
+  deepSleep(ACTIVE_SLEEP_MINUTES);
 #endif
 
 #ifdef COMM_MODE_LORA
   sendLoRa();
-  deepSleep(SLEEP_MINUTES);
+  deepSleep(ACTIVE_SLEEP_MINUTES);
 #endif
 
 #ifdef COMM_MODE_BLE
@@ -2206,12 +2568,12 @@ void loop() {
 
 #ifdef COMM_MODE_SIGFOX
   sendSigfox();
-  deepSleep(SLEEP_MINUTES);
+  deepSleep(ACTIVE_SLEEP_MINUTES);
 #endif
 
 #ifdef COMM_MODE_LORA
   sendLoRa();
-  deepSleep(SLEEP_MINUTES);
+  deepSleep(ACTIVE_SLEEP_MINUTES);
 #endif
 
 #ifdef COMM_MODE_BLE
