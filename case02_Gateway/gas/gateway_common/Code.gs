@@ -27,12 +27,14 @@
 //     - v5: LoRaダウンリンク（Class A + 確認応答方式）のリモート制御機能を追加（2026-08-09〜10）
 //       check_downlinks / downlink_sent / downlink_result アクション、cmd_status・downlink_logシート、
 //       Gateway操作/Flex操作メニュー
-//     - v7: 子機データ用シート(child_XX)を自動作成するようにした（2026-08-10）。
-//       従来はシートが無いとデータを黙って捨てていた（送信側は成功に見えるため気づけない）
 //     - v6: check_cmd に dl=1 パラメータを追加（2026-08-10）。本番Gateway(v1.20)への統合用。
 //       dl=1 のときだけ応答を複数行化し、2行目以降にダウンリンク予約を返す。
 //       dl未指定なら従来とまったく同じ1行応答（gateway_v1.1はこちら）。
 //       check_downlinks は検証用テストスケッチが使い続けるため残してある。
+//     - v7: 子機データ用シート(child_XX)を自動作成するようにした（2026-08-10）。
+//       従来はシートが無いとデータを黙って捨てていた（送信側は成功に見えるため気づけない）
+//     - v8: ダウンリンク予約の read-modify-write（queueDownlink_ / downlink_result /
+//       downlink_sent）にLockServiceを適用（2026-08-11）。並行リクエストでの更新消失を防止
 //
 //   対応する子機ファーム:
 //     - project07_NEXCO/firmware/src/main.cpp（COMM_MODE_BLE、本番項目用）
@@ -217,7 +219,8 @@ function dlSet_(childHex, obj) {
 //   ★attemptsもseqもGAS側を正とする。Gateway側で数えると、再取得のたびにリセットされたり、
 //     予約を入れ直しても古い試行回数を引き継いだりするため。
 //   ★mode: 0=通常の設定変更 / 1=ステータス確認のみ（設定変更フラグを立てずに送る）
-// ★AT+SHREQ経由の応答サイズに収まるよう、1回に返すのは最大DOWNLINK_MAX_LINES件までとする。
+// ★GatewayはAT+HTTPTOFS方式でこの応答を取得する（HEADERLEN等の制限を受けない）ため、
+//   件数上限はサイズ制約ではなく運用上の目安として1回にDOWNLINK_MAX_LINES件までとする。
 //   14台×約20バイト＝約280バイトで、check_cmdのコマンド行と合わせても十分小さい。
 // check_downlinks（テストスケッチ用）と check_cmd（本番Gateway用、2行目以降に相乗り）の
 // 両方から呼ばれる。表現を1か所に集約し、片方だけ形式が変わる事故を防ぐ。
@@ -295,20 +298,31 @@ function getKnownChildSettings_(childHex) {
 // （現在の送信間隔・平均・メジアン・WDTタイムアウト）を必ず返すため、この応答だけを
 // 目的に使う。sleep/avg/medianは送信フレームには使われないダミー値でよい。
 function queueDownlink_(childHex, sleepMin, avg, median, sourceNote, mode) {
-  var prevRec = dlGet_(childHex);
-  var nextSeq = (prevRec && prevRec.seq ? prevRec.seq : 0) + 1;
+  // ★同時予約でseqの採番・予約更新が競合しないようにする。
+  var lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
 
-  dlSet_(childHex, {
-    sleep: sleepMin, avg: avg, median: median,
-    state: 'queued', attempts: 0, seq: nextSeq,
-    mode: mode || 'set',
-  });
+    var prevRec = dlGet_(childHex);
+    var nextSeq = (prevRec && prevRec.seq ? prevRec.seq : 0) + 1;
 
-  dlLog_(childHex, nextSeq, (mode === 'status') ? 'ステータス確認要求' : '予約',
-         (mode === 'status') ? '（設定変更なし）' : ('間隔=' + sleepMin + '分 / 平均=' + avg + ' / メジアン=' + median),
-         (prevRec && prevRec.state !== 'done' && prevRec.state !== 'failed')
-           ? '★未完了の予約(seq=' + prevRec.seq + ')を上書きしました'
-           : sourceNote);
+    dlSet_(childHex, {
+      sleep: sleepMin, avg: avg, median: median,
+      state: 'queued', attempts: 0, seq: nextSeq,
+      mode: mode || 'set',
+    });
+
+    dlLog_(childHex, nextSeq, (mode === 'status') ? 'ステータス確認要求' : '予約',
+           (mode === 'status') ? '（設定変更なし）' : ('間隔=' + sleepMin + '分 / 平均=' + avg + ' / メジアン=' + median),
+           (prevRec && prevRec.state !== 'done' && prevRec.state !== 'failed')
+             ? '★未完了の予約(seq=' + prevRec.seq + ')を上書きしました'
+             : sourceNote);
+  } catch (err) {
+    console.log('Downlink reservation lock error: ' + err);
+    return ContentService.createTextOutput('error: lock timeout');
+  } finally {
+    try { lock.releaseLock(); } catch (e2) {}
+  }
 
   refreshCmdStatusSheet();
 }
@@ -981,7 +995,7 @@ function doGet(e) {
   //   子機が起きた瞬間に応答しなければならない（受信窓は2秒）ため、Gatewayは事前に
   //   この結果をローカルにキャッシュしておき、アップリンク受信時はネットワークを介さず
   //   即座にLoRa送信する。1行1件・改行区切りで返す: "08:4:5:5:0:1:0\n0E:60:10:10:0:1:1"
-  //   ★AT+SHREQの512バイト制限に収まるよう、1回に返すのは最大20件までとする。
+  //   ★件数上限はDOWNLINK_MAX_LINES（buildDownlinkLines_参照）を参照。
   if (p.action === 'check_downlinks') {
     var lines = buildDownlinkLines_();
     return ContentService.createTextOutput(lines.length ? lines.join('\n') : 'none');
@@ -1003,30 +1017,41 @@ function doGet(e) {
                   (wdtMin ? ('（WDT=' + wdtMin + '分）') : '');
     var statusNum = parseInt(p.status || '0', 10);
 
-    var rec = dlGet_(childHex);
+    // ★予約結果の照合・状態更新が新しい予約と競合しないようにする。
+    var lock = LockService.getScriptLock();
+    try {
+      lock.waitLock(10000);
 
-    // ★履歴は「予約が今も生きているか」に関わらず必ず残す。
-    //   以前はstale時にここより前でreturnしていたため、予約を入れ直すと
-    //   「実際に子機へ配信されて適用された」事実が履歴から消えていた。
-    if (!rec || String(p.seq || '') !== String(rec.seq || '')) {
-      dlLog_(childHex, p.seq, '結果(期限切れ)', '適用値: ' + applied,
-             'この応答が返る前に予約が入れ替わっていたため、現在の予約状態には反映していません' +
-             '（子機側では実際に適用されています）');
-      return ContentService.createTextOutput('stale: seq mismatch');
+      var rec = dlGet_(childHex);
+
+      // ★履歴は「予約が今も生きているか」に関わらず必ず残す。
+      //   以前はstale時にここより前でreturnしていたため、予約を入れ直すと
+      //   「実際に子機へ配信されて適用された」事実が履歴から消えていた。
+      if (!rec || String(p.seq || '') !== String(rec.seq || '')) {
+        dlLog_(childHex, p.seq, '結果(期限切れ)', '適用値: ' + applied,
+               'この応答が返る前に予約が入れ替わっていたため、現在の予約状態には反映していません' +
+               '（子機側では実際に適用されています）');
+        return ContentService.createTextOutput('stale: seq mismatch');
+      }
+
+      rec.status        = statusNum;
+      rec.attempts      = parseInt(p.attempts || '0', 10);
+      rec.appliedSleep  = parseInt(p.sleep  || '0', 10);
+      rec.appliedAvg    = parseInt(p.avg    || '0', 10);
+      rec.appliedMedian = parseInt(p.median || '0', 10);
+      rec.appliedWdtMin = wdtMin;
+      rec.state = (rec.status === DL_STATUS_OK || rec.status === DL_STATUS_CLAMPED) ? 'done' : 'failed';
+      dlSet_(childHex, rec);
+
+      dlLog_(childHex, p.seq, '結果',
+             '要求: ' + rec.sleep + ' / ' + rec.avg + ' / ' + rec.median + '　→　適用: ' + applied,
+             dlStatusLabel_(rec) + '（' + rec.attempts + '回目で確定）');
+    } catch (err) {
+      console.log('Downlink result lock error: ' + err);
+      return ContentService.createTextOutput('error: lock timeout');
+    } finally {
+      try { lock.releaseLock(); } catch (e2) {}
     }
-
-    rec.status        = statusNum;
-    rec.attempts      = parseInt(p.attempts || '0', 10);
-    rec.appliedSleep  = parseInt(p.sleep  || '0', 10);
-    rec.appliedAvg    = parseInt(p.avg    || '0', 10);
-    rec.appliedMedian = parseInt(p.median || '0', 10);
-    rec.appliedWdtMin = wdtMin;
-    rec.state = (rec.status === DL_STATUS_OK || rec.status === DL_STATUS_CLAMPED) ? 'done' : 'failed';
-    dlSet_(childHex, rec);
-
-    dlLog_(childHex, p.seq, '結果',
-           '要求: ' + rec.sleep + ' / ' + rec.avg + ' / ' + rec.median + '　→　適用: ' + applied,
-           dlStatusLabel_(rec) + '（' + rec.attempts + '回目で確定）');
 
     refreshCmdStatusSheet();
     return ContentService.createTextOutput('ok');
@@ -1036,20 +1061,31 @@ function doGet(e) {
   //   状態を queued → sent に進め、試行回数を記録する。予約自体は消さない（確認が取れるまで再試行）。
   if (p.action === 'downlink_sent') {
     var sentHex = String(p.child || '').toUpperCase();
-    var sentRec = dlGet_(sentHex);
+    // ★送信報告の照合・状態更新が新しい予約と競合しないようにする。
+    var lock = LockService.getScriptLock();
+    try {
+      lock.waitLock(10000);
 
-    if (!sentRec || String(p.seq || '') !== String(sentRec.seq || '')) {
-      dlLog_(sentHex, p.seq, '送信(期限切れ)', '', '送信後に予約が入れ替わっていました');
-      return ContentService.createTextOutput('stale: seq mismatch');
+      var sentRec = dlGet_(sentHex);
+
+      if (!sentRec || String(p.seq || '') !== String(sentRec.seq || '')) {
+        dlLog_(sentHex, p.seq, '送信(期限切れ)', '', '送信後に予約が入れ替わっていました');
+        return ContentService.createTextOutput('stale: seq mismatch');
+      }
+
+      sentRec.state = 'sent';
+      sentRec.attempts = parseInt(p.attempts || '1', 10);
+      dlSet_(sentHex, sentRec);
+
+      dlLog_(sentHex, p.seq, '送信',
+             '間隔=' + sentRec.sleep + '分 / 平均=' + sentRec.avg + ' / メジアン=' + sentRec.median,
+             sentRec.attempts + '回目（子機からの確認応答を待っています）');
+    } catch (err) {
+      console.log('Downlink sent lock error: ' + err);
+      return ContentService.createTextOutput('error: lock timeout');
+    } finally {
+      try { lock.releaseLock(); } catch (e2) {}
     }
-
-    sentRec.state = 'sent';
-    sentRec.attempts = parseInt(p.attempts || '1', 10);
-    dlSet_(sentHex, sentRec);
-
-    dlLog_(sentHex, p.seq, '送信',
-           '間隔=' + sentRec.sleep + '分 / 平均=' + sentRec.avg + ' / メジアン=' + sentRec.median,
-           sentRec.attempts + '回目（子機からの確認応答を待っています）');
 
     refreshCmdStatusSheet();
     return ContentService.createTextOutput('ok');

@@ -230,7 +230,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 88;
+static uint8_t  const GATEWAY_FW_VERSION = 90;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -1236,27 +1236,48 @@ struct DownlinkReport {
   uint32_t seq;
   uint16_t wdtMin;  // 子機の確認応答に載る、適用後に有効になるWDTタイムアウト（分）
 };
-#define MAX_REPORTS 8
+#define MAX_REPORTS 32
 static DownlinkReport s_reports[MAX_REPORTS];
 
 static void queueReport(bool finalResult, uint8_t childId, uint8_t status,
                         uint16_t sleepMin, uint8_t avg, uint8_t median,
                         uint8_t attempts, uint32_t seq, uint16_t wdtMin = 0) {
+  int slot = -1;
   for (int i = 0; i < MAX_REPORTS; i++) {
-    if (s_reports[i].used) continue;
-    s_reports[i].used        = true;
-    s_reports[i].finalResult = finalResult;
-    s_reports[i].childId     = childId;
-    s_reports[i].status      = status;
-    s_reports[i].sleepMin    = sleepMin;
-    s_reports[i].avg         = avg;
-    s_reports[i].median      = median;
-    s_reports[i].attempts    = attempts;
-    s_reports[i].seq         = seq;
-    s_reports[i].wdtMin      = wdtMin;
+    if (!s_reports[i].used) {
+      slot = i;
+      break;
+    }
+  }
+
+  // ★LTE-M不調でキューが満杯でも、最終結果を失うとGASの予約が未完了のまま残り、
+  //   子機への再送が続いてしまう。中間報告(downlink_sent)は失ってもよいため、
+  //   最終結果だけは既存の中間報告を上書きして優先する。
+  if (slot < 0 && finalResult) {
+    for (int i = 0; i < MAX_REPORTS; i++) {
+      if (!s_reports[i].finalResult) {
+        slot = i;
+        Serial.println(F("[REPORT] キュー満杯のため中間報告を最終結果で上書きします"));
+        break;
+      }
+    }
+  }
+
+  if (slot < 0) {
+    Serial.println(F("[REPORT] キューが満杯のため報告を破棄しました"));
     return;
   }
-  Serial.println(F("[REPORT] キューが満杯のため報告を破棄しました"));
+
+  s_reports[slot].used        = true;
+  s_reports[slot].finalResult = finalResult;
+  s_reports[slot].childId     = childId;
+  s_reports[slot].status      = status;
+  s_reports[slot].sleepMin    = sleepMin;
+  s_reports[slot].avg         = avg;
+  s_reports[slot].median      = median;
+  s_reports[slot].attempts    = attempts;
+  s_reports[slot].seq         = seq;
+  s_reports[slot].wdtMin      = wdtMin;
 }
 
 // ★「実際に送信したダウンリンク」の控え。
@@ -3077,7 +3098,33 @@ static uint32_t lastSend = 0;
 #else
 #define CMD_CHECK_INTERVAL_MS (15UL * 60UL * 1000UL)   // 15分
 #endif
+#define CMD_CHECK_JITTER_SECONDS 180UL                 // ±3分
+#define CMD_CHECK_INTERVAL_MIN_MS (30UL * 1000UL)      // テスト用3分でも0以下にしない下限
+
+// ★子機の送信周期は60分（乱数ジッターは±10秒）で、従来の固定15分確認周期とは4周期ごとに
+// 重なる。同じ時刻にGAS通信(s_atBusy)が始まると子機アップリンクのダウンリンク送信を毎回
+// 見送る状態が永久に続き得るため、Gateway側もnRF52840内蔵RNGで確認周期をずらす。
+static uint8_t gatewayTrueRandomByte() {
+  NRF_RNG->TASKS_START = 1;
+  NRF_RNG->EVENTS_VALRDY = 0;
+  while (NRF_RNG->EVENTS_VALRDY == 0) { /* HW RNGの1バイト生成を待つ（数十us程度） */ }
+  uint8_t value = (uint8_t)NRF_RNG->VALUE;
+  NRF_RNG->EVENTS_VALRDY = 0;
+  NRF_RNG->TASKS_STOP = 1;
+  return value;
+}
+
+static uint32_t makeCmdCheckIntervalMs() {
+  uint16_t raw = ((uint16_t)gatewayTrueRandomByte() << 8) | gatewayTrueRandomByte();
+  int32_t jitterSeconds = (int32_t)(raw % (CMD_CHECK_JITTER_SECONDS * 2UL + 1UL))
+                       - (int32_t)CMD_CHECK_JITTER_SECONDS;
+  int32_t intervalMs = (int32_t)CMD_CHECK_INTERVAL_MS + jitterSeconds * 1000L;
+  if (intervalMs < (int32_t)CMD_CHECK_INTERVAL_MIN_MS) intervalMs = CMD_CHECK_INTERVAL_MIN_MS;
+  return (uint32_t)intervalMs;
+}
+
 static uint32_t lastCmdCheck = 0;
+static uint32_t nextCmdCheckIntervalMs = CMD_CHECK_INTERVAL_MS;
 
 // ★報告（downlink_sent / downlink_result）は確認間隔を待たずに送る。
 //   確認間隔の到来を待つと、子機の応答を受けてから結果がスプレッドシートに出るまで
@@ -3608,7 +3655,8 @@ void setup() {
   if (netOk) {
     checkRemoteCmd();  // 起動直後に一度、コマンドとダウンリンク予約を取得する
 #ifdef COMM_MODE_LORA
-    lastCmdCheck = millis();  // 直後にもう一度走らないよう15分タイマーを起点合わせする
+    lastCmdCheck = millis();
+    nextCmdCheckIntervalMs = makeCmdCheckIntervalMs();  // 次回は固定周期にせず衝突時刻をずらす
 #endif
   }
 
@@ -3688,8 +3736,7 @@ void loop() {
   //   ここではデータ送信(flushRecords)は行わない。予約の取得と結果報告だけを行う。
   //   ※この直後の送信ブロックが動く場合はそちらでも確認するが、lastCmdCheckを
   //     更新し合うので二重に走ることはない。
-  if (now - lastCmdCheck >= CMD_CHECK_INTERVAL_MS) {
-    lastCmdCheck = now;
+  if (now - lastCmdCheck >= nextCmdCheckIntervalMs) {
     Serial.print(F("\n=== ダウンリンク予約の確認（本文取得の累計 "));
     Serial.print(s_gasFetchOk); Serial.print(F("/")); Serial.print(s_gasFetchTry);
     Serial.println(F(" 成功） ==="));
@@ -3699,6 +3746,8 @@ void loop() {
     } else {
       Serial.println(F("[CACHE] ネットワーク未接続のため確認をスキップします"));
     }
+    lastCmdCheck = millis();
+    nextCmdCheckIntervalMs = makeCmdCheckIntervalMs();  // 今回の確認完了後、次周期も乱数でずらす
   }
 #endif
 
@@ -3748,7 +3797,8 @@ void loop() {
     if (ensureNetworkReady()) {
       checkRemoteCmd();
 #ifdef COMM_MODE_LORA
-      lastCmdCheck = millis();  // ここで確認したので、15分タイマーも仕切り直す
+      lastCmdCheck = millis();
+      nextCmdCheckIntervalMs = makeCmdCheckIntervalMs();  // 定期送信内の確認後も次周期をずらす
       // ★v1.20: ダウンリンクの送信・確認応答の報告をGASへ流す。
       //   loraPoll()の中（＝AT通信の待機ループ内）から送るとAT通信が入れ子になって
       //   破綻するため、キューに積んでおいたものをここで安全にまとめて送る。
