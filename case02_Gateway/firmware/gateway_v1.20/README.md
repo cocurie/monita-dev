@@ -2,7 +2,7 @@
 title: Monita Gateway v1.20 ファームウェア
 domain: iot_device
 tags: [gateway, nRF52840, SIM7080G, BLE, LoRa, E220-900T22S, LTE-M, DS3231, SD, GAS, DIP, downlink]
-updated: 2026-08-10
+updated: 2026-08-16
 ---
 
 # gateway_v1.20
@@ -84,6 +84,13 @@ GAS 側の `doGet(e)` は「子機データ行」と「起動確認用の設定�
 | `r{i}` | i番目の BLE RSSI (dBm) |
 
 payload は GAS 側で PktType・DeviceID・CH1〜CH6・FlexHour/Min に汎用パースする（バイト長からチャンネル数を自動判定。将来12バイト/6チャンネル拡張に対応）。
+
+### Monita One / クラウド形式V2
+
+許可する子機DeviceIDは`0x01〜0x0F`。Oneを接続するGatewayでは`platformio.ini`の
+コメント例に従って`CLOUD_FMT_V2`を有効にする。既定（フラグなし）は旧GAS互換の
+13バイト/台（26 hex）のままで、V2時だけ電池電圧を末尾へ追加した14バイト/台
+（28 hex）になる。対向GASには`gas/one/Code.gs`を使用する。
 
 ### 起動確認情報行（`row_type=info`）
 

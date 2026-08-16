@@ -218,19 +218,19 @@ static uint32_t       sendIntervalMs           = SEND_INTERVAL_DEFAULT_MS;  // �
 
 // Pkt type と併せて二重チェックする Device ID ホワイトリスト（BLE/LoRa共通）
 // 2026-07-20: test_sketches/22_lora_multi_child によるLoRa複数台テスト(13台)用に拡張
-// ★2026-08-10(v1.20): 0x0Eを追加。ダウンリンク側の MAX_PENDING_CHILDREN(14) と
-//   GAS側の CMD_STATUS_CHILD_IDS（'01'〜'0E'）は14台を前提にしており、ここだけ13台で
-//   食い違っていた。そのため Flex v3.20（DEVICE_ID=0x0E）のフレームが
+// ★2026-08-16(v1.20): One用の0x0Fを追加。ダウンリンク側の MAX_PENDING_CHILDREN(15) と
+//   GAS側の CMD_STATUS_CHILD_IDS（'01'〜'0F'）も15台を前提にする。
+//   以前は一覧の食い違いにより Flex v3.20（DEVICE_ID=0x0E）のフレームが
 //   isAllowedFlexPacket() で黙って棄却され、受信はできているのに台数0・ダウンリンク
 //   送信も起こらない状態になっていた（実機で確認）。3か所は必ず同じ台数に揃えること。
 static uint8_t  const ALLOWED_DEVICE_IDS[] = {
-  0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+  0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
 };   // ★子機を増やしたらここに追加する
 static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / sizeof(ALLOWED_DEVICE_IDS[0]);
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 90;
+static uint8_t  const GATEWAY_FW_VERSION = 91;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
@@ -1188,7 +1188,7 @@ void sendLogDumpToGAS() {
 // 自動的に再試行される。規定回数試しても確認が返らなければ未達としてGASへ報告する。
 #ifdef COMM_MODE_LORA
 
-#define MAX_PENDING_CHILDREN   14   // 子機DeviceID 0x01〜0x0E
+#define MAX_PENDING_CHILDREN   15   // 子機DeviceID 0x01〜0x0F
 #define DOWNLINK_MAX_ATTEMPTS  3    // この回数送っても確認が返らなければ未達として打ち切る
 
 // ★同じ子機への連続送信を抑制する時間。
@@ -1672,6 +1672,16 @@ void scanCallback(ble_gap_evt_adv_report_t* report) {
   }
 
   if (msd == nullptr) { Bluefruit.Scanner.resume(); return; }
+  // Flex / One のセンサフレームは19バイト固定。短いフレームを通すと、後段で
+  // CH2〜4や電池電圧を未受信領域から読み出してクラウドへ送ってしまうため、
+  // PktType / DeviceID の判定より前に固定長を検証する。
+  if (msdLen != 19) {
+    Serial.print(F("[BLE] 不正なMSD長を破棄: "));
+    Serial.print(msdLen);
+    Serial.println(F(" バイト（期待値19）"));
+    Bluefruit.Scanner.resume();
+    return;
+  }
   // MSD フォーマット: msd[0]=Pkt type, msd[1]=Device ID
   uint8_t pktType  = (msdLen >= 1) ? msd[0] : 0xFF;
   uint8_t deviceId = (msdLen >= 2) ? msd[1] : 0xFF;
@@ -2243,6 +2253,13 @@ static void loraPoll() {
     s_loraLastRxMs = millis();  // 受信が生きている証跡（ストール監視の基準）
     if (loraFeedByte(b)) {
       s_loraFramesOk++;
+      if (s_loraLen < 2) {
+        Serial.print(F("[LORA] 不正な短フレームを破棄: "));
+        Serial.print(s_loraLen);
+        Serial.println(F(" バイト"));
+        s_loraRejected++;
+        continue;
+      }
       uint8_t pktType  = s_loraBody[0];
       uint8_t deviceId = s_loraBody[1];
 
@@ -2250,6 +2267,16 @@ static void loraPoll() {
       //   レコード更新には回さず、ここで処理を終える。
       if (pktType == DOWNLINK_ACK_PKT_TYPE) {
         onDownlinkAckReceived(s_loraBody, s_loraLen);
+        continue;
+      }
+
+      // センサデータはFlex / Oneとも19バイト固定。短いフレームを許すと未受信の
+      // CH2〜4や電池電圧が残留値のままクラウドへ出るため、厳密一致で検証する。
+      if (s_loraLen != 19) {
+        Serial.print(F("[LORA] 不正なセンサフレーム長を破棄: "));
+        Serial.print(s_loraLen);
+        Serial.println(F(" バイト（期待値19）"));
+        s_loraRejected++;
         continue;
       }
 
@@ -2844,6 +2871,17 @@ void postBootInfoRow() {
 // 実測バイト数で都度判定する方式にした。
 static uint16_t const SHREQ_MAX_URL_BYTES = 512;
 
+// 子機フレーム内の電池電圧(mV)をクラウドV2形式の1バイトへ圧縮する。
+// 255は未取得、0/254は表現範囲の下限/上限への飽和を表す。
+#ifdef CLOUD_FMT_V2
+static uint8_t encodeBatt(uint16_t mV) {
+  if (mV == 0)    return 255;
+  if (mV <= 3000) return 0;
+  uint32_t v = ((uint32_t)mV - 3000U + 2U) / 5U;  // round half up
+  return (v >= 254U) ? 254 : (uint8_t)v;
+}
+#endif
+
 // merged[start..n) から、scriptPath全体（/macros/s/+ID+?+params）が512バイトを超えない
 // 範囲で可能な限り多くの台数を1バッチに詰め込む。採用した台数を返し、outParamsに
 // 完成したクエリ文字列（q=...&n=...&d=...）を格納する。
@@ -2875,14 +2913,27 @@ int buildBatchQuery(const FlexRecord* merged, int start, int n,
   // ★2026-07-25: Gateway RTC(DS3231)の受信時刻(UNIX epoch, uint32 LE)を先頭に追加。
   // GAS側の受信日時(サーバnew Date())は送信サイクルの時刻であり実測時刻ではないため、
   // 再送キューで複数回分がまとめて届いた場合に測定タイミングを区別できるようにする。
-  // Epoch(4B)+DeviceID(1B)+CH1-4(8B) = 13バイト/台 = 26 hex文字。
+  // 既定: Epoch(4B)+DeviceID(1B)+CH1-4(8B) = 13バイト/台 = 26 hex文字。
+  // CLOUD_FMT_V2時のみ末尾へBATT(1B)を加え、14バイト/台 = 28 hex文字にする。
+  // ビルドフラグ無しの既存現場ではwire formatを一切変えない。
   String body = "";
   int count = 0;
   for (int i = start; i < n; i++) {
     const FlexRecord& rec = merged[i];
-    if (rec.payloadLen < 11) continue;  // DeviceID+CH1-4に満たない不正レコードは送らない
+    if (rec.payloadLen != 19) continue;  // Flex / Oneのセンサフレームは19バイト固定
 
-    char chunk[27];
+    char chunk[29];
+#ifdef CLOUD_FMT_V2
+    uint16_t battMv = (uint16_t)rec.payload[11] | ((uint16_t)rec.payload[12] << 8);
+    snprintf(chunk, sizeof(chunk), "%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+             (uint8_t)(rec.rtcEpoch & 0xFF),
+             (uint8_t)((rec.rtcEpoch >> 8) & 0xFF),
+             (uint8_t)((rec.rtcEpoch >> 16) & 0xFF),
+             (uint8_t)((rec.rtcEpoch >> 24) & 0xFF),
+             rec.payload[1], rec.payload[3], rec.payload[4], rec.payload[5],
+             rec.payload[6], rec.payload[7], rec.payload[8], rec.payload[9], rec.payload[10],
+             encodeBatt(battMv));
+#else
     snprintf(chunk, sizeof(chunk), "%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
              (uint8_t)(rec.rtcEpoch & 0xFF),
              (uint8_t)((rec.rtcEpoch >> 8) & 0xFF),
@@ -2890,10 +2941,12 @@ int buildBatchQuery(const FlexRecord* merged, int start, int n,
              (uint8_t)((rec.rtcEpoch >> 24) & 0xFF),
              rec.payload[1], rec.payload[3], rec.payload[4], rec.payload[5],
              rec.payload[6], rec.payload[7], rec.payload[8], rec.payload[9], rec.payload[10]);
+#endif
 
     // "&n=" の桁数は最終台数が決まるまで確定しないため、2桁分（最大99台）を先に見込んでおく
-    // "&d=" は先頭1回だけ付くので、2台目以降は純粋にchunk(26文字)分だけ伸びる
-    size_t oneLen = (count == 0) ? (String(F("&d=")).length() + 26) : 26;
+    // "&d=" は先頭1回だけ付く。chunk長は旧26 / V2 28文字を実値から使う。
+    size_t chunkLen = strlen(chunk);
+    size_t oneLen = (count == 0) ? (String(F("&d=")).length() + chunkLen) : chunkLen;
     size_t projected = baseUrl.length() + header.length() + String(F("&n=99")).length()
                         + body.length() + oneLen;
     if (count > 0 && projected > SHREQ_MAX_URL_BYTES) {

@@ -1,11 +1,8 @@
 // ================================
-// Monita Gateway (LTE-M/LoRa) → GAS 汎用バックエンド
+// Monita Gateway (LTE-M/LoRa) → GAS Monita One向けバックエンド
 //
-// ★このファイルの位置づけ: 各案件へコピーする「元ファイル（テンプレート）」。
-//   特定の現場・本番監視に紐づくものではない。案件ごとに本ファイルをコピーして
-//   それぞれ独立したApps Scriptプロジェクト／スプレッドシートを立てて運用する。
-//   各案件で加えた個別の変更は、その案件のフォルダ側で管理すること
-//   （このファイルへ現場固有の設定を書き戻さない）。
+// ★gateway_commonを基に、DEVICE_ID 0x0FのOne-PIR設定だけを追加した案件用コピー。
+//   デプロイ前にSPREADSHEET_IDと通知先を必ず設定すること。
 //
 // ================================
 // バージョン対応表
@@ -470,7 +467,7 @@ const CMD_STATUS_GATEWAY_IDS = [
 // 子機自体はGASを直接ポーリングしないため、pending_cmd_<id>という個別の予約枠は無い。
 // 現在lora_downlink_testに積まれているdownlinkコマンドの宛先と一致する行にだけ、
 // その内容を表示する（一度に1台分しか予約できない設計のため）。
-const CMD_STATUS_CHILD_IDS = ['01', '02', '03', '04', '05', '06', '07', '08', '09', '0A', '0B', '0C', '0D', '0E'];
+const CMD_STATUS_CHILD_IDS = ['01', '02', '03', '04', '05', '06', '07', '08', '09', '0A', '0B', '0C', '0D', '0E', '0F'];
 
 // ★2026-08-10追加: MAC列。「シート名編集」タブを廃止し、LoRa子機のMAC↔シート名対応を
 // cmd_statusだけで完結させるため（MAC自体はgetDeviceSheetNameByMac_の導出ロジックが
@@ -622,9 +619,9 @@ function testMailPermission() {
 // 基本設定
 // ================================
 
-// ★要設定: 案件ごとにコピーした側で対象スプレッドシートIDへ置き換えること。
-// gateway_common はコピー元テンプレートなので、現場固有のIDを置かない。
-const SPREADSHEET_ID = 'REPLACE_WITH_SPREADSHEET_ID';
+// ★要設定: One用に新規作成したスプレッドシートのIDへ置き換えること。
+// プレースホルダのままデプロイしない。
+const SPREADSHEET_ID = 'REPLACE_WITH_ONE_SPREADSHEET_ID';
 
 // ================================
 // 製品種別プロファイル / DEVICE_ID台帳
@@ -632,7 +629,7 @@ const SPREADSHEET_ID = 'REPLACE_WITH_SPREADSHEET_ID';
 // channelDefsの順番はGatewayレコードのCH1〜CH4に対応する。
 // scaleで表示値へ換算し、missingValuesに一致する値は空欄にする。
 // alertを定義すると、閾値到達時にprofile_alertsシートへ記録する。
-// DEVICE_PRODUCT_REGISTRYの中身は案件固有なので、この共通テンプレートでは空にする。
+// One案件では0x0FをOne-PIRとして扱う。他のIDは従来Flex表示へフォールバックする。
 const PRODUCT_PROFILES = {
   FLEX: {
     productType: 'Flex',
@@ -643,10 +640,27 @@ const PRODUCT_PROFILES = {
       { key: 'CH4', label: 'CH4 メジアン', unit: 'με', scale: 1 },
     ],
   },
+  ONE_PIR: {
+    productType: 'One-PIR',
+    rowMissingWhen: { channel: 0, value: -1, blankChannels: [0, 1] },
+    channelDefs: [
+      { key: 'CH1', label: '最大人数', unit: '人', scale: 1, missingValues: [-1] },
+      { key: 'CH2', label: '平均人数', unit: '人', scale: 0.1, decimals: 1, missingValues: [-1] },
+      {
+        key: 'CH3', label: 'PIRイベント数', unit: '回', scale: 1,
+        alert: {
+          operator: 'gte', threshold: 32767,
+          title: '【Monita One警告】PIRイベント数が上限に到達',
+          message: 'PIRイベント数が32767に張り付いています。PIR故障の疑いがあります。',
+        },
+      },
+      { key: 'CH4', label: 'スキャン回数', unit: '回', scale: 1, zeroMeansNoMeasurement: true },
+    ],
+  },
 };
 const DEFAULT_PRODUCT_TYPE = 'FLEX';
 const DEVICE_PRODUCT_REGISTRY = {
-  // 例: 'AB': 'PRODUCT_KEY'（実際の台帳は案件側で定義する）
+  '0F': 'ONE_PIR',
 };
 
 // ★2026-08-04追加: リモートコマンド（resetなど）用のトークン。
@@ -1058,6 +1072,16 @@ function checkProfileAlerts_(ss, profile, values, mac, measuredAt) {
   });
 }
 
+// 製品種別ごとにアラート経路を分離する。
+// デバイスシート内のCH1〜CH12設定はFlex用のひずみ閾値なので、One-PIRには流用しない。
+// One-PIRはPRODUCT_PROFILES.ONE_PIRで定義したPIR故障アラートだけを評価する。
+function checkAlertsForProductProfile_(ss, sheet, profile, dataObj, mac, displayCh, measuredAt) {
+  if (profile.productType === PRODUCT_PROFILES.FLEX.productType) {
+    checkAlertsForDeviceSheet(sheet, dataObj, mac);
+  }
+  checkProfileAlerts_(ss, profile, displayCh, mac, measuredAt);
+}
+
 
 // ================================
 // Webhook 受信本体（GET）
@@ -1381,13 +1405,13 @@ function doGet(e) {
         d.battV,                                               // Q: 電池電圧(V)
       ]);
 
-      // シート設定による従来アラートには製品別の表示値を渡す。
+      // Flexのシート設定による従来アラートには表示値を渡す。
+      // One-PIRではこのdataObjを旧ひずみ閾値へ渡さない。
       var dataObj = {
         CH1: displayCh[0], CH2: displayCh[1], CH3: displayCh[2], CH4: displayCh[3],
       };
 
-      checkAlertsForDeviceSheet(sheet, dataObj, mac);
-      checkProfileAlerts_(ss, profile, displayCh, mac, measuredAt);
+      checkAlertsForProductProfile_(ss, sheet, profile, dataObj, mac, displayCh, measuredAt);
     }
 
   } catch (err) {
