@@ -470,7 +470,11 @@ const CMD_STATUS_GATEWAY_IDS = [
 // 子機自体はGASを直接ポーリングしないため、pending_cmd_<id>という個別の予約枠は無い。
 // 現在lora_downlink_testに積まれているdownlinkコマンドの宛先と一致する行にだけ、
 // その内容を表示する（一度に1台分しか予約できない設計のため）。
-const CMD_STATUS_CHILD_IDS = ['01', '02', '03', '04', '05', '06', '07', '08', '09', '0A', '0B', '0C', '0D', '0E'];
+const CMD_STATUS_CHILD_IDS = [
+  '01', '02', '03', '04', '05', '06', '07', '08', '09', '0A', '0B', '0C', '0D', '0E', '0F', '10',
+  '11', '12', '13', '14', '15', '16', '17', '18', '19', '1A', '1B', '1C', '1D', '1E', '1F',
+];
+// 群1以降は実機の群番号確定後にここへ追加する。
 
 // ★2026-08-10追加: MAC列。「シート名編集」タブを廃止し、LoRa子機のMAC↔シート名対応を
 // cmd_statusだけで完結させるため（MAC自体はgetDeviceSheetNameByMac_の導出ロジックが
@@ -935,7 +939,7 @@ function extractLoraChildHexFromMac_(mac) {
 }
 
 // ★2026-08-16改訂: CMD_STATUS_CHILD_IDSに登録したLoRa子機は
-// 「シート名編集」への手動登録が不要になった（Gatewayの許可範囲は0x01〜0x0F）。
+// 「シート名編集」への手動登録が不要になった（群0の許可範囲は0x01〜0x1F）。
 // gateway_v1.1が送る疑似MACは "00-00-00-00-00-<DeviceID>" という固定形式なので、
 // DeviceIDから "child_<HEX2>" というシート名を直接導出できる。cmd_statusシートで
 // 予約状況とデータ振り分け先を1つのタブにまとめて見られるようにするための変更
@@ -1249,7 +1253,7 @@ function doGet(e) {
     if (statusSheet) {
       statusSheet.appendRow([
         new Date(),                                              // A: 受信日時
-        'GW',                                                    // B: DeviceID欄にGW識別子
+        p.device_id || 'GW',                                     // B: DeviceID欄にGW識別子
         '',                                                      // C: 温度
         '', '', '', '',                                          // D-G: CH med
         '', '', '', '', '', '', '', '',                          // H-O: Max/Min
@@ -1284,7 +1288,7 @@ function doGet(e) {
     console.log('[INFO] ts=' + p.ts + ' sim=' + p.sim + ' csq=' + p.csq +
       ' xiao_id=' + p.xiao_id + ' sim_imei=' + p.sim_imei +
       ' sd=' + p.sd + ' interval_min=' + p.interval_min + ' devcount=' + p.devcount +
-      ' gw_fw=' + p.gw_fw);
+      ' gw_fw=' + p.gw_fw + ' gw_id=' + p.gw_id + ' group=' + p.group);
 
     var infoSheet = getSpreadsheet().getSheetByName('databox');
     if (infoSheet) {
@@ -1297,6 +1301,8 @@ function doGet(e) {
         '', '', '', '', '', '', '', '',                          // H-O: Max/Min
         p.csq || '',                                             // P: CSQ
         'fw' + (p.gw_fw || '?') + ' xiao=' + (p.xiao_id || '') + ' imei=' + (p.sim_imei || ''),
+        p.gw_id || '',                                           // R: Gateway ID
+        p.group || '',                                           // S: Gateway群番号
       ]);
     }
     return ContentService.createTextOutput('OK');

@@ -2,13 +2,16 @@
 title: Monita One向けGateway GAS
 domain: monita_dev
 tags: [GAS, gateway, monita_one, one_pir, battery]
-updated: 2026-08-16
+updated: 2026-08-28
 ---
 
 # one — Monita One向けGateway GAS
 
-`../gateway_common/Code.gs`を基に、Monita One（PIRモード）固有の設定だけを追加した
+`../gateway_common/Code.gs`を基に、Monita One固有の製品プロファイルを追加した
 Google Apps Script。Gatewayは`CLOUD_FMT_V2`を有効にし、1台14バイトのクラウド形式で送る。
+
+DeviceIDは上位3bitをGateway群、下位5bitを機器番号（1〜31）に使う。現在の許可範囲は
+群0=`0x01`〜`0x1F`で、群1以降は実機の群番号確定後に追加する。
 
 ## デプロイ前の必須設定
 
@@ -32,6 +35,11 @@ Google Apps Script。Gatewayは`CLOUD_FMT_V2`を有効にし、1台14バイト�
 
 CH1が`-1`の行はCH1/CH2を空欄にするため、人数の集計・グラフには入りにくい形で保存される。
 CH1が`0`の行は「スキャンしたが0人」の有効な観測として数値0を保存する。
+
+## One標準センサ設定
+
+`ONE_SENSOR`プロファイルを定義しているが、実機種別が未確定のため`DEVICE_PRODUCT_REGISTRY`には
+登録していない。CH1はひずみ（με）の実測値、未使用のCH2〜CH4は`-1`を欠測値として扱う。
 
 ## 受信形式
 

@@ -2,7 +2,7 @@
 title: Gateway共通GAS受信・リモート制御スクリプト
 domain: monita_dev
 tags: [GAS, gateway, lora, downlink, remote-control, firmware_versioning]
-updated: 2026-08-16
+updated: 2026-08-28
 ---
 
 # gateway_common — Gateway共通GAS受信・リモート制御スクリプト
@@ -40,7 +40,7 @@ GAS本体はGoogle側（スプレッドシート紐付け）で動作してお�
 - **電池電圧**: 新形式の末尾1バイトを`3000 + value * 5`mVで復元し、Q列へV単位で記録。`255`と旧形式は空欄
 - **Gateway遠隔操作**（スプレッドシート「Gateway操作」メニュー）: リモートリセット、データ送信の停止/再開、送信間隔変更、ステータス確認、RTC再同期、診断ログ吸い上げ
 - **Flex子機へのLoRaダウンリンク**（スプレッドシート「Flex操作」メニュー）: 送信間隔・平均/メジアン回数の変更を、Class A方式（子機のアップリンク直後の受信窓に便乗）＋確認応答（子機からの適用結果を受けて完了とする）で配信
-- **`cmd_status`シート**: Gateway・子機の現在の予約状況・MAC・状態・結果を一覧表示。Gatewayの許可DeviceID範囲は0x01〜0x0Fで、案件側の`CMD_STATUS_CHILD_IDS`に登録したIDを対象とする
+- **`cmd_status`シート**: Gateway・子機の現在の予約状況・MAC・状態・結果を一覧表示。DeviceIDは上位3bitをGateway群、下位5bitを機器番号（1〜31）に使い、現在の許可範囲は群0=`0x01`〜`0x1F`。案件側の`CMD_STATUS_CHILD_IDS`に登録したIDを対象とする
 - **`downlink_log`シート**: ダウンリンクの予約・送信・結果（期限切れも含む）を1イベントごとに履歴として記録
 
 ## LoRaダウンリンクのアーキテクチャ
