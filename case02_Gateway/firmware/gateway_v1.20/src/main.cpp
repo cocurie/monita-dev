@@ -216,13 +216,36 @@ static uint8_t  const EXPECTED_PKT_TYPE  = 0x04;             // Flex v3.10 LoRa 
 static uint32_t const SEND_INTERVAL_DEFAULT_MS = 3600000;  // 既定 60 分
 static uint32_t       sendIntervalMs           = SEND_INTERVAL_DEFAULT_MS;  // 実行時可変
 
-// Pkt type と併せて二重チェックする Device ID ホワイトリスト（BLE/LoRa共通）
+// ══════════════════════════════════════════════
+// Gateway群（GATEWAY_GROUP_ID）★2026-08-28追加
+// ══════════════════════════════════════════════
+// 1つの現場にGatewayを複数台置くと、E220の設定が全機共通のため両方が同じ子機を
+// 二重受信してしまう。無線層（チャネル）を分けると電波法対応のコストが発生するため、
+// DeviceIDを分割してソフトフィルタで受信を分離する方式を採った。
+//
+//   DEVICE_ID (1バイト)
+//     上位3bit = Gateway群 (0〜7)       → group   = deviceId >> 5
+//     下位5bit = 群内の機器番号 (1〜31)  → localNo = deviceId & 0x1F   ※0は無効値
+//
+//   群0 = 0x01〜0x1F、群1 = 0x21〜0x3F、群N の開始は N*0x20+1。
+//   現在稼働中の 0x01〜0x0F はすべて群0に収まるため、既存機器の焼き直しは不要。
+//
+// ビルド時に指定する（既定は群0＝従来と等価）:
+//   PLATFORMIO_BUILD_FLAGS="-D GATEWAY_GROUP_ID=1" pio run -t upload
+#ifndef GATEWAY_GROUP_ID
+#define GATEWAY_GROUP_ID 0
+#endif
+static_assert(GATEWAY_GROUP_ID >= 0 && GATEWAY_GROUP_ID <= 0x07,
+              "GATEWAY_GROUP_ID must be 0..7");
+
+// Pkt type と併せて二重チェックする Device ID ホワイトリスト（★BLE専用）
 // 2026-07-20: test_sketches/22_lora_multi_child によるLoRa複数台テスト(13台)用に拡張
-// ★2026-08-16(v1.20): One用の0x0Fを追加。ダウンリンク側の MAX_PENDING_CHILDREN(15) と
-//   GAS側の CMD_STATUS_CHILD_IDS（'01'〜'0F'）も15台を前提にする。
+// ★2026-08-16(v1.20): One用の0x0Fを追加。
 //   以前は一覧の食い違いにより Flex v3.20（DEVICE_ID=0x0E）のフレームが
 //   isAllowedFlexPacket() で黙って棄却され、受信はできているのに台数0・ダウンリンク
-//   送信も起こらない状態になっていた（実機で確認）。3か所は必ず同じ台数に揃えること。
+//   送信も起こらない状態になっていた（実機で確認）。
+// ★2026-08-28: LoRaは群方式（isAllowedLoRaPacket）へ移行したため、この一覧はBLE専用に
+//   なった。BLEの群分離はLoRaへの移行が進むまで後回しと決定したので現状維持とする。
 static uint8_t  const ALLOWED_DEVICE_IDS[] = {
   0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
 };   // ★子機を増やしたらここに追加する
@@ -230,9 +253,12 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 91;
+static uint8_t  const GATEWAY_FW_VERSION = 92;
 
-// pktType・deviceId が Flex として許可された組み合わせか判定する
+// pktType・deviceId が Flex として許可された組み合わせか判定する（★BLE受信専用）
+// ★2026-08-28: LoRaは isAllowedLoRaPacket() を使う。BLEの群分離は第3段階まで後回しと
+//   決定したため、この関数は従来どおりホワイトリスト方式のまま残す。
+//   ここを群方式へ置き換えるとBLE子機も群分離されてしまうので、統合してはいけない。
 bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
   if (pktType != EXPECTED_PKT_TYPE) return false;
   for (size_t i = 0; i < ALLOWED_DEVICE_IDS_COUNT; i++) {
@@ -240,6 +266,17 @@ bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
   }
   return false;
 }
+
+#ifdef COMM_MODE_LORA
+// pktType・deviceId がこのGatewayの群の子機として受信すべき組み合わせか判定する（LoRa専用）
+// ホワイトリストではなくDeviceIDのビット構成で判定するため、子機を増やしても
+// Gateway側のソース修正は不要になる（群内で1〜31が自動的に許可される）。
+bool isAllowedLoRaPacket(uint8_t pktType, uint8_t deviceId) {
+  if (pktType != EXPECTED_PKT_TYPE) return false;
+  if ((deviceId & 0x1F) == 0) return false;            // 下位5bitが0のIDは無効値
+  return (deviceId >> 5) == GATEWAY_GROUP_ID;          // 上位3bitが自群と一致するもののみ
+}
+#endif
 
 // ── ピン割当（v1.1 基板、AC電源版）─────────────────
 // ★ TCA9534を撤去し、全て直結ピンに戻した（詳細はファイル冒頭コメント参照）。
@@ -256,7 +293,9 @@ static int const LORA_M0M1_PIN = 2;  // D2: E220 M0・M1 共通駆動（基板�
 // ══════════════════════════════════════════════
 // BLE 受信バッファ
 // ══════════════════════════════════════════════
-#define MAX_DEVICES 20
+// ★2026-08-28: 群あたり最大31台（DeviceID下位5bit）に合わせて 20→32 へ拡張。
+//   records[] / pendingRecords[] / 送信時のmerged[] がこのサイズで確保される。
+#define MAX_DEVICES 32
 // v3.03 の MSD は Company ID(2B) を除くと 19 バイト
 // （PktType+DeviceID+FW_VERSION+CH1-4+BATT+Hour+Min+CH1-4Range）。
 // 将来の拡張余地を見て 24 バイトを確保する。
@@ -1073,7 +1112,26 @@ bool postToGAS(String queryParams) {
 // のため代替不可。既に安定動作しているGASのHTTPS経由（AT+SHREQ/SHREAD）でコマンドを
 // ポーリングする方式に変更した。GAS側の対応はcase02_Gateway/gas/gateway_common/Code.gs
 // のdoGet()内 action=check_cmd / action=set_cmd を参照。
-static char const* GW_DEVICE_ID = "gateway_v11_test";
+// ★2026-08-28: 固定文字列 "gateway_v11_test" から、XIAO固有ID由来の一意なIDへ変更。
+//   Gateway 2台が同じIDでGASに接続すると、pending_cmd_<deviceId> の取得競合が起き、
+//   status_report・log_dump も混ざって個体を識別できなくなる。
+//   （これはDeviceIDの群分離とは独立した問題。群を分けても解決しない）
+//
+//   XIAO nRF52840 の FICR->DEVICEID（64bit、工場書込みで一意）から "gw_<16桁hex>" を作る。
+//   16桁を切り詰めないのは、識別空間を狭める合理的な理由がないため。
+//
+//   ★実装上の注意：一時Stringのc_str()を保持すると関数終了後にポインタが無効になるため、
+//   固定長のグローバル配列に snprintf で書き込む。初期化は checkRemoteCmd() が
+//   最初に呼ばれるより前（setup()の冒頭）で行うこと。
+//   ★運用上の注意：XIAO交換＝Gateway ID変更になる。現場名はファームに焼かず、
+//   GAS台帳で「論理名 ↔ XIAO固有ID」を対応付ける（旧IDの予約整理も必要）。
+static char GW_DEVICE_ID[24] = "gw_uninitialized";
+
+static void initGwDeviceId() {
+  snprintf(GW_DEVICE_ID, sizeof(GW_DEVICE_ID), "gw_%08lX%08lX",
+           (unsigned long)NRF_FICR->DEVICEID[1],
+           (unsigned long)NRF_FICR->DEVICEID[0]);
+}
 
 // ★2026-08-04追加: stop/start/send_nowコマンド用の状態フラグ。
 // s_gasSendPausedはBLE/LoRa受信・check_cmdの確認自体は止めず、GASへのデータ送信
@@ -1188,8 +1246,17 @@ void sendLogDumpToGAS() {
 // 自動的に再試行される。規定回数試しても確認が返らなければ未達としてGASへ報告する。
 #ifdef COMM_MODE_LORA
 
-#define MAX_PENDING_CHILDREN   15   // 子機DeviceID 0x01〜0x0F
+// ★2026-08-28: 当該群の機器番号1〜31（DeviceID下位5bit）に合わせて 15→31 へ拡張。
+#define MAX_PENDING_CHILDREN   31   // 当該群の子機（機器番号1〜31）
 #define DOWNLINK_MAX_ATTEMPTS  3    // この回数送っても確認が返らなければ未達として打ち切る
+
+// ★2026-08-28: 第1段階では群1以上のGatewayでダウンリンクを無効化する。
+//   GAS側の群別配信（check_cmdへのgroup指定）は第2段階で実装するため、現時点では
+//   GASは全Gatewayへ同じ予約一覧を返す。有効のままだと群1のGatewayが群0あての
+//   設定変更を送ってしまう。ダウンリンクは全てテスト段階で現場実装がないため実害はない。
+//   ※applyDownlinkCache()の群検証と二重の防御になっているのは意図的。
+//     こちらは「GASへ予約を要求しない」、あちらは「受け取っても取り込まない」。
+static bool const DOWNLINK_ENABLED = (GATEWAY_GROUP_ID == 0);
 
 // ★同じ子機への連続送信を抑制する時間。
 //
@@ -1328,6 +1395,7 @@ static PendingDownlink* findPending(uint8_t childId) {
 // ★キャッシュは毎回作り直す。GAS側が正なので、消えた予約はここで自動的に落ちる。
 static void applyDownlinkCache(const String& body) {
   for (int i = 0; i < MAX_PENDING_CHILDREN; i++) s_pending[i].active = false;
+  if (!DOWNLINK_ENABLED) return;  // 群1以上では予約を持たない（DOWNLINK_ENABLEDのコメント参照）
 
   int slot = 0;
   int from = body.indexOf('\n');           // 1行目（コマンド）は読み飛ばす
@@ -1368,8 +1436,15 @@ static void applyDownlinkCache(const String& body) {
 
     // ★ステータス確認(statusOnly)はsleep/avg/medianを使わない（GAS側は0を送ってくる）ので
     //   値域チェックの対象外にする。通常の設定変更だけ範囲を検証する。
-    if (childId == 0 ||
-        (!statusOnly && (sleepMin < 1 || sleepMin > 1440 || avg < 1 || median < 1))) {
+    // ★2026-08-28: 群の検証。GASは全Gatewayに同じ予約一覧を返すため（群別配信は第2段階）、
+    //   これが無いと他群あての予約が s_pending[] を占有し、自群の予約が入らなくなる。
+    if ((childId & 0x1F) == 0 || (childId >> 5) != GATEWAY_GROUP_ID) {
+      Serial.print(F("[CACHE] 自群(")); Serial.print(GATEWAY_GROUP_ID);
+      Serial.print(F(")宛でないため無視: ")); Serial.println(line);
+      continue;
+    }
+
+    if (!statusOnly && (sleepMin < 1 || sleepMin > 1440 || avg < 1 || median < 1)) {
       Serial.print(F("[CACHE] 値が範囲外のため無視: ")); Serial.println(line);
       continue;
     }
@@ -1448,7 +1523,8 @@ static bool checkRemoteCmdOnce() {
   // ★v1.20: dl=1 を付けると、応答の2行目以降にLoRaダウンリンクの予約が相乗りしてくる。
   //   予約取得のためにHTTPリクエストを増やさずに済む（通信時間・失敗ポイントを増やさない）。
   //   dl=1を送らない旧ファーム(gateway_v1.1)には従来どおり1行だけが返る（GAS側で分岐）。
-  query += "&dl=1";
+  //   ★2026-08-28: 群1以上ではダウンリンクを無効化しているので予約自体を要求しない。
+  if (DOWNLINK_ENABLED) query += "&dl=1";
 #endif
 
   // ★2026-08-10(v1.20): AT+SH*系からAT+HTTPTOFS方式へ変更。
@@ -1463,7 +1539,7 @@ static bool checkRemoteCmdOnce() {
 #ifdef COMM_MODE_LORA
   // ★v1.20: 2行目以降のダウンリンク予約をキャッシュへ取り込み、cmdは1行目だけに絞る。
   //   （この分離をしないと "none\n08:..." のような文字列をコマンドとして判定してしまう）
-  applyDownlinkCache(cmd);
+  applyDownlinkCache(cmd);  // 群1以上では中で何もしない（cmdの1行目切り出しは共通）
   int nlPos = cmd.indexOf('\n');
   if (nlPos >= 0) cmd = cmd.substring(0, nlPos);
   cmd.trim();
@@ -1904,7 +1980,14 @@ static uint32_t    s_loraFieldStartMs = 0;
 //   CKSUM OKだが受信台数0  → 受信後のフィルタ（isAllowedFlexPacket等）で弾かれている
 static uint32_t s_loraRxBytes    = 0;  // UARTE1から読んだ生バイトの累計
 static uint32_t s_loraCksumNg    = 0;
-static uint32_t s_loraRejected = 0;  // ホワイトリスト外として棄却したフレーム数  // チェックサム不一致で破棄したフレーム数
+static uint32_t s_loraRejected = 0;  // 受信フィルタで棄却したフレーム数（下記の理由別カウンタの合計）
+// ★2026-08-28: 棄却理由を分けて数える。「電波は来ているのに受信台数0」のとき、
+//   群の焼き間違い（群不一致）と別プロトコルの混信（PktType不一致）と
+//   ID無効値（下位5bit=0）を切り分けられるようにするため。
+static uint32_t s_loraRejPktType = 0;  // PktTypeが期待値(0x04)と違う
+static uint32_t s_loraRejGroup   = 0;  // DeviceID上位3bitが自群と不一致
+static uint32_t s_loraRejLocalNo = 0;  // DeviceID下位5bitが0（無効値）
+static uint32_t s_loraRejLen     = 0;  // センサフレーム長が19バイトでない
 static uint32_t s_loraFramesOk   = 0;  // チェックサムまで通ったフレーム数
 static bool     s_loraConfigOk   = false;  // 起動時のconfig check結果
 
@@ -2149,6 +2232,7 @@ static void sendDownlinkCommand(uint8_t targetDeviceId, uint16_t sleepMinutes,
 
 // 子機のアップリンクを検知したときの処理。予約があればダウンリンクを送る。
 static void onUplinkReceived(uint8_t childId) {
+  if (!DOWNLINK_ENABLED) return;  // 群1以上ではダウンリンクを送らない
   PendingDownlink* p = findPending(childId);
   if (p == nullptr) return;
 
@@ -2207,6 +2291,7 @@ static void onUplinkReceived(uint8_t childId) {
 //   ack: [0]0x05 [1]DeviceID [2]status [3-4]適用sleepMin(BE) [5]適用avg [6]適用median
 //        [7-8]適用後に有効になるWDTタイムアウト(分,BE)
 static void onDownlinkAckReceived(const uint8_t* ack, uint8_t len) {
+  if (!DOWNLINK_ENABLED) return;  // 群1以上では自分が送っていないため応答も処理しない
   if (len < 7) return;
   uint8_t  childId       = ack[1];
   uint8_t  status        = ack[2];
@@ -2277,14 +2362,18 @@ static void loraPoll() {
         Serial.print(s_loraLen);
         Serial.println(F(" バイト（期待値19）"));
         s_loraRejected++;
+        s_loraRejLen++;
         continue;
       }
 
-      if (!isAllowedFlexPacket(pktType, deviceId)) {
+      if (!isAllowedLoRaPacket(pktType, deviceId)) {
         // ★無関係な電波を拾うたびにログを出すと埋もれるため本文は出さないが、
-        //   件数だけはハートビートに出す。棄却が増え続けている＝ホワイトリストの
-        //   設定漏れを疑う手がかりになる（実際に0x0Eの登録漏れをこれで見落とした）。
+        //   件数だけはハートビートに出す。棄却が増え続けている＝群の焼き間違いや
+        //   混信を疑う手がかりになる（以前は0x0Eの登録漏れをこれで見落とした）。
         s_loraRejected++;
+        if (pktType != EXPECTED_PKT_TYPE)  s_loraRejPktType++;
+        else if ((deviceId & 0x1F) == 0)   s_loraRejLocalNo++;
+        else                               s_loraRejGroup++;
         continue;
       }
       int rssiDbm = (int)s_loraRssiRaw - 256;
@@ -2852,6 +2941,14 @@ void postBootInfoRow() {
   params += String(recordCount);
   params += "&gw_fw=";
   params += String(GATEWAY_FW_VERSION);
+  // ★2026-08-28: GAS側でGateway個体と受信対象群を識別できるようにする。
+  //   info行はデータ行と別のリクエストで、buildBatchQuery()の512バイト予算とは無関係。
+  //   ここでの増分は "&gw_id=gw_<16桁>"(26B) + "&group=N"(8B) = 34B で、
+  //   scriptPath全体は約280バイト。SHREQ_MAX_URL_BYTES(512)に十分収まる。
+  params += "&gw_id=";
+  params += GW_DEVICE_ID;
+  params += "&group=";
+  params += String(GATEWAY_GROUP_ID);
 
   postToGAS(params);
 }
@@ -3014,7 +3111,7 @@ void flushRecords() {
 
   // ★2026-07-25: 再送キュー分とライブ分が1バッチにまとまる場合、rtcEpoch昇順（古い実測時刻が先）
   // に並べ替える。以前はライブ→再送キューの順（新しい→古い）で送られており、スプレッドシートの
-  // 見た目が時系列と逆転して分かりにくかった。単純挿入ソート（nはMAX_DEVICES=20以下）。
+  // 見た目が時系列と逆転して分かりにくかった。単純挿入ソート（nはMAX_DEVICES=32以下）。
   for (int i = 1; i < n; i++) {
     FlexRecord key = merged[i];
     int j = i - 1;
@@ -3422,6 +3519,11 @@ void setup() {
   uint32_t resetReason = NRF_POWER->RESETREAS;
   NRF_POWER->RESETREAS = 0xFFFFFFFFUL;  // 読み取り後すぐクリア（次回リセット時に前回分と混ざらないように）
 
+  // ★2026-08-28: GW_DEVICE_ID はXIAO固有IDから生成する。checkRemoteCmd()が最初に
+  //   呼ばれるより前（=ここ）で必ず初期化すること。未初期化のままGASへ問い合わせると
+  //   全Gatewayが同じIDで予約を取り合ってしまう。
+  initGwDeviceId();
+
   wdtInit(WDT_TIMEOUT_MS);  // 無人運用の安全網。以降 120 秒キックが無ければ自動リセット
   lastGasSuccessMs = millis();  // アプリ層WDTの起点。以降computeAppWdtMs(sendIntervalMs)以内に送信成功が無ければ再起動
 
@@ -3442,6 +3544,22 @@ void setup() {
   Serial.println(F("===================================="));
   Serial.print(F("SIM: ")); Serial.println(SIM_NAME);
   Serial.print(F("APN: ")); Serial.println(APN);
+
+  // ★2026-08-28: 個体識別・群の焼き間違いを現場で切り分けるための起動ログ。
+  Serial.print(F("GW_DEVICE_ID: ")); Serial.println(GW_DEVICE_ID);
+  Serial.print(F("XIAO固有ID: ")); Serial.println(&GW_DEVICE_ID[3]);  // "gw_"を除いた16桁
+  Serial.print(F("Gateway群: ")); Serial.print(GATEWAY_GROUP_ID);
+  Serial.print(F("（受信する子機DeviceID: 0x"));
+  Serial.print(GATEWAY_GROUP_ID * 0x20 + 0x01, HEX);
+  Serial.print(F("〜0x")); Serial.print(GATEWAY_GROUP_ID * 0x20 + 0x1F, HEX);
+  Serial.println(F("）"));
+  Serial.print(F("Gateway FW: ")); Serial.println(GATEWAY_FW_VERSION);
+#ifdef COMM_MODE_LORA
+  if (!DOWNLINK_ENABLED) {
+    Serial.print(F("△ 群")); Serial.print(GATEWAY_GROUP_ID);
+    Serial.println(F("のためダウンリンクを無効化しています（GAS側の群別配信は第2段階で対応）"));
+  }
+#endif
 
   Serial.print(F("[RESETREAS] 0x")); Serial.println(resetReason, HEX);
   if (resetReason == 0) {
@@ -3765,6 +3883,11 @@ void loop() {
     Serial.print(F(" LoRa[rxB=")); Serial.print(s_loraRxBytes);
     Serial.print(F(" cksumNG=")); Serial.print(s_loraCksumNg);
     Serial.print(F(" 棄却=")); Serial.print(s_loraRejected);
+    Serial.print(F("(type=")); Serial.print(s_loraRejPktType);
+    Serial.print(F(" 群=")); Serial.print(s_loraRejGroup);
+    Serial.print(F(" ID0=")); Serial.print(s_loraRejLocalNo);
+    Serial.print(F(" len=")); Serial.print(s_loraRejLen);
+    Serial.print(F(")"));
     Serial.print(F(" frames=")); Serial.print(s_loraFramesOk);
     Serial.print(F(" err=0x")); Serial.print(s_loraErrSrcAcc, HEX);
     Serial.print(F(" rekick=")); Serial.print(s_loraRekicks);

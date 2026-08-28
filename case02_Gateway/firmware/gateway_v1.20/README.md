@@ -87,7 +87,7 @@ payload は GAS 側で PktType・DeviceID・CH1〜CH6・FlexHour/Min に汎用�
 
 ### Monita One / クラウド形式V2
 
-許可する子機DeviceIDは`0x01〜0x0F`。Oneを接続するGatewayでは`platformio.ini`の
+Oneを接続するGatewayでは`platformio.ini`の
 コメント例に従って`CLOUD_FMT_V2`を有効にする。既定（フラグなし）は旧GAS互換の
 13バイト/台（26 hex）のままで、V2時だけ電池電圧を末尾へ追加した14バイト/台
 （28 hex）になる。対向GASには`gas/one/Code.gs`を使用する。
@@ -101,6 +101,41 @@ payload は GAS 側で PktType・DeviceID・CH1〜CH6・FlexHour/Min に汎用�
 | `sd` | SDカード記録の有無（0/1） |
 | `interval_min` | 定期送信インターバル（分） |
 | `devcount` | 起動時点で受信済みの子機台数 |
+| `gw_fw` | Gatewayファームのバージョン |
+| `gw_id` | Gateway個体ID（`gw_<XIAO固有ID16桁>`。GAS上の個体識別キー） |
+| `group` | このGatewayが受信する子機の群番号（0〜7） |
+
+## 子機DeviceIDと群（GATEWAY_GROUP_ID）
+
+1つの現場にGatewayを複数台置くと、E220の設定が全機共通のため両方が同じ子機を
+二重受信してしまう。無線層（チャネル）は変えず、DeviceIDを分割してソフトフィルタで
+受信を分離する。
+
+```
+DEVICE_ID (1バイト)
+  上位3bit = Gateway群 (0〜7)       → group   = deviceId >> 5
+  下位5bit = 群内の機器番号 (1〜31)  → localNo = deviceId & 0x1F   ※0は無効値
+```
+
+- 群0 = `0x01`〜`0x1F`、群1 = `0x21`〜`0x3F`、群N の開始は `N × 0x20 + 1`
+- 収容能力は8群 × 31台。1Gatewayあたり最大31台（`MAX_DEVICES=32` / `MAX_PENDING_CHILDREN=31`）
+- 既存の `0x01`〜`0x0F` はすべて群0に収まるため、稼働中の機器の焼き直しは不要
+- **LoRa受信のみ**この方式（`isAllowedLoRaPacket()`）。BLE受信は従来の
+  `ALLOWED_DEVICE_IDS[]` ホワイトリスト（`0x01`〜`0x0F`）のままで、群分離は第3段階
+- 群1以上のGatewayではダウンリンクを無効化している（GAS側の群別配信は第2段階）
+
+2台目以降のGatewayはビルド時に群を指定して焼く。
+
+```sh
+PLATFORMIO_BUILD_FLAGS="-D GATEWAY_GROUP_ID=1" pio run -t upload
+```
+
+Gateway個体を識別する `GW_DEVICE_ID` は、XIAO固有ID（FICR DEVICEID）から
+`gw_<16桁hex>` を自動生成する。GAS上のリモートコマンド予約キー
+（`pending_cmd_<deviceId>`）・`status_report`・`log_dump` に使うため、
+Gateway 2台が同じIDになると予約の取得競合や記録の混在が起きる。
+XIAO交換＝Gateway ID変更になるので、現場名（論理名）はファームに焼かず、
+GAS台帳で「論理名 ↔ XIAO固有ID」を対応付けること。
 
 ## ビルド
 
