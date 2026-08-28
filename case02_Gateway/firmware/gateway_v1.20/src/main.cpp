@@ -253,7 +253,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 92;
+static uint8_t  const GATEWAY_FW_VERSION = 93;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する（★BLE受信専用）
 // ★2026-08-28: LoRaは isAllowedLoRaPacket() を使う。BLEの群分離は第3段階まで後回しと
@@ -1426,47 +1426,63 @@ static void applyDownlinkCache(const String& body) {
       continue;
     }
 
-    uint8_t  childId    = (uint8_t)strtoul(line.substring(0, pos[0]).c_str(), nullptr, 16);
-    uint16_t sleepMin   = (uint16_t)line.substring(pos[0] + 1, pos[1]).toInt();
-    uint8_t  avg        = (uint8_t)line.substring(pos[1] + 1, pos[2]).toInt();
-    uint8_t  median     = (uint8_t)line.substring(pos[2] + 1, pos[3]).toInt();
-    uint8_t  attempts   = (uint8_t)line.substring(pos[3] + 1, pos[4]).toInt();
-    uint32_t seq        = (uint32_t)line.substring(pos[4] + 1, pos[5]).toInt();
-    bool     statusOnly = line.substring(pos[5] + 1).toInt() != 0;
+    // ★2026-08-28: 値域検証は必ず「格納型へ縮小変換する前」に行うこと。
+    //   以前は (uint8_t)strtoul(...) のように切り詰めてから検証していたため、GASが誤って
+    //   "101" を返すと 0x101 が 0x01 へ化け、実在する別の子機あての予約として受理された。
+    //   群検証も切り詰め後の値に対して行われるので、他群あての異常値が自群の実在IDに
+    //   化けて誤配送される経路になっていた（avg/medianの257→1、sleepMinの65537→1も同じ）。
+    //   したがって一旦 long / unsigned long のまま受けてから値域を見る。
+    unsigned long childIdRaw  = strtoul(line.substring(0, pos[0]).c_str(), nullptr, 16);
+    long          sleepMinRaw = line.substring(pos[0] + 1, pos[1]).toInt();
+    long          avgRaw      = line.substring(pos[1] + 1, pos[2]).toInt();
+    long          medianRaw   = line.substring(pos[2] + 1, pos[3]).toInt();
+    long          attemptsRaw = line.substring(pos[3] + 1, pos[4]).toInt();
+    long          seqRaw      = line.substring(pos[4] + 1, pos[5]).toInt();
+    bool          statusOnly  = line.substring(pos[5] + 1).toInt() != 0;
 
-    // ★ステータス確認(statusOnly)はsleep/avg/medianを使わない（GAS側は0を送ってくる）ので
-    //   値域チェックの対象外にする。通常の設定変更だけ範囲を検証する。
-    // ★2026-08-28: 群の検証。GASは全Gatewayに同じ予約一覧を返すため（群別配信は第2段階）、
+    // ★群の検証。GASは全Gatewayに同じ予約一覧を返すため（群別配信は第2段階）、
     //   これが無いと他群あての予約が s_pending[] を占有し、自群の予約が入らなくなる。
-    if ((childId & 0x1F) == 0 || (childId >> 5) != GATEWAY_GROUP_ID) {
+    if (childIdRaw > 0xFF || (childIdRaw & 0x1F) == 0 ||
+        (childIdRaw >> 5) != GATEWAY_GROUP_ID) {
       Serial.print(F("[CACHE] 自群(")); Serial.print(GATEWAY_GROUP_ID);
       Serial.print(F(")宛でないため無視: ")); Serial.println(line);
       continue;
     }
 
-    if (!statusOnly && (sleepMin < 1 || sleepMin > 1440 || avg < 1 || median < 1)) {
+    // ★ステータス確認(statusOnly)はsleep/avg/medianを使わない（GAS側は0を送ってくる）ので
+    //   値域チェックの対象外にする。通常の設定変更だけ範囲を検証する。
+    //   attempts/seqはstatusOnlyでも使うため常に検証する。
+    if (attemptsRaw < 0 || attemptsRaw > 255 || seqRaw < 0) {
+      Serial.print(F("[CACHE] 値が範囲外のため無視: ")); Serial.println(line);
+      continue;
+    }
+    if (!statusOnly && (sleepMinRaw < 1 || sleepMinRaw > 1440 ||
+                        avgRaw < 1 || avgRaw > 255 ||
+                        medianRaw < 1 || medianRaw > 255)) {
       Serial.print(F("[CACHE] 値が範囲外のため無視: ")); Serial.println(line);
       continue;
     }
 
+    uint8_t childId = (uint8_t)childIdRaw;  // 上で0x01〜0xFFに収まることを確認済み
+
     s_pending[slot].active     = true;
     s_pending[slot].childId    = childId;
-    s_pending[slot].sleepMin   = sleepMin;
-    s_pending[slot].avg        = avg;
-    s_pending[slot].median     = median;
-    s_pending[slot].attempts   = attempts;  // ★GAS側が正（Gatewayが再起動しても引き継がれる）
-    s_pending[slot].seq        = seq;
+    s_pending[slot].sleepMin   = (uint16_t)sleepMinRaw;
+    s_pending[slot].avg        = (uint8_t)avgRaw;
+    s_pending[slot].median     = (uint8_t)medianRaw;
+    s_pending[slot].attempts   = (uint8_t)attemptsRaw;  // ★GAS側が正（Gatewayが再起動しても引き継がれる）
+    s_pending[slot].seq        = (uint32_t)seqRaw;
     s_pending[slot].statusOnly = statusOnly;
     s_pending[slot].lastSendMs = 0;  // キャッシュ更新時は抑制をリセット（新しい予約として扱う）
     slot++;
 
     Serial.print(F("[CACHE] 予約: 子機0x")); Serial.print(childId, HEX);
     if (statusOnly) Serial.print(F(" ステータス確認のみ"));
-    Serial.print(F(" 間隔=")); Serial.print(sleepMin);
-    Serial.print(F("分 平均=")); Serial.print(avg);
-    Serial.print(F(" メジアン=")); Serial.print(median);
-    Serial.print(F(" 試行済=")); Serial.print(attempts);
-    Serial.print(F(" seq=")); Serial.println(seq);
+    Serial.print(F(" 間隔=")); Serial.print(sleepMinRaw);
+    Serial.print(F("分 平均=")); Serial.print(avgRaw);
+    Serial.print(F(" メジアン=")); Serial.print(medianRaw);
+    Serial.print(F(" 試行済=")); Serial.print(attemptsRaw);
+    Serial.print(F(" seq=")); Serial.println(seqRaw);
   }
   Serial.print(F("[CACHE] 有効な予約 ")); Serial.print(slot); Serial.println(F(" 件を保持しました"));
 }
@@ -3085,8 +3101,17 @@ bool postBatch(const String& params) {
 void flushRecords() {
   if (xSemaphoreTake(recordMutex, pdMS_TO_TICKS(200)) != pdTRUE) return;
 
+  // ★2026-08-28: 以下3つの作業配列（liveSnap / merged / failedMerged）は必ずstaticにすること。
+  //   FlexRecordは44バイトなので MAX_DEVICES=32 では1配列1,408バイト、3つで4,224バイト。
+  //   Adafruit nRF52コアのloopタスクのスタックは LOOP_STACK_SZ=(256*4) ワード＝4,096バイトしか
+  //   なく、自動変数のままだと flushRecords() に入った時点でスタックオーバーフローする
+  //   （-fstack-usage の実測で4,416バイト。MAX_DEVICES=20の頃は2,832バイトで収まっていた）。
+  //   flushRecords()はloopタスクからのみ呼ばれ（loop() / setup() / loop()先頭の
+  //   handlePendingBleCommands()。BLEコールバックはフラグを立てるだけで直接呼ばない）、
+  //   再入しないためstatic化しても競合しない。RAMは+4.2KB。
+  //   ★MAX_DEVICESを増やすときはここのスタック実測をやり直すこと。
   int liveN = recordCount;
-  FlexRecord liveSnap[MAX_DEVICES];
+  static FlexRecord liveSnap[MAX_DEVICES];
   memcpy(liveSnap, records, sizeof(FlexRecord) * liveN);
   recordCount = 0;
 
@@ -3098,7 +3123,7 @@ void flushRecords() {
   // 再送キューの値とライブ値は異なる測定サイクルのデータ）。破棄すると送信失敗した測定が
   // 恒久的に失われるため、両方をそのまま送信する（GAS側は受信ごとに行を追加するだけなので
   // 同一DeviceIDが1バッチに複数件あっても問題ない）。
-  FlexRecord merged[MAX_DEVICES];
+  static FlexRecord merged[MAX_DEVICES];  // ★static必須。理由はliveSnapのコメント参照
   int n = 0;
   for (int i = 0; i < liveN && n < MAX_DEVICES; i++) merged[n++] = liveSnap[i];
 
@@ -3170,7 +3195,7 @@ void flushRecords() {
   // クエリ長がAT+SHREQの512バイト上限に達しないよう、実バイト数を見ながら動的に分割して送信する。
   // ★2026-07-25: 「接続を使い回す」最適化は撤回済み（postBatch()内で毎回postToGAS()を
   // 呼び、バッチごとに接続→送信→切断のフルシーケンスを行う。詳細はpostBatch()のコメント参照）。
-  FlexRecord failedMerged[MAX_DEVICES];
+  static FlexRecord failedMerged[MAX_DEVICES];  // ★static必須。理由はliveSnapのコメント参照
   int failedN = 0;
   bool cycleHadSuccess = false;  // このサイクルで1バッチでも送信成功したか
 
