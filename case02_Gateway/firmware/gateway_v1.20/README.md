@@ -122,7 +122,8 @@ DEVICE_ID (1バイト)
 - 既存の `0x01`〜`0x0F` はすべて群0に収まるため、稼働中の機器の焼き直しは不要
 - **LoRa受信のみ**この方式（`isAllowedLoRaPacket()`）。BLE受信は従来の
   `ALLOWED_DEVICE_IDS[]` ホワイトリスト（`0x01`〜`0x0F`）のままで、群分離は第3段階
-- 群1以上のGatewayではダウンリンクを無効化している（GAS側の群別配信は第2段階）
+- 全群でダウンリンクを利用できる。Gatewayは`check_cmd`へ`group`を付け、GASは
+  `childId >> 5`が一致する予約だけを返す（Gateway側でも取込時に群を再検証する）
 
 2台目以降のGatewayはビルド時に群を指定して焼く。
 

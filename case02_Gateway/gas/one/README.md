@@ -13,6 +13,11 @@ Google Apps Script。Gatewayは`CLOUD_FMT_V2`を有効にし、1台14バイト�
 DeviceIDは上位3bitをGateway群、下位5bitを機器番号（1〜31）に使う。現在の許可範囲は
 群0=`0x01`〜`0x1F`で、群1以降は実機の群番号確定後に追加する。
 
+LoRaダウンリンクは全Gateway群で有効。`check_cmd?dl=1&group=N`には
+`childId >> 5`が群Nと一致する保留予約だけを返す（group未指定の旧Gatewayは群0扱い）。
+`downlink_sent` / `downlink_result`では報告群と子機IDの群を照合し、不一致は予約状態を
+更新せず`downlink_log`へ記録する。同シートの`Gateway群`列には各イベントの群番号を残す。
+
 ## デプロイ前の必須設定
 
 1. `Code.gs`の`SPREADSHEET_ID = 'REPLACE_WITH_ONE_SPREADSHEET_ID'`を、One用に新規作成したスプレッドシートIDへ置き換える。

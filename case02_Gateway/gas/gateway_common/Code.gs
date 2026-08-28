@@ -10,7 +10,7 @@
 // ================================
 // バージョン対応表
 // ================================
-//   GASスクリプトバージョン: 9
+//   GASスクリプトバージョン: 10
 //     - v1〜3: 旧フォーマット（case02_Gateway/firmware/gateway_v1.1 対応）
 //     - v4: project07_NEXCO 専用フォーマットに対応（2026-07-25）
 //       ペイロード: 26B/台 = 52 hex文字
@@ -28,6 +28,7 @@
 //       downlink_sent）にLockServiceを適用（2026-08-11）。並行リクエストでの更新消失を防止
 //     - v9: Gatewayの旧13B/新14Bレコードを自動判別し、電池電圧・Gateway epoch・
 //       DEVICE_ID台帳による製品別の列名/単位/スケール/アラート定義へ対応（2026-08-16）
+//     - v10: check_cmdの群別ダウンリンク配信と、送信・結果報告のACK所有権検証に対応（2026-08-28）
 //
 //   対応する子機ファーム:
 //     - project07_NEXCO/firmware/src/main.cpp（COMM_MODE_BLE、本番項目用）
@@ -217,10 +218,11 @@ function dlSet_(childHex, obj) {
 // 両方から呼ばれる。表現を1か所に集約し、片方だけ形式が変わる事故を防ぐ。
 var DOWNLINK_MAX_LINES = 20;
 
-function buildDownlinkLines_() {
+function buildDownlinkLines_(group) {
   var lines = [];
   for (var ci = 0; ci < CMD_STATUS_CHILD_IDS.length && lines.length < DOWNLINK_MAX_LINES; ci++) {
     var hex = CMD_STATUS_CHILD_IDS[ci];
+    if (group !== undefined && (parseInt(hex, 16) >> 5) !== group) continue;
     var d = dlGet_(hex);
     if (d && (d.state === 'queued' || d.state === 'sent')) {
       lines.push(hex + ':' + d.sleep + ':' + d.avg + ':' + d.median +
@@ -501,7 +503,7 @@ function getCmdStatusSheet_() {
 // ★2026-08-09改訂: 従来は「最終結果」しか記録しておらず、しかもseq不一致の応答は
 // 記録する前にreturnしていたため、予約を入れ直すと「実際に配信された事実」が
 // 履歴から完全に消えていた。予約・送信・結果のすべての段階を残す。
-const DOWNLINK_LOG_HEADER = ['日時', '子機ID', 'seq', '種別', '内容', '備考'];
+const DOWNLINK_LOG_HEADER = ['日時', '子機ID', 'seq', '種別', '内容', '備考', 'Gateway群'];
 
 function getDownlinkLogSheet_() {
   var ss = getSpreadsheet();
@@ -517,10 +519,11 @@ function getDownlinkLogSheet_() {
 }
 
 // 履歴を1行追記する。どの経路からでも必ずここを通す（記録漏れを作らないため）。
-function dlLog_(childHex, seq, kind, detail, note) {
+function dlLog_(childHex, seq, kind, detail, note, group) {
   try {
+    var logGroup = (group === undefined) ? (parseInt(childHex, 16) >> 5) : group;
     getDownlinkLogSheet_().appendRow([
-      new Date(), '0x' + childHex, seq || '', kind, detail || '', note || '',
+      new Date(), '0x' + childHex, seq || '', kind, detail || '', note || '', logGroup,
     ]);
   } catch (e) {
     // 履歴の書き込み失敗で本体の処理を止めない
@@ -1117,7 +1120,8 @@ function doGet(e) {
     if (p.dl !== '1') {
       return ContentService.createTextOutput(cmd || 'none');  // 旧ファーム互換（1行のみ）
     }
-    var out = [cmd || 'none'].concat(buildDownlinkLines_());
+    var group = parseInt(p.group || '0', 10);  // group無しの旧ファームは群0
+    var out = [cmd || 'none'].concat(buildDownlinkLines_(group));
     return ContentService.createTextOutput(out.join('\n'));
   }
 
@@ -1154,6 +1158,14 @@ function doGet(e) {
     if (!/^[0-9A-F]{2}$/.test(childHex)) {
       return ContentService.createTextOutput('error: bad child id');
     }
+    var reportGroup = parseInt(p.group || '0', 10);  // group無しは旧ファーム互換で群0
+    var childGroup = parseInt(childHex, 16) >> 5;
+    if (reportGroup !== childGroup) {
+      var ownershipNote = '報告元の群' + reportGroup + 'と子機IDの群' + childGroup + 'が不一致のため処理をスキップ';
+      console.error('Downlink ACK ownership mismatch: child=' + childHex + ', ' + ownershipNote);
+      dlLog_(childHex, p.seq, '結果(群不一致)', '', ownershipNote, reportGroup);
+      return ContentService.createTextOutput('error: group mismatch');
+    }
     var wdtMin = parseInt(p.wdt || '0', 10);
     var applied = (p.sleep || '?') + ' / ' + (p.avg || '?') + ' / ' + (p.median || '?') +
                   (wdtMin ? ('（WDT=' + wdtMin + '分）') : '');
@@ -1187,7 +1199,7 @@ function doGet(e) {
 
       dlLog_(childHex, p.seq, '結果',
              '要求: ' + rec.sleep + ' / ' + rec.avg + ' / ' + rec.median + '　→　適用: ' + applied,
-             dlStatusLabel_(rec) + '（' + rec.attempts + '回目で確定）');
+             dlStatusLabel_(rec) + '（' + rec.attempts + '回目で確定）', reportGroup);
     } catch (err) {
       console.log('Downlink result lock error: ' + err);
       return ContentService.createTextOutput('error: lock timeout');
@@ -1203,6 +1215,17 @@ function doGet(e) {
   //   状態を queued → sent に進め、試行回数を記録する。予約自体は消さない（確認が取れるまで再試行）。
   if (p.action === 'downlink_sent') {
     var sentHex = String(p.child || '').toUpperCase();
+    if (!/^[0-9A-F]{2}$/.test(sentHex)) {
+      return ContentService.createTextOutput('error: bad child id');
+    }
+    var sentGroup = parseInt(p.group || '0', 10);  // group無しは旧ファーム互換で群0
+    var sentChildGroup = parseInt(sentHex, 16) >> 5;
+    if (sentGroup !== sentChildGroup) {
+      var sentOwnershipNote = '報告元の群' + sentGroup + 'と子機IDの群' + sentChildGroup + 'が不一致のため処理をスキップ';
+      console.error('Downlink ACK ownership mismatch: child=' + sentHex + ', ' + sentOwnershipNote);
+      dlLog_(sentHex, p.seq, '送信(群不一致)', '', sentOwnershipNote, sentGroup);
+      return ContentService.createTextOutput('error: group mismatch');
+    }
     // ★送信報告の照合・状態更新が新しい予約と競合しないようにする。
     var lock = LockService.getScriptLock();
     try {
@@ -1221,7 +1244,7 @@ function doGet(e) {
 
       dlLog_(sentHex, p.seq, '送信',
              '間隔=' + sentRec.sleep + '分 / 平均=' + sentRec.avg + ' / メジアン=' + sentRec.median,
-             sentRec.attempts + '回目（子機からの確認応答を待っています）');
+             sentRec.attempts + '回目（子機からの確認応答を待っています）', sentGroup);
     } catch (err) {
       console.log('Downlink sent lock error: ' + err);
       return ContentService.createTextOutput('error: lock timeout');

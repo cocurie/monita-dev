@@ -253,7 +253,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 93;
+static uint8_t  const GATEWAY_FW_VERSION = 94;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する（★BLE受信専用）
 // ★2026-08-28: LoRaは isAllowedLoRaPacket() を使う。BLEの群分離は第3段階まで後回しと
@@ -1250,14 +1250,6 @@ void sendLogDumpToGAS() {
 #define MAX_PENDING_CHILDREN   31   // 当該群の子機（機器番号1〜31）
 #define DOWNLINK_MAX_ATTEMPTS  3    // この回数送っても確認が返らなければ未達として打ち切る
 
-// ★2026-08-28: 第1段階では群1以上のGatewayでダウンリンクを無効化する。
-//   GAS側の群別配信（check_cmdへのgroup指定）は第2段階で実装するため、現時点では
-//   GASは全Gatewayへ同じ予約一覧を返す。有効のままだと群1のGatewayが群0あての
-//   設定変更を送ってしまう。ダウンリンクは全てテスト段階で現場実装がないため実害はない。
-//   ※applyDownlinkCache()の群検証と二重の防御になっているのは意図的。
-//     こちらは「GASへ予約を要求しない」、あちらは「受け取っても取り込まない」。
-static bool const DOWNLINK_ENABLED = (GATEWAY_GROUP_ID == 0);
-
 // ★同じ子機への連続送信を抑制する時間。
 //
 // 【なぜ必要か】子機は同じデータを LORA_TX_REPEAT 回（現在2回）冗長送信する。
@@ -1395,7 +1387,6 @@ static PendingDownlink* findPending(uint8_t childId) {
 // ★キャッシュは毎回作り直す。GAS側が正なので、消えた予約はここで自動的に落ちる。
 static void applyDownlinkCache(const String& body) {
   for (int i = 0; i < MAX_PENDING_CHILDREN; i++) s_pending[i].active = false;
-  if (!DOWNLINK_ENABLED) return;  // 群1以上では予約を持たない（DOWNLINK_ENABLEDのコメント参照）
 
   int slot = 0;
   int from = body.indexOf('\n');           // 1行目（コマンド）は読み飛ばす
@@ -1440,8 +1431,7 @@ static void applyDownlinkCache(const String& body) {
     long          seqRaw      = line.substring(pos[4] + 1, pos[5]).toInt();
     bool          statusOnly  = line.substring(pos[5] + 1).toInt() != 0;
 
-    // ★群の検証。GASは全Gatewayに同じ予約一覧を返すため（群別配信は第2段階）、
-    //   これが無いと他群あての予約が s_pending[] を占有し、自群の予約が入らなくなる。
+    // ★群の検証。GAS側でも群別に配信するが、誤配信時の多重防御として必ず検証する。
     if (childIdRaw > 0xFF || (childIdRaw & 0x1F) == 0 ||
         (childIdRaw >> 5) != GATEWAY_GROUP_ID) {
       Serial.print(F("[CACHE] 自群(")); Serial.print(GATEWAY_GROUP_ID);
@@ -1500,6 +1490,7 @@ static void processReportQueue() {
     String q;
     if (s_reports[i].finalResult) {
       q  = "action=downlink_result&child="; q += childHex;
+      q += "&group=";    q += String(GATEWAY_GROUP_ID);
       q += "&status=";   q += String(s_reports[i].status);
       q += "&sleep=";    q += String(s_reports[i].sleepMin);
       q += "&avg=";      q += String(s_reports[i].avg);
@@ -1509,6 +1500,7 @@ static void processReportQueue() {
       q += "&wdt=";      q += String(s_reports[i].wdtMin);
     } else {
       q  = "action=downlink_sent&child="; q += childHex;
+      q += "&group=";    q += String(GATEWAY_GROUP_ID);
       q += "&attempts="; q += String(s_reports[i].attempts);
       q += "&seq=";      q += String(s_reports[i].seq);
     }
@@ -1539,8 +1531,9 @@ static bool checkRemoteCmdOnce() {
   // ★v1.20: dl=1 を付けると、応答の2行目以降にLoRaダウンリンクの予約が相乗りしてくる。
   //   予約取得のためにHTTPリクエストを増やさずに済む（通信時間・失敗ポイントを増やさない）。
   //   dl=1を送らない旧ファーム(gateway_v1.1)には従来どおり1行だけが返る（GAS側で分岐）。
-  //   ★2026-08-28: 群1以上ではダウンリンクを無効化しているので予約自体を要求しない。
-  if (DOWNLINK_ENABLED) query += "&dl=1";
+  //   groupはGASが自群宛ての予約だけを返すために使用する。
+  query += "&dl=1&group=";
+  query += String(GATEWAY_GROUP_ID);
 #endif
 
   // ★2026-08-10(v1.20): AT+SH*系からAT+HTTPTOFS方式へ変更。
@@ -1555,7 +1548,7 @@ static bool checkRemoteCmdOnce() {
 #ifdef COMM_MODE_LORA
   // ★v1.20: 2行目以降のダウンリンク予約をキャッシュへ取り込み、cmdは1行目だけに絞る。
   //   （この分離をしないと "none\n08:..." のような文字列をコマンドとして判定してしまう）
-  applyDownlinkCache(cmd);  // 群1以上では中で何もしない（cmdの1行目切り出しは共通）
+  applyDownlinkCache(cmd);
   int nlPos = cmd.indexOf('\n');
   if (nlPos >= 0) cmd = cmd.substring(0, nlPos);
   cmd.trim();
@@ -2248,7 +2241,6 @@ static void sendDownlinkCommand(uint8_t targetDeviceId, uint16_t sleepMinutes,
 
 // 子機のアップリンクを検知したときの処理。予約があればダウンリンクを送る。
 static void onUplinkReceived(uint8_t childId) {
-  if (!DOWNLINK_ENABLED) return;  // 群1以上ではダウンリンクを送らない
   PendingDownlink* p = findPending(childId);
   if (p == nullptr) return;
 
@@ -2307,7 +2299,6 @@ static void onUplinkReceived(uint8_t childId) {
 //   ack: [0]0x05 [1]DeviceID [2]status [3-4]適用sleepMin(BE) [5]適用avg [6]適用median
 //        [7-8]適用後に有効になるWDTタイムアウト(分,BE)
 static void onDownlinkAckReceived(const uint8_t* ack, uint8_t len) {
-  if (!DOWNLINK_ENABLED) return;  // 群1以上では自分が送っていないため応答も処理しない
   if (len < 7) return;
   uint8_t  childId       = ack[1];
   uint8_t  status        = ack[2];
@@ -3580,10 +3571,8 @@ void setup() {
   Serial.println(F("）"));
   Serial.print(F("Gateway FW: ")); Serial.println(GATEWAY_FW_VERSION);
 #ifdef COMM_MODE_LORA
-  if (!DOWNLINK_ENABLED) {
-    Serial.print(F("△ 群")); Serial.print(GATEWAY_GROUP_ID);
-    Serial.println(F("のためダウンリンクを無効化しています（GAS側の群別配信は第2段階で対応）"));
-  }
+  Serial.print(F("群")); Serial.print(GATEWAY_GROUP_ID);
+  Serial.println(F("・ダウンリンク有効"));
 #endif
 
   Serial.print(F("[RESETREAS] 0x")); Serial.println(resetReason, HEX);
