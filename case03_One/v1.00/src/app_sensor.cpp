@@ -111,6 +111,12 @@ int medianInt(int *values, uint8_t count) {
 
 bool measureHx711(int32_t &value, uint8_t &range) {
   s_hx.begin(ONE_DOUT_PIN, ONE_PD_SCK_PIN);
+  // bogde/HX711 の begin() は PD_SCK を LOW に戻さない。直前の失敗時に
+  // power_down() を呼んでいると PD_SCK が HIGH のまま残り、HX711 が
+  // パワーダウン状態から復帰できずに以後ずっと失敗し続ける。
+  // 明示的に power_up() して復帰させる。
+  s_hx.power_up();
+  delay(1);  // HX711 のパワーアップ安定待ち
   s_hx.set_offset(s_settings.tareOffset);
   int32_t medians[MAX_MEASURE_COUNT] = {};
   int32_t minimum = INT32_MAX, maximum = INT32_MIN;
@@ -319,6 +325,7 @@ void sleepUntilNextCycle() {
   one::setLoRaModeNormal();  // 逆給電対策: 3V3_SWを落とす前にLOW
   one::endSensorI2c();
   one::setPeripheralPower(false);
+  Serial.print("[SLEEP] "); Serial.print(s_settings.sleepMinutes); Serial.println(" min");
   Serial.flush();
   vTaskDelay(pdMS_TO_TICKS(static_cast<uint32_t>(s_settings.sleepMinutes) * 60000UL));
 }
@@ -327,11 +334,27 @@ void sleepUntilNextCycle() {
 
 void setup() {
   Serial.begin(115200);
-  delay(50);
   one::halBegin();
   loadSettings();
   one::watchdogBegin(static_cast<uint32_t>(s_settings.sleepMinutes + WDT_MARGIN_MIN) * 60000UL);
-  Serial.print("[BOOT] Monita One sensor FW="); Serial.println(FW_VERSION);
+
+  // USB CDC の列挙完了前に出力すると PC に届かず消える。
+  // Flex v3.20 と同じ方式で、1秒間隔で複数回リピートしてモニタ接続を待つ。
+  // ONE_DEBUG_BOOT_REPEAT=0 を渡せば本番ビルドで待ち時間をゼロにできる。
+#ifndef ONE_DEBUG_BOOT_REPEAT
+#define ONE_DEBUG_BOOT_REPEAT 5
+#endif
+  for (uint8_t i = 0; i < ONE_DEBUG_BOOT_REPEAT; ++i) {
+    Serial.print("[BOOT] Monita One sensor FW=");
+    Serial.print(FW_VERSION);
+    Serial.print(" CH_ASSIGN=");
+    Serial.print(CH_ASSIGN);
+    Serial.print(" sleepMin=");
+    Serial.println(s_settings.sleepMinutes);
+    Serial.flush();
+    one::watchdogFeed();
+    delay(1000);
+  }
 }
 
 void loop() {
@@ -348,13 +371,34 @@ void loop() {
   const uint16_t battery = one::readBatteryMv();
   const int16_t temperature = one::readCpuTemperatureDeciC();
 
+  // 実機の切り分け用。計測が成功／失敗したかと、その値を必ず出す。
+  Serial.print("[MEAS] ok=");   Serial.print(measured ? 1 : 0);
+  Serial.print(" ch=");         Serial.print(channel);
+  Serial.print(" range=");      Serial.print(range);
+  Serial.print(" batt_mV=");    Serial.print(battery);
+  Serial.print(" cpuTemp_dC="); Serial.print(temperature);
+  Serial.print(" errors=0x");   Serial.println(s_errors, HEX);
+  Serial.flush();
+
   // 本番既定では計測エラー時に送信しない。疎通試験用緩和は明示flagだけに隔離する。
 #if defined(ONE_ALLOW_TX_WITH_ERRORS)
   (void)measured;
   sendReport(channel, range, battery, temperature);
+  Serial.print("[TX] 送信試行 errors=0x"); Serial.println(s_errors, HEX);
 #else
-  if (measured && s_errors == ERR_NONE) sendReport(channel, range, battery, temperature);
-  else Serial.println("[TX] 計測エラーのため送信を中止");
+  if (measured && s_errors == ERR_NONE) {
+    sendReport(channel, range, battery, temperature);
+    // sendReport() は失敗時に ERR_LORA_CONFIG / ERR_RADIO を立てる。
+    // [MEAS] の errors は計測フェーズの値なので、送信後に改めて出す。
+    if (s_errors == ERR_NONE) {
+      Serial.println("[TX] 送信完了");
+    } else {
+      Serial.print("[TX] 送信失敗 errors=0x"); Serial.println(s_errors, HEX);
+    }
+  } else {
+    Serial.println("[TX] 計測エラーのため送信を中止");
+  }
 #endif
+  Serial.flush();
   sleepUntilNextCycle();
 }
