@@ -38,7 +38,7 @@ c++ -std=c++11 -Wall -Wextra -pedantic \
 
 ## ハードウェア上の注意
 
-ピンは`one_hal.h`先頭の1ブロックに集約しています。D10/D7/D3/D4/D5/D6は回路図未確認の推定値です。I2CはOne配線のD5/D6を使う専用`TwoWire SensorWire`であり、XIAO既定`Wire`（D4/D5）は使いません。
+ピンは`one_hal.h`先頭の1ブロックに集約しています。全ピンはネットリスト解析と実機検証（2026-08-26）により確定済みです。I2CはOne配線のD5/D6を使う専用`TwoWire SensorWire`であり、XIAO既定`Wire`（D4/D5）は使いません。
 
 `setPeripheralPower()`だけがMOSFETゲートを操作します。OneではLOW=ON / HIGH=OFFです。電源断前にLORA_MODEをLOWへ戻し、UARTを`Serial1.end()`で閉じます。PIR版だけはPIR給電のため3V3_SWを常時ONとし、LoRa待機中はE220をMode 3へ置きます。
 
@@ -69,13 +69,40 @@ LoRaはPkt type `0x04`の19B固定です。PIR版はCH1=最大人数、CH2=平�
 
 Sigfox 12B契約は正本でも未確定です。本実装では既存Flex互換の`CH1..4 + temperature×10 + battery mV`を暫定採用し、PIRのCH意味・欠測・飽和はLoRaと揃えています。backend確定時に双方を同時更新してください。
 
-`FW_VERSION`と`DEVICE_ID`は`platformio.ini`でそれぞれ`0x01`、`0x0F`を初期値にしています。ファーム更新コミットでは`FW_VERSION`をインクリメントしてください。
+`FW_VERSION`は`platformio.ini`で定義します。ファーム更新コミットではインクリメントしてください。
 
-## 実機到着後の必須確認
+### DEVICE_ID（子機ID）の設定
 
-- 推定ピン6本とMOSFET極性
-- D1ショート状態の3V3_SW電圧、E220 Mode 3電流、R7=100kΩの電流
-- PPI/EGU3による起動時HIGH・約2秒HIGH・張り付き・チャタリング
-- VBAT ADCの実測校正
+1台のGatewayに複数のFlex / Oneをぶら下げるため、**機体ごとに固有のIDを割り当てます**。
+
+- 許可範囲は **0x01〜0x0F**（Gateway側 `ALLOWED_DEVICE_IDS[]` / `MAX_PENDING_CHILDREN=15` と対応）
+- 既定値 `0x0F` は `src/app_sensor.cpp` / `src/app_pir.cpp` の `#ifndef DEVICE_ID` で定義
+- ビルド時に上書きできます
+
+```sh
+PLATFORMIO_BUILD_FLAGS="-D DEVICE_ID=0x0E" pio run -e one_sensor_lora -t upload
+```
+
+`platformio.ini`側では定義していません。両方で定義すると`redefined`警告が出るためです。
+書き込んだIDは起動ログでは出ないため、**機体に貼るなどして管理してください**（ID重複はGateway側で
+データが混ざる原因になります）。
+
+## 実機検証の状況
+
+確認済み（2026-08-26。詳細は `【7】Monita/開発/開発メモ/20260826_MonitaOne_v1.00_実機立ち上げ記録.md`）:
+
+- ピン割当（MOSFET_GATE=D10 / PD_SCK=D3 / DOUT=D4）
+- MOSFET極性が LOW=ON であること
+- D1をショートした状態で 3V3_SW = 3.3V を確保できること
+- HX711（CH_ASSIGN=1）での計測（ok=1 / range=1 / errors=0x0）
+- E220の設定読み書きとLoRa送信
+
+未確認:
+
+- Gateway側での受信（One用スプレッドシートとGASのID差し替えが未了）
+- E220 Mode 3電流、R7=100kΩの電流（R7の差し替え自体が未実施）
+- VBAT ADCの実測校正（バッテリー未接続のため batt_mV は未検証）
+- STRAIN_SCALE の校正（現在100。Flex系は1110）
+- PIRモード: PPI/EGU3による起動時HIGH・約2秒HIGH・張り付き・チャタリング
 - PIR→SCAN→TX/RX→idleを1000回以上反復した電力・欠測・WDT評価
 - Sigfoxモジュールの待機モードと最終12B payload契約

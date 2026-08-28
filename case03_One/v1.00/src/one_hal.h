@@ -7,15 +7,20 @@
 #include <stdint.h>
 
 // ── Monita One v1.00 ピン割当（差し替えはこのブロックだけで完結させる）──
+//
+// 全ピン確定済み。根拠は2段階:
+//  1) ネットリスト解析: Flex v3.20 と同一の EAGLE 部品（XIAOフットプリント）を使用しており、
+//     稼働中のFlexファームのピン定義と5〜7点で矛盾なく一致した。
+//  2) 実機検証(2026-08-26): MOSFET_GATE / PD_SCK / DOUT の動作を基板上で確認済み。
+//     詳細: 【7】Monita/開発/開発メモ/20260826_MonitaOne_v1.00_実機立ち上げ記録.md
 constexpr uint8_t ONE_UART_TX_PIN = D8;
 constexpr uint8_t ONE_UART_RX_PIN = D9;
-// ★以下6本は回路図未確認の推定値。実機配線確認後にここだけを更新すること。
-constexpr uint8_t ONE_MOSFET_GATE_PIN = D10;  // 要回路図確認
-constexpr uint8_t ONE_LORA_MODE_PIN = D7;     // 要回路図確認: M0/M1共通
-constexpr uint8_t ONE_PD_SCK_PIN = D3;        // 要回路図確認
-constexpr uint8_t ONE_DOUT_PIN = D4;          // 要回路図確認 / PIR OUT兼用
-constexpr uint8_t ONE_I2C_SDA_PIN = D5;       // 要回路図確認
-constexpr uint8_t ONE_I2C_SCL_PIN = D6;       // 要回路図確認
+constexpr uint8_t ONE_MOSFET_GATE_PIN = D10;  // 3V3_SW電源ゲート。★LOW=ON（Flexと逆極性）
+constexpr uint8_t ONE_LORA_MODE_PIN = D7;     // E220 M0/M1共通（基板上で短絡）
+constexpr uint8_t ONE_PD_SCK_PIN = D3;        // HX711 PD_SCK / DS18B20 1-Wire兼用
+constexpr uint8_t ONE_DOUT_PIN = D4;          // HX711 DOUT / PIRモードでは PIR OUT兼用
+constexpr uint8_t ONE_I2C_SDA_PIN = D5;       // ★XIAO既定(D4)と異なる。専用SensorWireを使う
+constexpr uint8_t ONE_I2C_SCL_PIN = D6;       // ★XIAO既定(D5)と異なる
 
 namespace one {
 
