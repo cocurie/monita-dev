@@ -75,17 +75,30 @@ Sigfox 12B契約は正本でも未確定です。本実装では既存Flex互換
 
 1台のGatewayに複数のFlex / Oneをぶら下げるため、**機体ごとに固有のIDを割り当てます**。
 
-- 許可範囲は **0x01〜0x0F**（Gateway側 `ALLOWED_DEVICE_IDS[]` / `MAX_PENDING_CHILDREN=15` と対応）
-- 既定値 `0x0F` は `src/app_sensor.cpp` / `src/app_pir.cpp` の `#ifndef DEVICE_ID` で定義
+DeviceIDは1バイトを2つのフィールドに分割しています。
+
+```
+DEVICE_ID (1バイト)
+  上位3bit = Gateway群 (0〜7)       → group   = DEVICE_ID >> 5
+  下位5bit = 群内の機器番号 (1〜31)  → localNo = DEVICE_ID & 0x1F   ※0は無効値
+```
+
+- 群の境界は 群0 = `0x01`〜`0x1F`、群1 = `0x21`〜`0x3F`、群N の開始は `N × 0x20 + 1`
+- 1つの現場に複数のGatewayを置く場合、Gatewayは自分の `GATEWAY_GROUP_ID` と上位3bitが一致する
+  パケットだけをLoRaで受信します（二重受信の防止）
+- 下位5bitが0のID（`0x00` `0x20` `0x40` …）は無効値です。`static_assert` でビルドが失敗します
+- 既定値 `0x0F`（群0・機器15）は `src/app_sensor.cpp` / `src/app_pir.cpp` の `#ifndef DEVICE_ID` で定義
 - ビルド時に上書きできます
 
 ```sh
-PLATFORMIO_BUILD_FLAGS="-D DEVICE_ID=0x0E" pio run -e one_sensor_lora -t upload
+PLATFORMIO_BUILD_FLAGS="-D DEVICE_ID=0x24" pio run -e one_sensor_lora -t upload
 ```
 
+（`0x24` = 群1・機器番号4）
+
 `platformio.ini`側では定義していません。両方で定義すると`redefined`警告が出るためです。
-書き込んだIDは起動ログでは出ないため、**機体に貼るなどして管理してください**（ID重複はGateway側で
-データが混ざる原因になります）。
+書き込んだIDは起動ログ（`[BOOT] ... DEVICE_ID=0x24 group=1 localNo=4`）で確認できますが、
+**機体に貼るなどして管理してください**（ID重複はGateway側でデータが混ざる原因になります）。
 
 ## 実機検証の状況
 

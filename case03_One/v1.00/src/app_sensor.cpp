@@ -21,6 +21,12 @@
 #ifndef DEVICE_ID
 #define DEVICE_ID 0x0F
 #endif
+// DEVICE_IDは 上位3bit=Gateway群(0〜7) / 下位5bit=群内の機器番号(1〜31)。
+// 下位5bitが0のIDはGateway側で無効値として捨てられるため、ビルド時に弾く。
+static_assert((DEVICE_ID) >= 0x01 && (DEVICE_ID) <= 0xFF,
+              "DEVICE_ID must be 0x01..0xFF");
+static_assert(((DEVICE_ID) & 0x1F) != 0,
+              "DEVICE_ID low 5 bits must be 1..31 (0 is reserved)");
 
 namespace {
 
@@ -347,6 +353,13 @@ void setup() {
   for (uint8_t i = 0; i < ONE_DEBUG_BOOT_REPEAT; ++i) {
     Serial.print("[BOOT] Monita One sensor FW=");
     Serial.print(FW_VERSION);
+    // 機体の焼き間違いを現場で検知できるよう、完全ID・群番号・群内番号を出す。
+    Serial.print(" DEVICE_ID=0x");
+    Serial.print(static_cast<uint8_t>(DEVICE_ID), HEX);
+    Serial.print(" group=");
+    Serial.print(static_cast<uint8_t>((DEVICE_ID) >> 5));
+    Serial.print(" localNo=");
+    Serial.print(static_cast<uint8_t>((DEVICE_ID) & 0x1F));
     Serial.print(" CH_ASSIGN=");
     Serial.print(CH_ASSIGN);
     Serial.print(" sleepMin=");

@@ -19,6 +19,12 @@
 #ifndef DEVICE_ID
 #define DEVICE_ID 0x0F
 #endif
+// DEVICE_IDは 上位3bit=Gateway群(0〜7) / 下位5bit=群内の機器番号(1〜31)。
+// 下位5bitが0のIDはGateway側で無効値として捨てられるため、ビルド時に弾く。
+static_assert((DEVICE_ID) >= 0x01 && (DEVICE_ID) <= 0xFF,
+              "DEVICE_ID must be 0x01..0xFF");
+static_assert(((DEVICE_ID) & 0x1F) != 0,
+              "DEVICE_ID low 5 bits must be 1..31 (0 is reserved)");
 
 namespace {
 
@@ -493,7 +499,11 @@ void setup() {
 #endif
   // 必ずloadSettings()後。最大活動時間を加算し、状態機械停止だけをreset対象にする。
   one::watchdogBegin(static_cast<uint32_t>(s_settings.reportIntervalMin) * 60000UL + MAX_ACTIVITY_MS);
-  Serial.print("[BOOT] Monita One PIR FW="); Serial.println(FW_VERSION);
+  // 機体の焼き間違いを現場で検知できるよう、完全ID・群番号・群内番号を出す。
+  Serial.print("[BOOT] Monita One PIR FW="); Serial.print(FW_VERSION);
+  Serial.print(" DEVICE_ID=0x"); Serial.print(static_cast<uint8_t>(DEVICE_ID), HEX);
+  Serial.print(" group="); Serial.print(static_cast<uint8_t>((DEVICE_ID) >> 5));
+  Serial.print(" localNo="); Serial.println(static_cast<uint8_t>((DEVICE_ID) & 0x1F));
 }
 
 void loop() {
