@@ -99,8 +99,13 @@ using namespace Adafruit_LittleFS_Namespace;
 // BLE モード設定（COMM_MODE_BLE 時のみ有効）
 // ============================================================
 #ifdef COMM_MODE_BLE
-static const uint8_t  DEVICE_ID           = 0x01;  // 子機 ID（複数台時は変える: 0x01〜0xFF）
-static const uint8_t  FW_VERSION          = 4;     // 子機ファームのバージョン。コミットのたびに+1すること
+// 子機 ID。機体ごとに焼き分けるためビルド時に上書きできる:
+//   PLATFORMIO_BUILD_FLAGS="-D DEVICE_ID=0x21" pio run -t upload
+// 上位3bit=Gateway群(0〜7) / 下位5bit=群内の機器番号(1〜31)。詳細は下の static_assert 参照。
+#ifndef DEVICE_ID
+#define DEVICE_ID 0x01                             // BLEモードの既定値（群0・機器1）
+#endif
+static const uint8_t  FW_VERSION          = 5;     // 子機ファームのバージョン。コミットのたびに+1すること
 static const uint32_t MEASURE_INTERVAL_MIN = 20;   // 計測間隔（分）
 static const uint32_t ADV_DURATION_MIN     = 10;   // アドバタイズ継続時間（分）
 static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のときアドバタイズ
@@ -117,8 +122,31 @@ static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のとき
 // （BLEのような継続アドバタイズ／時間窓判定は行わない）。
 // ============================================================
 #ifdef COMM_MODE_LORA
-static const uint8_t  DEVICE_ID  = 0x0E;  // 子機 ID（iPEC実機テスト用。Gateway側 01_http_post の TARGET_DEVICE_ID と一致させること）
-static const uint8_t  FW_VERSION = 12;    // 子機ファームのバージョン。コミットのたびに+1すること
+// 子機 ID。機体ごとに焼き分けるためビルド時に上書きできる:
+//   PLATFORMIO_BUILD_FLAGS="-D DEVICE_ID=0x21" pio run -t upload
+// 上位3bit=Gateway群(0〜7) / 下位5bit=群内の機器番号(1〜31)。詳細は下の static_assert 参照。
+#ifndef DEVICE_ID
+#define DEVICE_ID 0x0E                    // LoRaモードの既定値（群0・機器14。iPEC実機テスト用）
+#endif
+static const uint8_t  FW_VERSION = 13;    // 子機ファームのバージョン。コミットのたびに+1すること
+#endif
+
+// ============================================================
+// DeviceID の値域検証（BLE / LoRa 共通）
+//
+// DEVICE_ID (1バイト)
+//   上位3bit = Gateway群 (0〜7)       → group   = DEVICE_ID >> 5
+//   下位5bit = 群内の機器番号 (1〜31)  → localNo = DEVICE_ID & 0x1F   ※0は無効値
+//
+// Gatewayは自分の GATEWAY_GROUP_ID と上位3bitが一致するパケットだけをLoRaで受信する。
+// 下位5bitが0のIDは無効値としてGatewayに捨てられるため、焼く前にビルドで弾く。
+// uint8_t へ暗黙切り詰めされる前に検出できるよう、マクロのまま評価している。
+// ============================================================
+#if defined(COMM_MODE_BLE) || defined(COMM_MODE_LORA)
+static_assert((DEVICE_ID) >= 0x01 && (DEVICE_ID) <= 0xFF,
+              "DEVICE_ID must be 0x01..0xFF");
+static_assert(((DEVICE_ID) & 0x1F) != 0,
+              "DEVICE_ID low 5 bits must be 1..31 (0 is reserved)");
 #endif
 
 // ============================================================
@@ -2382,6 +2410,13 @@ void setup() {
 #if defined(COMM_MODE_BLE) || defined(COMM_MODE_LORA)
     Serial.print("[FW] Version=");
     Serial.println(FW_VERSION);
+    // 焼き間違いを現場で切り分けられるよう、完全ID・群番号・群内番号を出す。
+    Serial.print("[ID] DEVICE_ID=0x");
+    Serial.print(static_cast<uint8_t>(DEVICE_ID), HEX);
+    Serial.print(" group=");
+    Serial.print(static_cast<uint8_t>((DEVICE_ID) >> 5));
+    Serial.print(" localNo=");
+    Serial.println(static_cast<uint8_t>((DEVICE_ID) & 0x1F));
 #endif
     Serial.print("[RESETREAS] 0x");
     Serial.println(reason, HEX);
