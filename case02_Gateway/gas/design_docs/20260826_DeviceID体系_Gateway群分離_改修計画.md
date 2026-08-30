@@ -310,7 +310,8 @@ static_assert(((DEVICE_ID) & 0x1F) != 0,
 
 > **★配備先の確認が必要**：テンプレート（`gateway_common`）を修正しても**配備済みGASには反映されない**。
 > どのデプロイがどの現場に紐づくかを先に棚卸しすること。
-> `gateway_common` は `SPREADSHEET_ID='REPLACE_WITH_SPREADSHEET_ID'` のテンプレートであり、実運用中のコードとは限らない。
+> `gateway_common` はコピー元テンプレートであり、実運用中のコードとは限らない。
+> （★2026-08-30: `SPREADSHEET_ID` はプレースホルダをやめ、`Code.gs` 最上部の警告ブロックに実IDを置く方式へ変更した）
 
 ### 4-5. テスト
 

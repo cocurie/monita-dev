@@ -159,6 +159,13 @@ const char* GAS_SCRIPT_ID = "AKfycbzKVvW6vEUvJ28c_xJbHoS2ulvHiPD4OsNONdrTrf6u4kL
 // 0 = 無効（通常運用時は必ず 0 に戻すこと）。
 #define TEST_INJECT_FAKE_DEVICE_COUNT 0  // 0=無効（通常運用）。バッチ分割検証時のみ一時的に台数を入れる
 
+// ★2026-08-30追加: 切り分け用スイッチ（通常運用は 0）。
+// 1にすると起動直後の checkRemoteCmd() を飛ばし、setup() を postBootInfoRow() まで
+// 一直線に到達させる。GAS「取得」(本文が要る・chunked未対応で失敗中)と
+// GAS「送信」(本文不要)を分離して、送信側の疎通だけを単独で判定したいときに使う。
+// ダウンリンクのchunked問題が未解決の間は、1にすると起動が約90秒短縮できる。
+#define DIAG_SKIP_BOOT_CMD_CHECK 0
+
 // ★2026-08-04追加: スプレッドシート側の動作確認用。1にすると、送信サイクルごと
 // （sendIntervalMs間隔、既定5分）に1台分のダミーCH値をrecordsへ注入し続ける。
 // 上のTEST_INJECT_FAKE_DEVICE_COUNTは起動時に1回だけ注入するのに対し、こちらは
@@ -253,7 +260,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 94;
+static uint8_t  const GATEWAY_FW_VERSION = 95;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する（★BLE受信専用）
 // ★2026-08-28: LoRaは isAllowedLoRaPacket() を使う。BLEの群分離は第3段階まで後回しと
@@ -879,6 +886,10 @@ bool initNetwork();                               // 後方で定義（復旧処
 #define HTTPTOFS_DIR_INDEX 3            // 3 = "/customer/"（AT+CFSRFILEの<index>）
 #define HTTPTOFS_FILENAME  "gasdl.txt"
 
+// 正常なGAS応答は 'ok'/'OK' 程度（chunkedのためlen=0で届く）。これを大きく超える本文が
+// 実際にダウンロードできた場合は、Content-Length付きのHTMLエラーページを疑う。
+#define GAS_ERROR_PAGE_MIN_LEN 512
+
 // AT+CFSRFILE の応答から本文を取り出す。
 // 応答形式: "OK\r\n\r\n+CFSRFILE: <len>\r\n<data>\r\n\r\nOK\r\n"
 static String extractCfsrfileBody(const String& raw, int expectedLen) {
@@ -909,6 +920,7 @@ static bool waitHttpToFsIdle(int maxWaitMs) {
 // モデム内部のHTTP/ファイル系リソース不調からの段階的復旧。
 static int s_fsFailStreak = 0;
 static int s_lastHttpStatus = 0;  // 直近のhttpGetViaFs()が受けたHTTPステータス（切り分け用）
+static int s_lastHttpLen    = 0;  // 直近のhttpGetViaFs()が受けた本文バイト数（偽陽性検出用）
 
 // ★2026-08-10: GAS取得の成功率を実測するためのカウンタ。
 // GASの応答はchunked（Content-Lengthなし）で、モジュールが本文長を決められず
@@ -967,6 +979,7 @@ static String httpGetViaFs(const String& url, bool wantBody) {
     }
   }
   s_lastHttpStatus = statusCode;
+  s_lastHttpLen    = dataLen;
   Serial.print(F("[GAS] HTTPTOFS status=")); Serial.print(statusCode);
   Serial.print(F(" len=")); Serial.println(dataLen);
 
@@ -1093,6 +1106,19 @@ bool postToGAS(String queryParams) {
   for (int attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) delay(1000);
     if (httpGetViaFs(url, false).length() > 0) {
+      // ★2026-08-30追加: postToGAS()はwantBody=falseで本文を読まないため、GASが例外を
+      //   投げてHTMLエラーページを返しても「status=200」だけを見て成功と表示していた。
+      //   実際にSPREADSHEET_ID未設定のGASを相手に「✓ 送信成功」と出続け、シートには
+      //   1行も入らない状態に丸一日気づけなかった（2026-08-30）。
+      //   正常時のGAS応答は 'ok'/'OK' 数バイトのchunkedで、モジュールは長さを決められず
+      //   len=0 を返す。一方Googleのエラーページは Content-Length 付きなので数KBが実際に
+      //   ダウンロードされる。この非対称を使って取り違えを検出する。
+      if (s_lastHttpLen > GAS_ERROR_PAGE_MIN_LEN) {
+        Serial.print(F("⚠ GASがエラーページを返した可能性（本文 "));
+        Serial.print(s_lastHttpLen);
+        Serial.println(F(" バイト）。シートに記録されていない恐れがあります"));
+        Serial.println(F("  → GAS側のSPREADSHEET_ID設定・デプロイ内容を確認してください"));
+      }
       Serial.println(F("✓ GAS 送信成功！"));
       lastGasSuccessMs = millis();  // アプリ層ウォッチドッグ: 送信成功を記録
       return true;
@@ -3270,10 +3296,40 @@ static uint32_t lastSend = 0;
 // ★子機の送信周期は60分（乱数ジッターは±10秒）で、従来の固定15分確認周期とは4周期ごとに
 // 重なる。同じ時刻にGAS通信(s_atBusy)が始まると子機アップリンクのダウンリンク送信を毎回
 // 見送る状態が永久に続き得るため、Gateway側もnRF52840内蔵RNGで確認周期をずらす。
+// ★2026-08-30修正: SoftDevice(BLE)有効中のRNG直接アクセスによる即時リセットを解消。
+//
+// 【症状】LoRaビルドで、STAGE6完了直後に必ずリセットし、postBootInfoRow()に一度も
+//   到達しない無限リブートに陥っていた（2026-08-24〜08-30の実機ログ20起動すべてで再現）。
+//   E220を外しても給電を変えても不変で、毎回まったく同じ命令位置・同じ経過時間で落ちた。
+//
+// 【原因】nRF52のRNGはSoftDeviceに占有される「制限付きペリフェラル」で、SoftDevice有効中に
+//   アプリがNRF_RNGへ直接レジスタアクセスすることは許されない。LoRaビルドは
+//   bleControllerBegin()でSoftDeviceを有効にするため、この関数に入った瞬間に必ず落ちていた。
+//   乱数はSoftDevice API経由で取得しなければならない。
+//   （導入は d47c62e / FW88→90。BLEビルドではmakeCmdCheckIntervalMs()自体が
+//     #ifdef COMM_MODE_LORA の中なので発現しない）
+//
+// 用途は確認周期のジッターなので乱数品質の要求は緩い。取得できない場合はmicros()で代替する。
 static uint8_t gatewayTrueRandomByte() {
+  uint8_t sdEnabled = 0;
+  (void) sd_softdevice_is_enabled(&sdEnabled);
+
+  if (sdEnabled) {
+    uint8_t value = 0;
+    for (int i = 0; i < 50; i++) {  // プールの補充待ち（通常は数ms以内）
+      uint8_t avail = 0;
+      if (sd_rand_application_bytes_available_get(&avail) == NRF_SUCCESS && avail >= 1) {
+        if (sd_rand_application_vector_get(&value, 1) == NRF_SUCCESS) return value;
+      }
+      delay(1);
+    }
+    return (uint8_t)(micros() & 0xFF);  // ジッター用途なので取れなくても実害はない
+  }
+
+  // SoftDeviceが無効なときだけ直接アクセスしてよい
   NRF_RNG->TASKS_START = 1;
   NRF_RNG->EVENTS_VALRDY = 0;
-  while (NRF_RNG->EVENTS_VALRDY == 0) { /* HW RNGの1バイト生成を待つ（数十us程度） */ }
+  while (NRF_RNG->EVENTS_VALRDY == 0) { wdtFeed(); }  // 万一止まってもWDTで拾えるよう給餌
   uint8_t value = (uint8_t)NRF_RNG->VALUE;
   NRF_RNG->EVENTS_VALRDY = 0;
   NRF_RNG->TASKS_STOP = 1;
@@ -3617,6 +3673,14 @@ void setup() {
     }
 
     Serial.println(F("✓ SD カード初期化完了"));
+
+    // ★2026-08-30 切り分け用: [RESETREAS]はSDログのオープンより前に出力されるため、
+    // gwlog.csvには一度も記録されていなかった（20起動分のログを確認済み）。
+    // 自然リセット直後はUSB CDCが落ちていてシリアルでも取り逃がすので、
+    // リセット原因を残せる場所がどこにも無い状態だった。ここで再掲する。
+    Serial.print(F("[RESETREAS/SD] 0x")); Serial.print(resetReason, HEX);
+    Serial.print(F(" 起動時刻=")); Serial.println(getTimestamp());
+
     // ヘッダ行がなければ書く
     if (!SD.exists("gateway.csv")) {
       File f = SD.open("gateway.csv", FILE_WRITE);
@@ -3838,7 +3902,11 @@ void setup() {
 #endif
 
   if (netOk) {
+#if DIAG_SKIP_BOOT_CMD_CHECK
+    Serial.println(F("[DIAG] 起動時のcheckRemoteCmd()をスキップします（切り分け用）"));
+#else
     checkRemoteCmd();  // 起動直後に一度、コマンドとダウンリンク予約を取得する
+#endif
 #ifdef COMM_MODE_LORA
     lastCmdCheck = millis();
     nextCmdCheckIntervalMs = makeCmdCheckIntervalMs();  // 次回は固定周期にせず衝突時刻をずらす
