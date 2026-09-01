@@ -7,16 +7,18 @@
 //
 // 【コマンド】
 //   0 : 4CH測定（単発。結果をシリアルに表示）
-//   8 : 4CHゼロ点補正（タレ）
-//   9 : 状態確認（タレオフセット・直近測定値・応答状況をキャッシュから表示。
+//   8 : 4CHゼロ点補正（タレ。現在値を0µεとする）
+//   9 : 状態確認（タレオフセット・ゼロ点基準・直近測定値・応答状況をキャッシュから表示。
 //       ハードウェアへのアクセスは行わない＝即座に返る）
+//   s : ゼロ点を任意のµε値にシフト（4CH一括）。数値入力後Enterで確定。
+//       例: 治具の②負方向基板で基準点を-1993µεに置きたい場合、"s" → "-1993" → Enter
 //
 // 【HX711が応答しない場合】
-//   該当CHにエラーを表示し、そのCHの測定/タレをスキップする。
+//   該当CHにエラーを表示し、そのCHの測定/タレ/ゼロ点シフトをスキップする。
 //   他のCHの処理は継続する（1CHの故障・未接続で全体を止めない）。
 //
 // 出典・流用元: case01_Flex/v3.20/src/main.cpp
-//   （muxSelect/hxBegin/hxReadAvg/hxRead/hxTareWithTimeout はほぼそのまま踏襲）
+//   （muxSelect/hxBegin/hxReadAvg/hxRead/タレのタイムアウト処理 はほぼそのまま踏襲）
 // ============================================================
 
 #include <Arduino.h>
@@ -31,7 +33,7 @@
 #define SW_POWER_PIN    10  // D10: 3V3_SW 電源ゲート（HIGH = ON）
 #define TCA9534_ADDR    0x20
 
-static const uint8_t  FW_VERSION   = 1;         // コミットのたびに+1すること
+static const uint8_t  FW_VERSION   = 2;         // コミットのたびに+1すること
 static const char     FW_NAME[]    = "StrainInspector";
 static const char     BUILD_INFO[] = __DATE__ " " __TIME__;
 
@@ -52,9 +54,11 @@ static HX711 hx;
 
 // ── CHごとの状態（RAM保持のみ。電源を切ると失われる）────────────
 static long  s_tareOffset[4]      = {0, 0, 0, 0};
-static bool  s_lastValid[4]       = {false, false, false, false};  // 直近の測定/タレが成功したか
+static bool  s_lastValid[4]       = {false, false, false, false};  // 直近の測定/タレ/ゼロ点シフトが成功したか
 static float s_lastStrainUe[4]    = {0, 0, 0, 0};                  // 直近の測定値（µε）
 static bool  s_everMeasured[4]    = {false, false, false, false};  // 一度でも測定できたか（"9"の表示用）
+static float s_zeroRefUe[4]       = {0, 0, 0, 0};                  // 現在のゼロ点が表す絶対µε値（"8"なら0、"s"ならその入力値）
+static bool  s_everZeroed[4]      = {false, false, false, false};  // 一度でもゼロ点を設定できたか（"9"の表示用）
 
 // ============================================================
 // TCA9534 — SN74LV4052（CH切替マルチプレクサ）の A/B を I2C から駆動
@@ -153,15 +157,20 @@ static bool hxRead(float *outRaw) {
   return true;
 }
 
-// タレ1回分のオフセットを、サンプルごとにタイムアウトを見ながら求める。
+// 現在の生値の平均が targetUe [µε] を指すように、オフセットを求めて設定する。
+// targetUe=0.0f を渡せば通常のタレ（ゼロ点補正）と同じ。
+// サンプルごとにタイムアウトを見ながら平均を取る。
 // 戻り値: true=成功（オフセット設定済み）、false=タイムアウト（オフセットは変更しない）
-static bool hxTareWithTimeout(uint8_t times = 10) {
+static bool hxSetZeroWithTimeout(float targetUe, uint8_t times = 10) {
   double sum = 0;
   for (uint8_t i = 0; i < times; i++) {
     if (!hx.wait_ready_timeout(HX711_SAMPLE_TIMEOUT_MS)) return false;
     sum += (double)hx.read();
   }
-  hx.set_offset((long)(sum / (double)times));
+  double avg = sum / (double)times;
+  // get_value() = read() - offset が targetUe*STRAIN_SCALE を返すようにする
+  long newOffset = (long)(avg - (double)targetUe * (double)STRAIN_SCALE);
+  hx.set_offset(newOffset);
   return true;
 }
 
@@ -184,8 +193,9 @@ static void printUsage() {
   Serial.println(s_tcaOk ? "OK" : "エラー（全CH応答しない可能性）");
   Serial.println("--- コマンド一覧 ---");
   Serial.println("  0 : 4CH測定（単発）");
-  Serial.println("  8 : 4CHゼロ点補正（タレ）");
-  Serial.println("  9 : 状態確認（再測定なし）");
+  Serial.println("  8 : 4CHゼロ点補正（タレ。現在値を0µεとする）");
+  Serial.println("  9 : 状態確認（再測定なし。現在のゼロ点位置も表示）");
+  Serial.println("  s : ゼロ点を任意のµε値へシフト（4CH一括、数値入力後Enter）");
   Serial.println("--------------------");
   Serial.println();
 }
@@ -230,13 +240,15 @@ static void cmdTare() {
       s_lastValid[ch - 1] = false;
       continue;
     }
-    if (!hxTareWithTimeout()) {
+    if (!hxSetZeroWithTimeout(0.0f)) {
       Serial.print("[TARE] CH"); Serial.print(ch);
       Serial.println(": ERROR（HX711応答なし。オフセットは変更していません）");
       s_lastValid[ch - 1] = false;
       continue;
     }
     s_tareOffset[ch - 1] = hx.get_offset();
+    s_zeroRefUe[ch - 1]  = 0.0f;
+    s_everZeroed[ch - 1] = true;
     s_lastValid[ch - 1]  = true;
     Serial.print("[TARE] CH"); Serial.print(ch);
     Serial.print(": OK（offset=");
@@ -244,6 +256,78 @@ static void cmdTare() {
     Serial.println(")");
   }
   Serial.println("[TARE] 完了");
+}
+
+// シリアルから1行読む（'\r'または'\n'で終端。連続する改行文字はまとめて1つの終端とみなす）。
+// 戻り値: true=1行読めた（bufに0終端で格納）、false=timeoutMs以内に終端が来なかった
+static bool readLineBlocking(char *buf, size_t bufSize, unsigned long timeoutMs) {
+  size_t len = 0;
+  unsigned long t0 = millis();
+  while ((millis() - t0) < timeoutMs) {
+    if (!Serial.available()) { delay(5); continue; }
+    int c = Serial.read();
+    if (c == '\r' || c == '\n') {
+      if (len == 0) continue;  // 行頭の改行はスキップ（\r\n両方送られてくる場合の空行対策）
+      buf[len] = '\0';
+      return true;
+    }
+    if (len + 1 < bufSize) {
+      buf[len++] = (char)c;
+    }
+    t0 = millis();  // 入力があるたびにタイムアウトを延長する
+  }
+  return false;
+}
+
+// 's': ゼロ点を任意のµε値へシフトする（4CH一括、同じ値を適用）。
+// ユーザーが入力した値をそのまま「現在の生値の位置」の絶対µεとして扱う。
+static void cmdSetZero() {
+  Serial.println("ゼロ点としたい µε 値を入力して Enter を押してください（例: -1993）:");
+
+  char buf[32];
+  if (!readLineBlocking(buf, sizeof(buf), 60000UL)) {
+    Serial.println("[SETZERO] 入力タイムアウト。キャンセルしました（変更なし）");
+    return;
+  }
+
+  char *endp = nullptr;
+  double val = strtod(buf, &endp);
+  if (endp == buf) {
+    Serial.print("[SETZERO] 数値として解釈できません: \"");
+    Serial.print(buf);
+    Serial.println("\" キャンセルしました（変更なし）");
+    return;
+  }
+  float targetUe = (float)val;
+
+  Serial.print("[SETZERO] 開始（目標=");
+  Serial.print(targetUe, 1);
+  Serial.println(" µε）");
+  for (uint8_t ch = 1; ch <= 4; ch++) {
+    if (!hxBegin(ch)) {
+      Serial.print("[SETZERO] CH"); Serial.print(ch);
+      Serial.println(": ERROR（MUX切替失敗。TCA9534未応答）");
+      s_lastValid[ch - 1] = false;
+      continue;
+    }
+    if (!hxSetZeroWithTimeout(targetUe)) {
+      Serial.print("[SETZERO] CH"); Serial.print(ch);
+      Serial.println(": ERROR（HX711応答なし。オフセットは変更していません）");
+      s_lastValid[ch - 1] = false;
+      continue;
+    }
+    s_tareOffset[ch - 1] = hx.get_offset();
+    s_zeroRefUe[ch - 1]  = targetUe;
+    s_everZeroed[ch - 1] = true;
+    s_lastValid[ch - 1]  = true;
+    Serial.print("[SETZERO] CH"); Serial.print(ch);
+    Serial.print(": OK（offset=");
+    Serial.print(s_tareOffset[ch - 1]);
+    Serial.print(", ゼロ点=");
+    Serial.print(targetUe, 1);
+    Serial.println(" µε）");
+  }
+  Serial.println("[SETZERO] 完了");
 }
 
 // '9': 状態確認。ハードウェアへは一切アクセスせず、キャッシュ済みの値だけを表示する
@@ -258,6 +342,13 @@ static void cmdStatus() {
   for (uint8_t ch = 1; ch <= 4; ch++) {
     Serial.print("  CH"); Serial.print(ch); Serial.print(": ");
     Serial.print("tare_offset="); Serial.print(s_tareOffset[ch - 1]);
+    Serial.print(", ゼロ点基準=");
+    if (s_everZeroed[ch - 1]) {
+      Serial.print(s_zeroRefUe[ch - 1], 1);
+      Serial.print(" µε");
+    } else {
+      Serial.print("未設定（起動時の初期値0）");
+    }
     Serial.print(", 直近値=");
     if (s_everMeasured[ch - 1]) {
       Serial.print(s_lastStrainUe[ch - 1], 1);
@@ -299,6 +390,7 @@ void loop() {
     case '0': cmdMeasure(); break;
     case '8': cmdTare();    break;
     case '9': cmdStatus();  break;
+    case 's': case 'S': cmdSetZero(); break;
     case '\r': case '\n':   break;  // 改行は無視
     default:
       Serial.print("[?] 不明なコマンド: '");
