@@ -1328,13 +1328,16 @@ function doGet(e) {
   // fw_version列にまとめて記録する。
   if (p.row_type === 'info') {
     console.log('[INFO] ts=' + p.ts + ' sim=' + p.sim + ' csq=' + p.csq +
-      ' xiao_id=' + p.xiao_id + ' sim_imei=' + p.sim_imei +
+      ' xiao_id=' + p.xiao_id + ' sim_imei=' + p.sim_imei + ' sim_iccid=' + p.sim_iccid +
       ' sd=' + p.sd + ' interval_min=' + p.interval_min + ' devcount=' + p.devcount +
       ' gw_fw=' + p.gw_fw + ' gw_id=' + p.gw_id + ' group=' + p.group);
 
     var infoSheet = getSpreadsheet().getSheetByName('databox');
     if (infoSheet) {
       // info行: 受信日時 + Gateway情報のみ。センサ列(D-O)は空欄
+      // ★2026-08-30: sim_iccid（SIMカード自体の識別番号）を追加。sim_imeiはモジュール
+      //   自体の識別番号でSIMを挿し替えても変わらないため、社内デバイス管理でSIMカード
+      //   自体を追跡するには別途ICCIDが必要という要望に対応した。
       infoSheet.appendRow([
         new Date(),                                              // A: 受信日時
         'GW',                                                    // B: DeviceID欄にGW識別子
@@ -1342,7 +1345,8 @@ function doGet(e) {
         '', '', '', '',                                          // D-G: CH med
         '', '', '', '', '', '', '', '',                          // H-O: Max/Min
         p.csq || '',                                             // P: CSQ
-        'fw' + (p.gw_fw || '?') + ' xiao=' + (p.xiao_id || '') + ' imei=' + (p.sim_imei || ''),
+        'fw' + (p.gw_fw || '?') + ' xiao=' + (p.xiao_id || '') + ' imei=' + (p.sim_imei || '') +
+          ' iccid=' + (p.sim_iccid || ''),
         p.gw_id || '',                                           // R: Gateway ID
         p.group || '',                                           // S: Gateway群番号
       ]);

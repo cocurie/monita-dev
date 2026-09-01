@@ -260,7 +260,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 95;
+static uint8_t  const GATEWAY_FW_VERSION = 96;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する（★BLE受信専用）
 // ★2026-08-28: LoRaは isAllowedLoRaPacket() を使う。BLEの群分離は第3段階まで後回しと
@@ -2935,6 +2935,8 @@ String getXiaoId() {
 }
 
 // SIM7080G の IMEI（15桁の一意な番号）を取得する
+// ★注意: これはモジュール自体の識別番号であり、SIMカードの識別番号ではない
+//   （SIMを挿し替えてもIMEIは変わらない）。SIMカード自体の識別にはgetSimIccid()を使う。
 String getSimImei() {
   String res = sendAT("AT+GSN", 3000);
   for (int i = 0; i < (int)res.length(); i++) {
@@ -2948,12 +2950,29 @@ String getSimImei() {
   return "";
 }
 
+// SIMカード自体のICCID（19〜20桁、契約者・回線を特定できる番号）を取得する。
+// ★2026-08-30追加: 社内デバイス管理でSIMカード自体を識別する必要があるため。
+//   IMEI（モジュール識別）とは別物で、SIMを挿し替えるとこちらの値が変わる。
+String getSimIccid() {
+  String res = sendAT("AT+CCID", 3000);
+  for (int i = 0; i < (int)res.length(); i++) {
+    if (isDigit(res[i])) {
+      int j = i;
+      while (j < (int)res.length() && isDigit(res[j])) j++;
+      if (j - i >= 15) return res.substring(i, j);  // ICCIDは19〜20桁程度の連続した数字
+      i = j;
+    }
+  }
+  return "";
+}
+
 // 起動確認送信: 機器の設定情報を1行だけ GAS へ送る（子機データとは別行）
 void postBootInfoRow() {
   Serial.println(F("--- 起動情報送信 ---"));
-  String xiaoId  = getXiaoId();
-  String simImei = getSimImei();
-  int    csq     = getSimCsq();
+  String xiaoId   = getXiaoId();
+  String simImei  = getSimImei();
+  String simIccid = getSimIccid();
+  int    csq      = getSimCsq();
 
   String params = "ts=";
   params += getTimestamp();
@@ -2966,6 +2985,8 @@ void postBootInfoRow() {
   params += xiaoId;
   params += "&sim_imei=";
   params += simImei;
+  params += "&sim_iccid=";
+  params += simIccid;
   params += "&sd=";
   params += (sdAvailable ? "1" : "0");
   params += "&interval_min=";
