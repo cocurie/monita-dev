@@ -1,0 +1,13 @@
+// I2Cスキャン用の一時コード（main.cppのsetup()内measureAll()の前に追加して確認）
+
+void i2cScan() {
+  Serial.println("--- I2C scan ---");
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("Found: 0x");
+      Serial.println(addr, HEX);
+    }
+  }
+  Serial.println("--- scan done ---");
+}
