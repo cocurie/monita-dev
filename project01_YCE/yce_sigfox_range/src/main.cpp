@@ -364,10 +364,11 @@ static uint32_t s_errors;
 // true の場合、初期化完了後に「ボタンが離されるのを待ってからタレ実行」する。
 // ※ ボタン割り込み（attachInterrupt/GPIOTE）は使わない。スリープ電流が
 //    約14µA増えるため（PPK2実測: 17.5µA → 31.6µA）。
-static bool s_bootButtonHeld = false;
 
 // D0 ボタンによる早期起床フラグ（ISR から書き込み、deepSleep() で読み出す）
 static volatile bool s_btnWakeRequest = false;
+// D0 ボタンで起床したことを loop() へ伝えるフラグ（長押しタレ判定に使用）
+static bool s_wakeByButton = false;
 // loop() タスクハンドル（ISR から vTaskNotifyGiveFromISR で通知するために保持）
 static TaskHandle_t s_loopTaskHandle = nullptr;
 
@@ -637,10 +638,16 @@ static void deepSleep(uint32_t minutes) {
 
   // sleepMs だけブロッキング待機する。FreeRTOS Tickless Idle により CPU は低消費電力状態へ落ちる。
   // D0 ボタンが押されると ISR が vTaskNotifyGiveFromISR を発行し、早期リターンして即計測・送信を行う。
+  //
+  // タレ操作（D0押しながら電源ON）でボタンを離す際のチャタリングにより ISR が誤発火し、
+  // タスク通知がキューに積まれたまま ulTaskNotifyTake に到達する場合がある。
+  // そのままだと即リターンして余分な計測・送信が発生するため、ここでドレインしておく。
+  ulTaskNotifyTake(pdTRUE, 0);  // 0ms = ノンブロッキング：キュー済み通知を捨てるだけ
   s_btnWakeRequest = false;
   ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(sleepMs));
   if (s_btnWakeRequest) {
-    Serial.println("[WAKE] D0ボタンによる早期起床 → 即計測・送信");
+    Serial.println("[WAKE] D0ボタンによる早期起床");
+    s_wakeByButton = true;
   }
   s_btnWakeRequest = false;
 }
@@ -939,50 +946,6 @@ static void performTare() {
   logEvent("TARE_OK", (int32_t)successCount);
 }
 
-// ============================================================
-// 起動時タレ（ゼロ点補正）
-//
-// 【操作方法】D0 のタクトスイッチを押しながら電源スイッチ(S1)を ON にし、
-//   LED（青）が点灯したらボタンを離す → タレ実行（成功時シアン約4秒点滅）。
-//
-// 【「離したら実行」にしている理由】
-//   ボタンが浸水・振動などで物理的に固着した場合、「押されていたら即実行」
-//   だと WDT リセットや電源瞬断のたびに勝手に再タレされてしまう。
-//   「離す」ことを条件にすれば、固着状態では永久に実行されない。
-//   タイムアウトした場合は赤点灯で異常を知らせ、タレは行わない。
-//
-// 呼び出しは 3V3_SW ON・Wire 初期化済み・tca9534Configure() 済みの状態で行うこと。
-// ============================================================
-static void handleBootTare() {
-  if (!s_bootButtonHeld) return;
-
-  Serial.println("[TARE] 起動時ボタン押下を検出。離すのを待っています...");
-  Serial.flush();
-
-  // ボタンが離されるのを待つ（押されている間は青点灯で「受付中」を示す）
-  statusBootBlueStrong();
-  unsigned long t0 = millis();
-  while (digitalRead(USER_BUTTON_PIN) == LOW) {
-    if (millis() - t0 >= BOOT_TARE_RELEASE_TIMEOUT_MS) {
-      // 離されないままタイムアウト → ボタン固着の疑い。タレは実行しない。
-      statusErrorRed();
-      logEvent("TARE_STUCK", (int32_t)(millis() - t0));
-      Serial.println("[TARE] タイムアウト: ボタンが離されません（固着の疑い）。タレを中止します。");
-      Serial.flush();
-      delay(2000);   // 赤点灯を現場で視認できる時間だけ保持
-      rgbOff();
-      return;
-    }
-    delay(10);
-  }
-
-  delay(50);  // 離す際のチャタリングが収まるのを待つ
-
-  Serial.println("[TARE] ボタンが離されました。タレを実行します。");
-  Serial.flush();
-
-  performTare();
-}
 
 // 小さな配列のバブルソートで中央値（外れ値に強い簡易ロバスト化）を求める。
 // outRange が非NULLの場合、ソート済み配列の最大-最小（そのサイクル内のブレ幅）も返す。
@@ -2366,12 +2329,6 @@ void setup() {
   pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
   pinMode(SPARE_GPIO_PIN,  INPUT_PULLUP);
 
-  // 電源投入時にボタンが押されているかを、ここで1回だけ読み取る。
-  // 実際のタレ実行は各種初期化（Wire/TCA9534/タレオフセット復元）が済んだ後、
-  // 「ボタンが離されたこと」を確認してから行う（後述の handleBootTare()）。
-  delay(20);  // チャタリング除去
-  s_bootButtonHeld = (digitalRead(USER_BUTTON_PIN) == LOW);
-
   // loop() タスクハンドルを保存し、D0 ボタン割り込みを登録する。
   // スリープ中に D0 を押すと ISR が vTaskNotifyGiveFromISR を発行し、
   // deepSleep() 内の ulTaskNotifyTake が早期リターンして即計測・送信を行う。
@@ -2443,11 +2400,6 @@ void setup() {
   s_eventLogCount = 0;
   s_eventLogNext  = 0;
   saveEventLog();
-
-  // 起動時にボタンが押されていたらタレを実行する（離されるのを待ってから実行）。
-  // loadTareOffsets() の後に置くこと（復元したオフセットを上書きする形になるため）。
-  // measureAll() の前に置くことで、直後の計測値に新しいタレが反映される。
-  handleBootTare();
 
   measureAll();
 
@@ -2525,8 +2477,35 @@ void loop() {
     statusErrorRed();
     Serial.println("[TCA9534] re-init failed");
   }
-  // D0 短押し（スリープ中）→ 早期起床して即計測・送信（deepSleep() 内の ulTaskNotifyTake が処理）
-  // D0 押しながら電源ON → タレ実行（setup() の handleBootTare() が処理）
+
+  // D0 長押し10秒でゼロ点補正（タレ）
+  // D0 短押しで起床した場合のみ判定する（通常のタイマー起床時は判定しない）。
+  // Sigfoxモジュール起動待ち（delay 3000ms）の間もボタンを押し続けることになるため、
+  // tca9534Configure() 完了後（Wire使用可能）の時点から10秒を計測する。
+  if (s_wakeByButton) {
+    s_wakeByButton = false;
+    if (digitalRead(USER_BUTTON_PIN) == LOW) {
+      Serial.println("[TARE] D0長押し確認中... 10秒以上でゼロ点補正");
+      statusBootBlueStrong();
+      unsigned long t0 = millis();
+      bool longPress = false;
+      while (digitalRead(USER_BUTTON_PIN) == LOW) {
+        wdtFeed();
+        if (millis() - t0 >= 10000UL) { longPress = true; break; }
+        delay(50);
+      }
+      if (longPress) {
+        // ボタンが離されるのを待ってからタレ実行
+        while (digitalRead(USER_BUTTON_PIN) == LOW) { delay(10); wdtFeed(); }
+        delay(50);  // チャタリング収束待ち
+        performTare();
+        // チャタリングによるキュー積みをドレイン
+        ulTaskNotifyTake(pdTRUE, 0);
+        s_btnWakeRequest = false;
+      }
+      // 短押しの場合はそのまま即計測・送信へ進む
+    }
+  }
 
   measureAll();
 
