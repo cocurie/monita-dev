@@ -105,7 +105,7 @@ using namespace Adafruit_LittleFS_Namespace;
 #ifndef DEVICE_ID
 #define DEVICE_ID 0x01                             // BLEモードの既定値（群0・機器1）
 #endif
-static const uint8_t  FW_VERSION          = 5;     // 子機ファームのバージョン。コミットのたびに+1すること
+static const uint8_t  FW_VERSION          = 6;     // 子機ファームのバージョン。コミットのたびに+1すること
 static const uint32_t MEASURE_INTERVAL_MIN = 20;   // 計測間隔（分）
 static const uint32_t ADV_DURATION_MIN     = 10;   // アドバタイズ継続時間（分）
 static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のときアドバタイズ
@@ -128,7 +128,7 @@ static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のとき
 #ifndef DEVICE_ID
 #define DEVICE_ID 0x0E                    // LoRaモードの既定値（群0・機器14。iPEC実機テスト用）
 #endif
-static const uint8_t  FW_VERSION = 13;    // 子機ファームのバージョン。コミットのたびに+1すること
+static const uint8_t  FW_VERSION = 14;    // 子機ファームのバージョン。コミットのたびに+1すること
 #endif
 
 // ============================================================
@@ -169,19 +169,17 @@ static_assert(((DEVICE_ID) & 0x1F) != 0,
 #endif
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 // ── タレ（ゼロ点補正）操作 ─────────────────────────────────────
-// 【操作方法】D0 のタクトスイッチを押しながら電源スイッチ(S1)を ON にし、
-//   LED（青）が点灯したらボタンを離す → タレ実行（成功時シアン点滅）。
+// 【操作方法】スリープ中に D0 ボタンを押す → 青点灯（長押し受付中）→
+//   そのまま 10 秒以上押し続けてから離す → タレ実行（成功時シアン点滅）。
+//   10 秒以内に離すと長押しキャンセル → 即時計測・送信として動作する。
 //
-// 【なぜ「離したら実行」なのか】
-//   ボタンが物理的に固着・浸水した場合、「押されていたら即実行」だと
-//   WDT リセットや電源瞬断のたびに勝手に再タレされてしまう。
-//   「離す」ことを条件にすれば、固着状態では永遠に実行されない。
+// 【電源投入時の動作】
+//   電源 ON → 初期化完了後に即時計測・送信。タレは上記スリープ中操作で行う。
 //
-// 【なぜスリープ中の長押しをやめたのか】
-//   nRF52 の attachInterrupt() は GPIOTE の IN event モードを使い、
-//   スリープ電流が約14µA増える（PPK2 実測: 17.5µA → 31.6µA）。
-//   起動時判定なら割り込み不要で digitalRead() だけで済む。
-#define BOOT_TARE_RELEASE_TIMEOUT_MS 15000UL  // ボタンが離されるのを待つ上限（ms）
+// 【スリープ電流について】
+//   GPIOTE を使うため PPK2 実測でスリープ電流が約+14µA 増えるが（17.5→31.6µA）、
+//   現場での電源 OFF なし操作性を優先して許容する。
+#define BOOT_TARE_RELEASE_TIMEOUT_MS 15000UL  // 将来の参照用（現仕様では未使用）
 
 // ── DS3231 RTC 設定 ────────────────────────────────────────────
 // 起動時に DS3231 の OSF（発振停止フラグ）を確認し、時刻が無効な場合
@@ -401,11 +399,23 @@ enum : uint32_t {
 
 static uint32_t s_errors;
 
-// 電源投入時に D0 ボタンが押されていたか（起動直後に1回だけ読み取る）。
-// true の場合、初期化完了後に「ボタンが離されるのを待ってからタレ実行」する。
-// ※ ボタン割り込み（attachInterrupt/GPIOTE）は使わない。スリープ電流が
-//    約14µA増えるため（PPK2実測: 17.5µA → 31.6µA）。
-static bool s_bootButtonHeld = false;
+// D0 ボタン関連
+// ISR からセットされる「起床リクエスト」フラグ。deepSleep() 内で参照する。
+static volatile bool s_btnWakeRequest = false;
+// deepSleep() が「ボタン起床だった」かを loop() に伝えるフラグ。
+// true のとき loop() は長押し判定（10秒）に入る。
+static bool s_wakeByButton = false;
+// vTaskNotifyGiveFromISR() のターゲット。setup() でセットし、以後変更しない。
+static TaskHandle_t s_loopTaskHandle = nullptr;
+
+static void onUserButtonISR() {
+  s_btnWakeRequest = true;
+  if (s_loopTaskHandle != nullptr) {
+    BaseType_t woken = pdFALSE;
+    vTaskNotifyGiveFromISR(s_loopTaskHandle, &woken);
+    portYIELD_FROM_ISR(woken);
+  }
+}
 
 // ボタンイベント（タレ実行等）をフラッシュへ記録する。定義は後方（DS3231関連の後）。
 static void logEvent(const char *type, int32_t extra);
@@ -517,8 +527,8 @@ static void statusSigfoxBlinkTick() {
 // いることが判明したため、FreeRTOSのブロッキング待機に置き換えた
 // （Tickless Idle が正しく発動し、CPUが低消費電力状態に入る）。
 //
-// ボタンによる早期起床は廃止したため、タスク通知（ulTaskNotifyTake）ではなく
-// 単純な vTaskDelay() を使う。タレはボタンを押しながら電源ONする方式に変更した。
+// D0 ボタン短押しで即時起床（ulTaskNotifyTake + ISR）、長押し10秒でゼロ点補正（タレ）。
+// GPIOTE 割り込みによるスリープ電流増加（約+14µA）を許容し、現場操作性を優先する。
 // ============================================================
 
 #ifdef COMM_MODE_LORA
@@ -676,8 +686,8 @@ static inline void wdtFeed() {
 }
 
 // 周辺（Sigfox/LoRa・HX711 電源レール 3V3_SW）をオフにし、minutes 分だけ
-// vTaskDelay() でブロッキング待機してから復帰する（Tickless Idle 発動のため）。
-// ボタンによる早期起床は行わない（タレは起動時ボタン押下で実行する方式）。
+// ulTaskNotifyTake() でブロッキング待機してから復帰する（Tickless Idle 発動のため）。
+// D0 短押しで即時起床（s_wakeByButton=true → loop() で長押し判定へ）。
 static void deepSleep(uint32_t minutes) {
   wdtFeed();  // これから始まる長時間スリープ区間の給餌
 
@@ -757,9 +767,16 @@ static void deepSleep(uint32_t minutes) {
 
   // sleepMs だけブロッキング待機する。この間、FreeRTOS の Tickless Idle により
   // CPU が低消費電力状態へ落ちる（独自 WFI busy-loop では発動しなかった問題の対策）。
-  // ボタンによる早期起床は行わない（GPIOTE を使うとスリープ電流が約14µA増えるため。
-  // タレはボタンを押しながら電源ONする方式に変更した）。
-  vTaskDelay(pdMS_TO_TICKS(sleepMs));
+  // D0 短押しで即時起床: ISR → vTaskNotifyGiveFromISR → ulTaskNotifyTake 即リターン。
+  // チャタリング対策: タレ操作でボタンを離す際に誤通知が積まれるため、入場前にドレインする。
+  ulTaskNotifyTake(pdTRUE, 0);  // ノンブロッキング: キュー済み通知を捨てるだけ
+  s_btnWakeRequest = false;
+  ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(sleepMs));
+  if (s_btnWakeRequest) {
+    Serial.println("[WAKE] D0ボタンによる早期起床");
+    s_wakeByButton = true;
+  }
+  s_btnWakeRequest = false;
 }
 
 // ============================================================
@@ -1057,49 +1074,6 @@ static void performTare() {
 }
 
 // ============================================================
-// 起動時タレ（ゼロ点補正）
-//
-// 【操作方法】D0 のタクトスイッチを押しながら電源スイッチ(S1)を ON にし、
-//   LED（青）が点灯したらボタンを離す → タレ実行（成功時シアン約4秒点滅）。
-//
-// 【「離したら実行」にしている理由】
-//   ボタンが浸水・振動などで物理的に固着した場合、「押されていたら即実行」
-//   だと WDT リセットや電源瞬断のたびに勝手に再タレされてしまう。
-//   「離す」ことを条件にすれば、固着状態では永久に実行されない。
-//   タイムアウトした場合は赤点灯で異常を知らせ、タレは行わない。
-//
-// 呼び出しは 3V3_SW ON・Wire 初期化済み・tca9534Configure() 済みの状態で行うこと。
-// ============================================================
-static void handleBootTare() {
-  if (!s_bootButtonHeld) return;
-
-  Serial.println("[TARE] 起動時ボタン押下を検出。離すのを待っています...");
-  Serial.flush();
-
-  // ボタンが離されるのを待つ（押されている間は青点灯で「受付中」を示す）
-  statusBootBlueStrong();
-  unsigned long t0 = millis();
-  while (digitalRead(USER_BUTTON_PIN) == LOW) {
-    if (millis() - t0 >= BOOT_TARE_RELEASE_TIMEOUT_MS) {
-      // 離されないままタイムアウト → ボタン固着の疑い。タレは実行しない。
-      statusErrorRed();
-      logEvent("TARE_STUCK", (int32_t)(millis() - t0));
-      Serial.println("[TARE] タイムアウト: ボタンが離されません（固着の疑い）。タレを中止します。");
-      Serial.flush();
-      delay(2000);   // 赤点灯を現場で視認できる時間だけ保持
-      rgbOff();
-      return;
-    }
-    delay(10);
-  }
-
-  delay(50);  // 離す際のチャタリングが収まるのを待つ
-
-  Serial.println("[TARE] ボタンが離されました。タレを実行します。");
-  Serial.flush();
-
-  performTare();
-}
 
 // 小さな配列のバブルソートで中央値（外れ値に強い簡易ロバスト化）を求める。
 // outRange が非NULLの場合、ソート済み配列の最大-最小（そのサイクル内のブレ幅）も返す。
@@ -2455,12 +2429,10 @@ void setup() {
   pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
   pinMode(SPARE_GPIO_PIN,  INPUT_PULLUP);
 
-  // 電源投入時にボタンが押されているかを、ここで1回だけ読み取る。
-  // 実際のタレ実行は各種初期化（Wire/TCA9534/タレオフセット復元）が済んだ後、
-  // 「ボタンが離されたこと」を確認してから行う（後述の handleBootTare()）。
-  // ※ 割り込み（attachInterrupt/GPIOTE）は使わない。スリープ電流が約14µA増えるため。
-  delay(20);  // チャタリング除去
-  s_bootButtonHeld = (digitalRead(USER_BUTTON_PIN) == LOW);
+  // D0 ボタン割り込み設定。短押しで即時計測・送信、長押し10秒でゼロ点補正（タレ）。
+  // GPIOTE を使うためスリープ電流が約+14µA増えるが、現場操作性を優先して許容する。
+  s_loopTaskHandle = xTaskGetCurrentTaskHandle();
+  attachInterrupt(USER_BUTTON_PIN, onUserButtonISR, FALLING);
 
   statusBootBlueStrong();
   delay((unsigned long)BOOT_BLUE_MS);
@@ -2526,11 +2498,6 @@ void setup() {
   s_eventLogCount = 0;
   s_eventLogNext  = 0;
   saveEventLog();
-
-  // 起動時にボタンが押されていたらタレを実行する（離されるのを待ってから実行）。
-  // loadTareOffsets() の後に置くこと（復元したオフセットを上書きする形になるため）。
-  // measureAll() の前に置くことで、直後の計測値に新しいタレが反映される。
-  handleBootTare();
 
   measureAll();
 
@@ -2608,10 +2575,29 @@ void loop() {
     statusErrorRed();
     Serial.println("[TCA9534] re-init failed");
   }
-  // ボタン処理は loop() では行わない。
-  // タレはボタンを押しながら電源ONする方式（setup() の handleBootTare()）に変更し、
-  // 短押しリセットは電源スイッチ(S1)で代替するため廃止した。
-  // これによりスリープ中の割り込み（GPIOTE）が不要になり、約14µA削減できる。
+  // D0 ボタン起床の場合、長押し（10秒）でゼロ点補正（タレ）を実行する。
+  // 短押し（即リターン）の場合はそのまま計測・送信へ進む。
+  if (s_wakeByButton) {
+    s_wakeByButton = false;
+    if (digitalRead(USER_BUTTON_PIN) == LOW) {
+      Serial.println("[TARE] D0長押し確認中... 10秒以上でゼロ点補正");
+      statusBootBlueStrong();
+      unsigned long t0 = millis();
+      bool longPress = false;
+      while (digitalRead(USER_BUTTON_PIN) == LOW) {
+        wdtFeed();
+        if (millis() - t0 >= 10000UL) { longPress = true; break; }
+        delay(50);
+      }
+      if (longPress) {
+        while (digitalRead(USER_BUTTON_PIN) == LOW) { delay(10); wdtFeed(); }
+        delay(50);
+        performTare();
+        ulTaskNotifyTake(pdTRUE, 0);  // タレ後チャタリング通知をドレイン
+        s_btnWakeRequest = false;
+      }
+    }
+  }
 
   measureAll();
 
