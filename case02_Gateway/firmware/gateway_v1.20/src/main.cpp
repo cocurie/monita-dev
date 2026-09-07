@@ -245,6 +245,28 @@ static uint32_t       sendIntervalMs           = SEND_INTERVAL_DEFAULT_MS;  // �
 static_assert(GATEWAY_GROUP_ID >= 0 && GATEWAY_GROUP_ID <= 0x07,
               "GATEWAY_GROUP_ID must be 0..7");
 
+// ╔══════════════════════════════════════════════════════════════════════╗
+// ║  ★★★ 群を変えたら、このファイルIDも必ず群用のものに変えること ★★★    ║
+// ║                                                                      ║
+// ║  ダウンリンク予約の取得元（Drive上のテキストファイル）。GAS Web Appの ║
+// ║  応答は chunked で Content-Length が付かず、AT+HTTPTOFS が本文を      ║
+// ║  ダウンロードできない（2026-09-07に実機で確定）。そのため本文だけを   ║
+// ║  Driveへ逃がしている。GAS側 DOWNLINK_DRIVE_FILE_IDS の同じ群の値と    ║
+// ║  一致していなければならない。                                        ║
+// ║                                                                      ║
+// ║  【食い違うとどうなるか】他群のファイルを読むことになるが、GASが      ║
+// ║  先頭行に埋めたワンタイム値(nonce)が一致しないため内容は破棄され、    ║
+// ║  ダウンリンクだけが永久に届かない。テレメトリ送信は正常に動き続ける。 ║
+// ║  シリアルに [DL] nonce不一致 が出ていればこれ。                      ║
+// ╚══════════════════════════════════════════════════════════════════════╝
+#ifndef DOWNLINK_DRIVE_FILE_ID
+#define DOWNLINK_DRIVE_FILE_ID "1bulwGZOSK5iBiw1pv88JEOHuryeomme0"  // 群0
+#endif
+
+// 1=Drive経由でダウンリンク予約を取得する（方式A）。0=従来のGAS本文直読み
+// （chunkedのため現在は必ず失敗する。切り分け用に残してある）。
+#define DOWNLINK_VIA_DRIVE 1
+
 // Pkt type と併せて二重チェックする Device ID ホワイトリスト（★BLE専用）
 // 2026-07-20: test_sketches/22_lora_multi_child によるLoRa複数台テスト(13台)用に拡張
 // ★2026-08-16(v1.20): One用の0x0Fを追加。
@@ -260,7 +282,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 96;
+static uint8_t  const GATEWAY_FW_VERSION = 97;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する（★BLE受信専用）
 // ★2026-08-28: LoRaは isAllowedLoRaPacket() を使う。BLEの群分離は第3段階まで後回しと
@@ -985,15 +1007,13 @@ static String httpGetViaFs(const String& url, bool wantBody) {
 
   if (wantBody) s_gasFetchTry++;
 
-  if (statusCode != 200 || (wantBody && dataLen <= 0)) {
+  if (statusCode != 200) {
     Serial.print(F("[DEBUG] HTTPTOFS raw=[")); Serial.print(res); Serial.println(F("]"));
     s_fsFailStreak++;
     recoverHttpStack();
     return "";
   }
-  s_fsFailStreak = 0;
-  if (wantBody) s_gasFetchOk++;
-  if (!wantBody) return "ok";
+  if (!wantBody) { s_fsFailStreak = 0; return "ok"; }
 
   // ★AT+HTTPTOFSは非同期。+HTTPTOFS URCが返った時点ではファイル書き込みが
   //   完了していないことがあるため、Idleになるまで待ってから読む。
@@ -1008,12 +1028,35 @@ static String httpGetViaFs(const String& url, bool wantBody) {
   int gi = gfis.indexOf("+CFSGFIS: ");
   if (gi >= 0) fileSize = gfis.substring(gi + 10).toInt();
 
-  if (fileSize != dataLen) {
+  // ★2026-09-07: 「len=0でも実ファイルは書けているのでは」という仮説の検証。
+  //   GASの最終応答は Transfer-Encoding: chunked で Content-Length が無く、
+  //   +HTTPTOFS は長さを 0 と報告する。しかしこれは「長さを報告できなかった」の意味で
+  //   あって「ダウンロードできなかった」とは限らない。従来はここへ来る前に
+  //   dataLen<=0 で打ち切っていたため、実ファイルサイズを一度も確認していなかった
+  //   （2026-08-24〜09-07、150回以上の失敗すべてで未確認）。
+  //   報告値ではなく実ファイルサイズを信じて読み出してみる。
+  if (dataLen <= 0) {
+    Serial.print(F("[DIAG] HTTPTOFSはlen=0を報告。実ファイルサイズ=")); Serial.println(fileSize);
+    if (fileSize > 0) {
+      Serial.println(F("[DIAG] → 実体は存在する。報告値ではなくファイルサイズで読み出す"));
+      dataLen = fileSize;
+    } else {
+      sendAT("AT+CFSTERM", 3000);
+      Serial.println(F("[DIAG] → 実体も0バイト。chunked応答は本当に取得できていない"));
+      Serial.print(F("[DEBUG] HTTPTOFS raw=[")); Serial.print(res); Serial.println(F("]"));
+      s_fsFailStreak++;
+      recoverHttpStack();
+      return "";
+    }
+  } else if (fileSize != dataLen) {
     sendAT("AT+CFSTERM", 3000);
     Serial.print(F("[GAS] ファイルサイズ不一致（期待=")); Serial.print(dataLen);
     Serial.print(F(" 実際=")); Serial.print(fileSize); Serial.println(F("）→ 破棄"));
     return "";
   }
+
+  s_fsFailStreak = 0;
+  s_gasFetchOk++;
 
   String fileRes = sendATFull("AT+CFSRFILE=" + String(HTTPTOFS_DIR_INDEX) + ",\"" + HTTPTOFS_FILENAME +
                               "\",0," + String(dataLen) + ",0", 5000);
@@ -1025,7 +1068,7 @@ static String httpGetViaFs(const String& url, bool wantBody) {
 }
 
 // 302のHTMLページ本体から <A HREF="..."> のURLを取り出す（&amp;も復元する）
-static String extractRedirectUrl(const String& html) {
+static __attribute__((unused)) String extractRedirectUrl(const String& html) {
   int hi = html.indexOf("HREF=\"");
   if (hi < 0) return "";
   hi += 6;
@@ -1037,7 +1080,8 @@ static String extractRedirectUrl(const String& html) {
 }
 
 // GASへGETし、応答本文を文字列で返す（失敗時は空文字列）。
-static String gasGetText(const String& queryParams) {
+// DOWNLINK_VIA_DRIVE=1 のときは未使用になるが、切り分け用に残す（unused属性はそのため）
+static __attribute__((unused)) String gasGetText(const String& queryParams) {
   String url1 = "https://script.google.com/macros/s/";
   url1 += GAS_SCRIPT_ID;
   url1 += "?";
@@ -1550,6 +1594,78 @@ static bool hasQueuedReports() {
 
 // GASへ1回問い合わせ、コマンドとダウンリンク予約を取り込む。
 // 戻り値: true=応答本文を取得できた / false=通信に失敗した（呼び出し側で再試行する）
+// ★2026-09-07: Drive経由のダウンリンク取得（方式A）。
+//
+// 【なぜ2段構えか】GAS Web Appの応答は Transfer-Encoding: chunked で Content-Length が
+// 付かず、AT+HTTPTOFS は本文を1バイトも落とせない（実ファイルサイズも0であることを
+// 実機で確認済み。ヘッダー長は無関係で、Content-Lengthの有無だけが成否を分けた）。
+// そこで「GASに計算させる」と「本文を読む」を分離する。
+//   1段目: GASへ問い合わせる。本文は読まないので chunked でも成功する。
+//          GASはこのとき応答と同じ内容をDriveのファイルへ書く。
+//   2段目: Driveのファイルを読む。Content-Length付きなので確実に落とせる。
+//
+// 【鮮度の保証】1段目は本文を読まないため、GAS側が失敗していてもGatewayには成功に
+// 見える。それだけだと「GASが失敗して古いファイルが残っているのに新鮮だと思い込む」
+// 事故が起きる（2026-08-30のSPREADSHEET_ID未設定と同じ形の落とし穴）。
+// 毎回ワンタイム値(nonce)を送り、GASにファイル先頭へ埋めさせ、一致しなければ捨てる。
+// 複数Gatewayが同じファイルを取り合った場合も同じ仕組みで検出できる。
+static uint8_t gatewayTrueRandomByte();  // 後方で定義（SoftDevice経由のRNG）
+
+static String makeDownlinkNonce() {
+  char buf[9];
+  snprintf(buf, sizeof(buf), "%02X%02X%04X",
+           gatewayTrueRandomByte(), gatewayTrueRandomByte(),
+           (unsigned int)(millis() & 0xFFFF));
+  return String(buf);
+}
+
+// 1段目: GASへ問い合わせるだけ（本文は読まない）。
+// postToGAS()を使わないのは、あちらがアプリ層WDTの起点(lastGasSuccessMs)を
+// 更新してしまうため。予約確認の成功でテレメトリ停止の検出を鈍らせたくない。
+static bool gasTriggerDownlinkWrite(const String& queryParams) {
+  String url = "https://script.google.com/macros/s/";
+  url += GAS_SCRIPT_ID;
+  url += "?";
+  url += queryParams;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) delay(1000);
+    if (httpGetViaFs(url, false).length() > 0) return true;
+    Serial.print(F("[DL] 1段目(GAS依頼)失敗（")); Serial.print(attempt + 1);
+    Serial.println(F("回目/3）"));
+  }
+  return false;
+}
+
+// 2段目: Driveのファイルを読み、nonceを検証して本体を返す。
+static String fetchDownlinkFromDrive(const String& nonce) {
+  String url = "https://drive.usercontent.google.com/download?id=";
+  url += DOWNLINK_DRIVE_FILE_ID;
+  url += "&export=download";
+
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) delay(1000);
+    String body = httpGetViaFs(url, true);
+    if (body.length() == 0) {
+      Serial.print(F("[DL] 2段目(Drive取得)失敗（")); Serial.print(attempt + 1);
+      Serial.println(F("回目/3）"));
+      continue;
+    }
+    int nl = body.indexOf('\n');
+    String got = (nl < 0) ? body : body.substring(0, nl);
+    got.trim();
+    if (got != nonce) {
+      Serial.print(F("[DL] nonce不一致（期待=")); Serial.print(nonce);
+      Serial.print(F(" 実際=")); Serial.print(got);
+      Serial.println(F("）→ 古い内容とみなして破棄"));
+      continue;  // GAS側の書き込みが間に合っていない可能性があるので再取得する
+    }
+    Serial.print(F("[DL] Drive経由で取得 (nonce ")); Serial.print(nonce);
+    Serial.println(F(" 一致)"));
+    return (nl < 0) ? String("") : body.substring(nl + 1);
+  }
+  return "";
+}
+
 static bool checkRemoteCmdOnce() {
   String query = "action=check_cmd&device_id=";
   query += GW_DEVICE_ID;
@@ -1562,12 +1678,19 @@ static bool checkRemoteCmdOnce() {
   query += String(GATEWAY_GROUP_ID);
 #endif
 
-  // ★2026-08-10(v1.20): AT+SH*系からAT+HTTPTOFS方式へ変更。
-  //   AT+SHREQはGASの302（chunked・Content-Lengthなし）の本文長を決定できず、
-  //   実機で +SHREQ: "GET",302,0 が返り続けて本文を読めなかった（理由はgasGetText()の
-  //   上のコメント参照）。リダイレクト追跡もgasGetText()の中で行う。
+#if defined(COMM_MODE_LORA) && DOWNLINK_VIA_DRIVE
+  // 方式A: GASに書かせて、Driveから読む（詳細はfetchDownlinkFromDrive()の上のコメント）
+  String nonce = makeDownlinkNonce();
+  query += "&nonce=";
+  query += nonce;
+  if (!gasTriggerDownlinkWrite(query)) return false;
+  String cmd = fetchDownlinkFromDrive(nonce);
+  if (cmd.length() == 0) return false;
+#else
+  // 従来方式: GASの応答本文を直接読む。GASの応答はchunkedのため現在は必ず失敗する。
   String cmd = gasGetText(query);
   if (cmd.length() == 0) return false;
+#endif
 
   cmd.trim();
 
@@ -3306,6 +3429,9 @@ static uint32_t lastSend = 0;
 // 同種の切り分けが再び必要になったら1に戻す。
 #define PROBE_CONTENT_LENGTH_URL 0
 
+// ★2026-09-07: ダウンリンク配信先の切り分けプローブ（確認後は 0 に戻す）
+#define PROBE_DOWNLINK_TRANSPORT 0
+
 #if DOWNLINK_E2E_TEST
 #define CMD_CHECK_INTERVAL_MS (3UL * 60UL * 1000UL)    // 【テスト用】3分
 #else
@@ -3919,6 +4045,41 @@ void setup() {
       Serial.println(F("[PROBE] Content-Length付きでも失敗 → 応答形式とは別の問題"));
     }
     Serial.println(F("=================================\n"));
+  }
+#endif
+
+  // ★2026-09-07 切り分け用プローブ（確認後は 0 に戻すこと）。
+  //   GAS(script.googleusercontent.com)の応答が取れないのは、ヘッダー1行が巨大
+  //   （reporting-endpoints = 2259B）なせいでモデムのヘッダー解析が破綻している、
+  //   という仮説の検証。ヘッダー行長だけが違う2つの取得先を比べる。
+  //     A: Google Drive        Content-Lengthあり / 最長ヘッダー行 4618B (CORS)
+  //     B: raw.githubusercontent Content-Lengthあり / 最長ヘッダー行   80B
+  //   A失敗+B成功 → ヘッダー行長が限界。小ヘッダーの配信先が必要
+  //   A成功+B成功 → Drive採用可。GAS固有の問題と確定
+  //   A失敗+B失敗 → ヘッダー長とは別の要因。仮説を捨てる
+#if PROBE_DOWNLINK_TRANSPORT
+  if (netOk) {
+    Serial.println(F("\n===== ダウンリンク配信先プローブ ====="));
+
+    String pa = httpGetViaFs("https://drive.usercontent.google.com/download?id="
+                             "1bulwGZOSK5iBiw1pv88JEOHuryeomme0&export=download", true);
+    Serial.print(F("[PROBE] A Drive(ヘッダー最長4618B) status=")); Serial.print(s_lastHttpStatus);
+    Serial.print(F(" len=")); Serial.print(s_lastHttpLen);
+    Serial.print(F(" 取得=")); Serial.print(pa.length());
+    Serial.print(F(" 本文=[")); Serial.print(pa); Serial.println(F("]"));
+
+    String pb = httpGetViaFs("https://raw.githubusercontent.com/torvalds/linux/master/README", true);
+    Serial.print(F("[PROBE] B GitHub(ヘッダー最長80B)  status=")); Serial.print(s_lastHttpStatus);
+    Serial.print(F(" len=")); Serial.print(s_lastHttpLen);
+    Serial.print(F(" 取得=")); Serial.println(pb.length());
+
+    if (pa.length() == 0 && pb.length() > 0)
+      Serial.println(F("[PROBE] → ヘッダー行長が限界。小ヘッダーの配信先が必要"));
+    else if (pa.length() > 0)
+      Serial.println(F("[PROBE] → Drive採用可。GAS固有の問題と確定"));
+    else
+      Serial.println(F("[PROBE] → 両方失敗。ヘッダー長とは別の要因"));
+    Serial.println(F("=====================================\n"));
   }
 #endif
 

@@ -17,6 +17,85 @@
 // ╚════════════════════════════════════════════════════════════════════════╝
 const SPREADSHEET_ID = '14g7rMQIT0tHwrYcripV84in_ME7B9yodOC7SDqFz17w';  // 「リモート操作テスト」
 
+// ╔════════════════════════════════════════════════════════════════════════╗
+// ║  ★★★ ダウンリンクを使う群ごとに、Driveファイルを用意して登録する ★★★  ║
+// ║                                                                        ║
+// ║  【なぜDrive経由なのか】GAS Web Appの応答は Transfer-Encoding: chunked  ║
+// ║  で Content-Length が付かない。SIM7080Gの AT+HTTPTOFS はこれを          ║
+// ║  ダウンロードできず、本文0バイトになる（2026-09-07に実機で確定。       ║
+// ║  ヘッダー長は無関係で、Content-Lengthの有無だけが成否を分けた）。       ║
+// ║  そこでGatewayが読む本文だけをDriveのファイルへ逃がす。Driveは          ║
+// ║  Content-Length付き・キャッシュ無しで配信され、実機で取得できている。   ║
+// ║                                                                        ║
+// ║  【用意のしかた】群ごとにテキストファイルを1つDriveに作り、共有を       ║
+// ║  「リンクを知る全員／閲覧者」にして、URLの /d/ と /view の間のIDを      ║
+// ║  下に登録する。中身は空でよい（GASが上書きする）。                     ║
+// ║                                                                        ║
+// ║  【★スコープ追加が必須】DriveAppを使うため、appsscript.json の         ║
+// ║  oauthScopes に "https://www.googleapis.com/auth/drive" が要る。        ║
+// ║  これが無いと承認ダイアログすら出ず、実行時に                           ║
+// ║  「You do not have permission to call DriveApp.getFileById」で失敗する。║
+// ║  oauthScopes を明示していないプロジェクトでは自動検出が働かないことが    ║
+// ║  あるため、下記を appsscript.json に明記すること（2026-09-07に遭遇）:   ║
+// ║    "oauthScopes": [                                                    ║
+// ║      "https://www.googleapis.com/auth/spreadsheets",                   ║
+// ║      "https://www.googleapis.com/auth/script.container.ui",            ║
+// ║      "https://www.googleapis.com/auth/script.send_mail",               ║
+// ║      "https://www.googleapis.com/auth/drive"                           ║
+// ║    ]                                                                   ║
+// ║  書き換え後は testWriteDownlinkFile() を手動実行して承認を通すこと。    ║
+// ║                                                                        ║
+// ║  【★デプロイ更新も必須】エディタで保存しただけではGatewayに反映され    ║
+// ║  ない。「デプロイを管理」から既存デプロイのバージョンを更新すること     ║
+// ║  （「新しいデプロイ」はURLが変わるので不可）。                          ║
+// ║                                                                        ║
+// ║  【登録し忘れるとどうなるか】その群のGatewayはダウンリンク予約を        ║
+// ║  受け取れない。テレメトリ送信は影響を受けず動き続けるので、            ║
+// ║  「データは来るのに設定変更だけ効かない」という形で現れる。            ║
+// ║  実行ログに [DOWNLINK] file id 未登録 が出ていればこれ。               ║
+// ╚════════════════════════════════════════════════════════════════════════╝
+const DOWNLINK_DRIVE_FILE_IDS = {
+  0: '1bulwGZOSK5iBiw1pv88JEOHuryeomme0',  // 群0
+  // 1: 'ここに群1用のファイルID',
+};
+
+// ★エディタから手動実行して、Drive書き込みだけを単独で確認するための関数。
+//   Gatewayを動かさずに「GASがDriveへ書けるか」だけを切り分けられる。
+//   初回実行時はDriveへのアクセス承認ダイアログが出るので許可すること
+//   （DriveAppを使い始めたぶんの権限追加。承認しないと書き込みは失敗し続ける）。
+function testWriteDownlinkFile() {
+  var group = 0;
+  var nonce = 'TEST' + Math.floor(Math.random() * 10000);
+  var ok = writeDownlinkFile_(group, nonce, 'none');
+  if (!ok) {
+    console.log('✗ 書き込み失敗。上に出ている [DOWNLINK] のログを見ること');
+    return;
+  }
+  var content = DriveApp.getFileById(DOWNLINK_DRIVE_FILE_IDS[group]).getBlob().getDataAsString();
+  console.log('✓ 書き込み成功。ファイルの現在の内容:');
+  console.log(content);
+  console.log('先頭行が ' + nonce + ' になっていればGateway側のnonce検証を通る');
+}
+
+// Gatewayが読む本文をDriveのファイルへ書く（方式A・2段目の取得元）。
+// 先頭行はGatewayが送ってきたワンタイム値(nonce)。Gatewayはこれが自分の送った値と
+// 一致しなければ内容を捨てるので、「GASが失敗して古いファイルが残っていたのに
+// 新鮮だと思い込む」事故と、複数Gatewayが同じファイルを取り合う事故を検出できる。
+function writeDownlinkFile_(group, nonce, body) {
+  var fileId = DOWNLINK_DRIVE_FILE_IDS[group];
+  if (!fileId) {
+    console.log('[DOWNLINK] file id 未登録: group=' + group + ' → この群はダウンリンク不可');
+    return false;
+  }
+  try {
+    DriveApp.getFileById(fileId).setContent(nonce + '\n' + body);
+    return true;
+  } catch (e) {
+    console.log('[DOWNLINK] Drive書き込み失敗 group=' + group + ' id=' + fileId + ' : ' + e);
+    return false;
+  }
+}
+
 // ================================
 // Monita Gateway (LTE-M/LoRa) → GAS 汎用バックエンド
 //
@@ -1141,7 +1220,14 @@ function doGet(e) {
     }
     var group = parseInt(p.group || '0', 10);  // group無しの旧ファームは群0
     var out = [cmd || 'none'].concat(buildDownlinkLines_(group));
-    return ContentService.createTextOutput(out.join('\n'));
+    var text = out.join('\n');
+
+    // ★2026-09-07: nonce付きで来たら、同じ内容をDriveのファイルにも書く（方式A）。
+    //   Gatewayはこの応答本文を読まない（chunkedで読めないため）。Driveから読む。
+    //   nonceを送らない従来のファームには何も影響しない。
+    if (p.nonce) writeDownlinkFile_(group, String(p.nonce), text);
+
+    return ContentService.createTextOutput(text);
   }
 
   // action=ack_cmd: Gatewayがコマンドを実際に受け取り、実行する直前に呼ぶ。ここで初めて
