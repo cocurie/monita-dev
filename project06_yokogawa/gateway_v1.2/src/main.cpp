@@ -1,0 +1,4146 @@
+/**
+ * Monita Gateway v1.2 — 横河ブリッジHD案件専用（8CH対応、LoRa受信対応）
+ *
+ * ★2026-09-03: case02_Gateway/firmware/gateway_v1.20（汎用・Flex v3.03(BLE)/v3.20(LoRa)、
+ * 4CH固定＋ダウンリンク対応版）から分岐。project06_yokogawa/gateway_v1.1（case02の
+ * 旧gateway_v1.1から8CH対応のため分岐した版）と同じ方針で、横河ver1.1(BLE)/ver1.3(LoRa)
+ * フィールドユニットの8CHペイロードに合わせてEXPECTED_PKT_TYPE・受信ペイロード長・
+ * buildBatchQuery()のパケット詰め替えを改修している。
+ *   - BLE  : EXPECTED_PKT_TYPE=0x11（横河ver1.1、project06_yokogawa/ver1.1/src/main.cpp）
+ *   - LoRa : EXPECTED_PKT_TYPE=0x12（横河ver1.3、project06_yokogawa/ver1.3/src/main.cpp）
+ * GASへの送信ワイヤフォーマット（&d=のEpoch+DeviceID+CH1-8）はproject06_yokogawa/gateway_v1.1
+ * と同一のため、GAS側は同じCode.gs（project06_yokogawa/gateway_v1.1/gas/Code.gs）をそのまま流用する。
+ * v1.20由来のLoRaダウンリンク機構（DOWNLINK_ACK_PKT_TYPE等）はコードとして残しているが、
+ * 横河ver1.3フィールドユニットはダウンリンク受信を未実装のため、現時点では動作しない
+ * （将来ver1.3側に実装したら有効化される）。
+ * 汎用版（NEXCO等）と機能追従する場合はcase02_Gateway側を都度確認すること。
+ *
+ * ベース: Monita Gateway v1.20 — BLE/LoRa 受信 + LTE-M → GAS 送信（AC電源版、ダウンリンク対応）
+ *
+ * MCU    : Seeed XIAO nRF52840
+ * 通信   : M5Stamp CAT-M（SIM7080G）、（LoRaビルドのみ）E220-900T22S(JP)-EV2
+ * RTC    : DS3231（I2C: D4=SDA, D5=SCL）
+ * SD     : microSD SPI（D1=CS, SCK/MISO/MOSI=D8/D9/D10）
+ * 電源   : XIAO nRF52840 Type-C給電（AC/USBアダプタ）。SIM7080GはXIAOの5Vへ直結、常時給電。
+ *          全部品DIP対応。★2026-07-17: LiPoバッテリー駆動＋昇圧/ロードスイッチ/TCA9534構成から変更。
+ *          旧設計は `gateway_v1.10_ARCHIVE_battery_TCA9534_design.md` にアーカイブ済み（復活する可能性あり）。
+ *
+ * 配線（v1.1 基板、AC電源版）:
+ *   XIAO D6 (TX) → SIM7080G RX
+ *   XIAO D7 (RX) ← SIM7080G TX
+ *   XIAO D4(SDA) → DS3231 SDA（4.7kΩ プルアップ）
+ *   XIAO D5(SCL) → DS3231 SCL（4.7kΩ プルアップ）
+ *   XIAO 3V3     → DS3231 VCC / SD VDD
+ *   XIAO 5V      → SIM7080G 5V（USB Type-C給電時のみ通電。v1.0と同じ直結方式）
+ *   XIAO D3      → SD CS（直結、net N$6）
+ *   XIAO D8(SCK) → SD CLK
+ *   XIAO D9(MISO)→ SD DAT0
+ *   XIAO D10(MOSI)→ SD CMD
+ *   XIAO D0      ← （LoRaビルドのみ）E220 TXD（Gateway RX側、net UART_RX_2）
+ *   XIAO D1      → （LoRaビルドのみ）E220 RXD（Gateway TX側、net UART_TX_2）
+ *   XIAO D2      → （LoRaビルドのみ）E220 M0・M1 共通駆動（net LORA_SETTING）
+ *                  ※ 本ファームはM0とM1を常に同じ値で駆動するため（Normal:両方LOW／Config:両方HIGH）、
+ *                    E220基板上でM0・M1ピンを物理的に接続し、GPIO1本で両方駆動する（回路図 ver1.10 で短絡済み）
+ *
+ * v1.1 の主な変更点:
+ *   - 電源をLiPoバッテリー駆動からAC電源（XIAO Type-C給電）に変更、全部品DIP化
+ *   - それに伴いTCA9534・AO3401・MMBT3904・TPS61232・TPS22965・RC遅延回路一式を削除
+ *   - SIM7080Gの電源投入シーケンス（P-MOSFET→昇圧→ロードスイッチ）は不要（XIAO 5Vに常時直結、v1.0方式に回帰）
+ *   - PMOSFET制御・SD CS・ロードスイッチON用に導入していたTCA9534を撤去し、SD CSは直結ピン(D1)に戻した
+ *   - LoRaのE220 M0/M1はTCA9534無しで直結する必要があるため、M0とM1を1本のGPIO(D3)にまとめる方式に変更
+ *     （基板側でM0・M1ピンを物理的に短絡する必要がある。回路図修正時に反映すること）
+ *   - BLE / LoRa（E220-900T22S(JP)）のビルド時選択（COMM_MODE_BLE / COMM_MODE_LORA）は維持
+ *   - バッテリー駆動用のディープスリープ間欠動作は不要になったため対象外（AC電源の常時稼働、v1.0と同じ動作モデル）
+ */
+
+#include <Arduino.h>
+#include <Adafruit_TinyUSB.h>
+
+// ============================================================
+// 通信モード選択（v1.1新規）
+// platformio.ini の build_flags で指定する:
+//   -D COMM_MODE_BLE   … BLE スキャン受信モード（v1.0からの既定動作）
+//   -D COMM_MODE_LORA  … LoRa(E220-900T22S(JP)) UART受信モード
+// ============================================================
+#if !defined(COMM_MODE_BLE) && !defined(COMM_MODE_LORA)
+  #error "platformio.ini の build_flags に -D COMM_MODE_BLE または -D COMM_MODE_LORA を指定してください"
+#endif
+
+// BLE は両ビルドで使用する:
+//   COMM_MODE_BLE  … Flex受信（Central/スキャナ）
+//   COMM_MODE_LORA … コントローラー連携（Peripheral/GATTサーバ）。Flex受信はLoRaが担う
+#include <bluefruit.h>
+
+#ifdef COMM_MODE_LORA
+// コントローラーからの設定変更（送信間隔）を再起動後も維持するための内蔵フラッシュ保存。
+// ※ using namespace は付けない（SDライブラリの File 型と衝突するため、LittleFS の File は
+//    Adafruit_LittleFS_Namespace::File と完全修飾で使う）
+#include <Adafruit_LittleFS.h>
+#include <InternalFileSystem.h>
+#endif
+
+// ★2026-07-25: DEBUG_LEVEL切替（0/1/2で本番/デバッグを出し分ける方式）を廃止。
+// 必要なログ（ステージ結果・GAS送信の各段階・LORA受信・失敗時の生応答等）は常時出力する。
+// AT コマンド1行ごとの生ログ（旧DEBUG_LEVEL=2相当）は、GAS/STAGE/LORA等の要点ログで
+// 十分に状況を追えることが分かったため削除した。
+
+#include <Wire.h>
+#include <RTClib.h>
+#include <SD.h>
+#include <SPI.h>
+
+#ifdef MQTT_CMD_ENABLED
+#include "../certs/emqxsl_ca_cert.h"
+#endif
+
+// ══════════════════════════════════════════════
+// シリアルログの二重化（USB Serial + SDカード）
+// ══════════════════════════════════════════════
+// ★2026-07-25追加: シリアルモニタに出ている内容を、データCSV（gateway.csv）とは別の
+// gwlog.csv にそのままミラー保存する。Print基底クラスのwrite()だけ実装すれば
+// print()/println()の全オーバーロードが自動的に経由するため、既存の200箇所以上ある
+// Serial.print/println呼び出しを1つも書き換えずに済む（下の #define Serial で差し替え）。
+// 1バイト単位でそのまま複製するので、複数回のprint()で1行を組み立てている箇所
+// （進捗表示の"."追記等）も実際の表示と完全に一致した形でSDに残る。
+static File gLogFile;
+static bool gLogAvailable = false;
+
+class TeeSerial : public Print {
+ public:
+  void   begin(unsigned long baud) { Serial.begin(baud); }
+  operator bool() { return (bool)Serial; }
+  int    available() { return Serial.available(); }
+  int    read() { return Serial.read(); }
+  String readStringUntil(char terminator) { return Serial.readStringUntil(terminator); }
+  void   flush() { Serial.flush(); if (gLogAvailable) gLogFile.flush(); }
+
+  size_t write(uint8_t c) override {
+    if (gLogAvailable) { gLogFile.write(c); if (c == '\n') gLogFile.flush(); }
+    return Serial.write(c);
+  }
+  size_t write(const uint8_t *buf, size_t sz) override {
+    if (gLogAvailable) {
+      gLogFile.write(buf, sz);
+      if (sz > 0 && buf[sz - 1] == '\n') gLogFile.flush();
+    }
+    return Serial.write(buf, sz);
+  }
+};
+
+static TeeSerial gSerialTee;
+#define Serial gSerialTee
+
+// ★2026-07-25追加: gwlog.csvは起動時に一度開いたまま close() されない設計だった。
+// flush()はデータブロックを書き込むが、多くのSD実装ではファイルサイズ(ディレクトリ
+// エントリ)の確定はclose()／明示的なsync()のタイミングに依存する。WDTリセットや
+// アプリ層WDT(NVIC_SystemReset)、現場での電源断はclose()を経由しないため、
+// 「ファイルは存在するが中身が空に見える」事象の原因になっていた（project07_NEXCO実機で確認）。
+// 対策として定期的にclose→reopen(追記)し、直近分だけを再オープンのリスクにとどめる。
+void gLogPeriodicCommit() {
+  if (!gLogAvailable) return;
+  gLogFile.close();
+  gLogFile = SD.open("gwlog.csv", FILE_WRITE);
+  gLogAvailable = (bool)gLogFile;
+}
+
+// ══════════════════════════════════════════════
+// ▼ ユーザー設定
+// ══════════════════════════════════════════════
+
+// GAS スクリプトID（デプロイURLの "AKfycb..." 部分）
+const char* GAS_SCRIPT_ID = "AKfycbzCFMs5oEXfp7gAs7nOupiZ4mJJsvltynxiGFWw-rJTuwuKBqtWnsRy_9UTkt9XhKmTag/exec";
+
+// LTE-M送信のON/OFF切替（★2026-07-23追加）
+// false にすると SIM7080G の初期化・ネットワーク接続・GAS送信を一切行わず、
+// BLE（またはLoRa）受信データを直接SDカードへ記録するだけの「SD記録のみモード」になる。
+// SIM7080GのTX系統故障が疑われる現場での暫定運用（アンテナ交換ができない場合等）を想定。
+#define LTEM_SEND_ENABLED true
+
+// 起動確認送信 — true にするとネットワーク接続直後に、機器の設定情報の行と、
+// それまでに BLE スキャンで受信できていた実際の子機データ（実 RSSI 含む）を
+// GAS へ送信する（通信経路とアンテナ状況を起動のたびに確認できる）
+#define BOOT_SCAN_SEND true
+
+// 再送キュー・即時リトライの動作確認用: 送信を N 回だけ強制的に失敗させる
+// （実際の通信は行わず即座に失敗を返すため、タイムアウト待ちなしで検証できる）
+// 0 = 無効（通常運用時は必ず 0 に戻すこと）
+#define TEST_FORCE_SEND_FAIL 0
+
+// ★2026-07-24追加、2026-07-25更新: バッチ分割の動作確認用。
+// 実機のFlexを複数台同時稼働させなくても、起動時にダミーの子機データをN件
+// バッファへ注入し、次の送信サイクルで正しく分割されるかを検証できる。
+// バッチ分割は固定台数ではなく実バイト数（512バイト上限）で動的に決まるため、
+// シリアルログの [BATCH] 行（採用台数とクエリ長）で「512バイト以内に収まっているか」
+// 「超えそうな時に正しく次バッチへ回っているか」を確認する。
+// 0 = 無効（通常運用時は必ず 0 に戻すこと）。
+#define TEST_INJECT_FAKE_DEVICE_COUNT 0  // 0=無効（通常運用）。バッチ分割検証時のみ一時的に台数を入れる
+
+// ★2026-08-30追加: 切り分け用スイッチ（通常運用は 0）。
+// 1にすると起動直後の checkRemoteCmd() を飛ばし、setup() を postBootInfoRow() まで
+// 一直線に到達させる。GAS「取得」(本文が要る・chunked未対応で失敗中)と
+// GAS「送信」(本文不要)を分離して、送信側の疎通だけを単独で判定したいときに使う。
+// ダウンリンクのchunked問題が未解決の間は、1にすると起動が約90秒短縮できる。
+#define DIAG_SKIP_BOOT_CMD_CHECK 0
+
+// ★2026-08-04追加: スプレッドシート側の動作確認用。1にすると、送信サイクルごと
+// （sendIntervalMs間隔、既定5分）に1台分のダミーCH値をrecordsへ注入し続ける。
+// 上のTEST_INJECT_FAKE_DEVICE_COUNTは起動時に1回だけ注入するのに対し、こちらは
+// 送信のたびに値を変えながら継続的に注入するため、スプレッドシートに定期的に
+// 新しい行が増えていくのを確認できる。検証後は必ず0に戻すこと。
+#define TEST_PERIODIC_FAKE_DATA 0
+
+// SIM 切り替え — 使う方のブロックだけ有効にする
+// ── 1NCE SIM ──────────────────────────────────
+#define SIM_1NCE
+// ── Plan-D SIM ────────────────────────────────
+// #define SIM_PLAN_D
+
+#if defined(SIM_1NCE)
+  const char* APN      = "iot.1nce.net";
+  const char* SIM_NAME = "1NCE";
+  const char* APN_USER = "";
+  const char* APN_PASS = "";
+#elif defined(SIM_PLAN_D)
+  const char* APN      = "planex.net";   // ← Plan-D の正式 APN に変更すること
+  const char* SIM_NAME = "Plan-D";
+  const char* APN_USER = "";             // ← 必要に応じて設定
+  const char* APN_PASS = "";
+#else
+  #error "SIM_1NCE または SIM_PLAN_D のどちらかを define してください"
+#endif
+
+#ifdef COMM_MODE_BLE
+// BLE スキャン / 送信設定
+// Gateway は USB-C 常時給電のため省電力を気にせずデューティ比をほぼ100%にする
+// （interval と window をほぼ同値にすることでほぼ常時受信状態にし、取りこぼしを減らす）
+static uint16_t const SCAN_INTERVAL_MS   = 100;     // スキャンインターバル (ms)
+static uint16_t const SCAN_WINDOW_MS     = 100;      // スキャンウィンドウ (ms)
+static uint8_t  const MFR_COMPANY_ID_H   = 0xFF;    // Flex の Company ID (上位)
+static uint8_t  const MFR_COMPANY_ID_L   = 0xFF;    // Flex の Company ID (下位)
+// Company ID 0xFFFF は Bluetooth 仕様上「未登録・テスト用」の予約値のため、
+// 近隣の無関係な BLE 機器（他社のテスト機器等）が偶然同じ ID で
+// Manufacturer Data を送信していると誤って拾ってしまうことがある。
+// そのため Flex の MSD フォーマット（Pkt type・Device ID）でも二重に検証する。
+static uint8_t  const EXPECTED_PKT_TYPE  = 0x11;             // 横河ver1.1 BLE の Pkt type
+#endif
+
+#ifdef COMM_MODE_LORA
+static uint8_t  const EXPECTED_PKT_TYPE  = 0x12;             // 横河ver1.3 LoRa の Pkt type
+#endif
+
+// GAS 送信インターバル。LoRaビルドではコントローラーからBLE経由で変更可能（内蔵フラッシュに保存し
+// 再起動後も維持）。BLEビルドではこの既定値のまま（変更手段なし）。
+// ★2026-08-11: 120分 → 60分。子機(Flex v3.20)の送信間隔を60分にしたことに合わせる。
+//   Gatewayは子機ごとに最新1件しか保持しない（updateRecordFromPayload()が上書きする）ため、
+//   送信間隔が子機より長いと、その差の分だけ測定データが失われる。
+//   ※アプリ層WDTはcomputeAppWdtMs(sendIntervalMs)＝送信間隔×1.5で自動追従するので
+//     手当ては不要（CLAUDE.md §7のヒューマンエラー対策）。60分→閾値90分。
+//   ※ハードWDT(WDT_TIMEOUT_MS=120秒)はloop()から常時給餌するため送信間隔とは無関係。
+static uint32_t const SEND_INTERVAL_DEFAULT_MS = 300000;  // 既定 60 分
+static uint32_t       sendIntervalMs           = SEND_INTERVAL_DEFAULT_MS;  // 実行時可変
+
+// ══════════════════════════════════════════════
+// Gateway群（GATEWAY_GROUP_ID）★2026-08-28追加
+// ══════════════════════════════════════════════
+// 1つの現場にGatewayを複数台置くと、E220の設定が全機共通のため両方が同じ子機を
+// 二重受信してしまう。無線層（チャネル）を分けると電波法対応のコストが発生するため、
+// DeviceIDを分割してソフトフィルタで受信を分離する方式を採った。
+//
+//   DEVICE_ID (1バイト)
+//     上位3bit = Gateway群 (0〜7)       → group   = deviceId >> 5
+//     下位5bit = 群内の機器番号 (1〜31)  → localNo = deviceId & 0x1F   ※0は無効値
+//
+//   群0 = 0x01〜0x1F、群1 = 0x21〜0x3F、群N の開始は N*0x20+1。
+//   現在稼働中の 0x01〜0x0F はすべて群0に収まるため、既存機器の焼き直しは不要。
+//
+// ビルド時に指定する（既定は群0＝従来と等価）:
+//   PLATFORMIO_BUILD_FLAGS="-D GATEWAY_GROUP_ID=1" pio run -t upload
+#ifndef GATEWAY_GROUP_ID
+#define GATEWAY_GROUP_ID 0
+#endif
+static_assert(GATEWAY_GROUP_ID >= 0 && GATEWAY_GROUP_ID <= 0x07,
+              "GATEWAY_GROUP_ID must be 0..7");
+
+// Pkt type と併せて二重チェックする Device ID ホワイトリスト（★BLE専用）
+// 2026-07-20: test_sketches/22_lora_multi_child によるLoRa複数台テスト(13台)用に拡張
+// ★2026-08-16(v1.20): One用の0x0Fを追加。
+//   以前は一覧の食い違いにより Flex v3.20（DEVICE_ID=0x0E）のフレームが
+//   isAllowedFlexPacket() で黙って棄却され、受信はできているのに台数0・ダウンリンク
+//   送信も起こらない状態になっていた（実機で確認）。
+// ★2026-08-28: LoRaは群方式（isAllowedLoRaPacket）へ移行したため、この一覧はBLE専用に
+//   なった。BLEの群分離はLoRaへの移行が進むまで後回しと決定したので現状維持とする。
+static uint8_t  const ALLOWED_DEVICE_IDS[] = {
+  0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+};   // ★子機を増やしたらここに追加する
+static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / sizeof(ALLOWED_DEVICE_IDS[0]);
+
+// Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
+// info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
+// ★project06_yokogawa/gateway_v1.2として分岐した時点のcase02 gateway_v1.20のカウンタ値(96)を
+// そのまま引き継ぎ、以後はこのファイル独自にコミットごとに+1する。
+static uint8_t  const GATEWAY_FW_VERSION = 96;
+
+// pktType・deviceId が Flex として許可された組み合わせか判定する（★BLE受信専用）
+// ★2026-08-28: LoRaは isAllowedLoRaPacket() を使う。BLEの群分離は第3段階まで後回しと
+//   決定したため、この関数は従来どおりホワイトリスト方式のまま残す。
+//   ここを群方式へ置き換えるとBLE子機も群分離されてしまうので、統合してはいけない。
+bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
+  if (pktType != EXPECTED_PKT_TYPE) return false;
+  for (size_t i = 0; i < ALLOWED_DEVICE_IDS_COUNT; i++) {
+    if (deviceId == ALLOWED_DEVICE_IDS[i]) return true;
+  }
+  return false;
+}
+
+#ifdef COMM_MODE_LORA
+// pktType・deviceId がこのGatewayの群の子機として受信すべき組み合わせか判定する（LoRa専用）
+// ホワイトリストではなくDeviceIDのビット構成で判定するため、子機を増やしても
+// Gateway側のソース修正は不要になる（群内で1〜31が自動的に許可される）。
+bool isAllowedLoRaPacket(uint8_t pktType, uint8_t deviceId) {
+  if (pktType != EXPECTED_PKT_TYPE) return false;
+  if ((deviceId & 0x1F) == 0) return false;            // 下位5bitが0のIDは無効値
+  return (deviceId >> 5) == GATEWAY_GROUP_ID;          // 上位3bitが自群と一致するもののみ
+}
+#endif
+
+// ── ピン割当（v1.1 基板、AC電源版）─────────────────
+// ★ TCA9534を撤去し、全て直結ピンに戻した（詳細はファイル冒頭コメント参照）。
+// ★2026-07-19: 回路図 ver1.10.sch（netlist_gateway_1）に合わせて確定。
+//   D0=LoRa RX, D1=LoRa TX, D2=M0/M1, D3=SD CS（旧割当から入れ替え）。
+static int const SD_CS_PIN = 3;  // D3（直結、net N$6）
+
+#ifdef COMM_MODE_LORA
+static int const LORA_RX_PIN   = 0;  // D0: E220 TXD → XIAO RX（net UART_RX_2）
+static int const LORA_TX_PIN   = 1;  // D1: XIAO TX → E220 RXD（net UART_TX_2）
+static int const LORA_M0M1_PIN = 2;  // D2: E220 M0・M1 共通駆動（基板側でM0/M1短絡済み、net LORA_SETTING）
+#endif
+
+// ══════════════════════════════════════════════
+// BLE 受信バッファ
+// ══════════════════════════════════════════════
+// ★2026-08-28: 群あたり最大31台（DeviceID下位5bit）に合わせて 20→32 へ拡張。
+//   records[] / pendingRecords[] / 送信時のmerged[] がこのサイズで確保される。
+#define MAX_DEVICES 32
+// 横河ver1.1 の MSD は Company ID(2B) を除くと 18 バイト
+// （PktType+DeviceID+CH1-8、各CHはint16 LE。project06_yokogawa/ver1.1/src/main.cpp 参照）。
+// ★2026-09-10: 横河ver1.3のLoRaペイロードは、スプレッドシート側の小数精度確保のため
+// CH1〜5をint16→int32(µε×100)へ拡張し29バイトになった
+// （PktType+DeviceID+CH1-5(int32×5)+CH6-8(int16×3)+予備1B。project06_yokogawa/ver1.3/
+// src/main.cppのsendMeasurementToLoRa()参照）。将来の拡張余地を見て32バイトを確保する。
+#define MAX_PAYLOAD 32
+
+struct FlexRecord {
+  uint8_t  mac[6];
+  uint8_t  payload[MAX_PAYLOAD];
+  uint8_t  payloadLen;
+  int      rssi;
+  uint32_t lastSeen; // millis()
+  uint32_t rtcEpoch; // Gateway RTC(DS3231)のUNIX時刻。BLE/LoRa受信時刻の記録用（GASの受信日時=サーバ側new Date()とは別物）
+};
+
+static FlexRecord records[MAX_DEVICES];
+static int        recordCount = 0;
+static SemaphoreHandle_t recordMutex;
+
+// 送信失敗時に保持する再送キュー（次回まとめてライブデータとマージして再送する）
+static FlexRecord pendingRecords[MAX_DEVICES];
+static int        pendingCount = 0;
+
+// コントローラー向けステータス表示用のキャッシュ（BLE status characteristic へ反映）
+static int  s_lastCsq   = 99;     // 最後に取得した SIM7080G の CSQ（0-31, 99=圏外）
+static bool s_lastNetOk = false;  // 最後のネットワーク接続結果
+
+// ══════════════════════════════════════════════
+// RTC
+// ══════════════════════════════════════════════
+String sendAT(String cmd, int waitMs = 5000, const char* waitForToken = nullptr);  // 後方で定義（RTC の網時刻同期から使うため前方宣言）
+
+static RTC_DS3231 rtc;
+static bool rtcAvailable = false;
+static bool s_rtcNeedsTimeSet = false;  // lostPower() 検知時にtrue。ネットワーク接続後にAT+CCLKで時刻セットする
+
+// DS3231はAT+CCLKの網時刻でJST（日本時間）に設定される（UTCではない）。
+// RTClibのunixtime()はUTCとして無条件変換するため、真のUTCエポックが必要な箇所
+// （GAS送信用のrtcEpoch）ではこのオフセットを差し引いて補正する。
+static int32_t const JST_OFFSET_SEC = 9 * 3600;
+
+// ★2026-07-27追加: I2Cノイズ/接触不良でDS3231から明らかにおかしい値（年が範囲外）を
+// 読んでしまうことがある（有野川連続運用時にも確認済み）。getTimestamp()を呼ぶ全箇所
+// （SDログ・シリアル表示・GAS送信パラメータ等）で共通して直前の正常値にフォールバック
+// できるよう、ここでキャッシュする。
+static DateTime s_lastGoodRtc(2026, 1, 1, 0, 0, 0);
+static bool     s_lastGoodRtcSet = false;
+
+String getTimestamp() {
+  if (!rtcAvailable) return String(millis() / 1000UL) + "s";
+  DateTime now = rtc.now();
+  if (now.year() < 2026 || now.year() > 2035) {
+    if (s_lastGoodRtcSet) now = s_lastGoodRtc;
+  } else {
+    s_lastGoodRtc = now;
+    s_lastGoodRtcSet = true;
+  }
+  char buf[20];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d",
+           now.year(), now.month(), now.day(),
+           now.hour(), now.minute(), now.second());
+  return String(buf);
+}
+
+// ★2026-07-27追加: I2Cバスリカバリ（Wire.begin()/rtc.begin()より前に必ず呼ぶ）。
+// 車載輸送中の振動でRTC(DS3231)への配線が瞬間的に接触不良になり、I2C通信がSDAを
+// LOWに張り付かせたまま止まる「バスロック」でMCU全体がフリーズする障害が発生した
+// （nRF52のWireライブラリの内部実装はこの状態に対するタイムアウトを持たないため、
+// 一度ハングすると内蔵WDTの強制リセット待ちになる。さらに配線の接触不良が再起動後も
+// 続いていると、起動のたびに同じ場所でハングする無限リセットループに陥る）。
+// 標準的なI2Cバスリカバリ手順（SCLを最大9回クロックしてスタックしたスレーブの送信を
+// 完了させ、STOPコンディションを生成する）を起動時に必ず一度実行することで、
+// バスが詰まった状態のままrtc.begin()に入ってしまうのを防ぐ。
+static void i2cBusRecovery() {
+  pinMode(SCL, OUTPUT);
+  pinMode(SDA, INPUT_PULLUP);
+  digitalWrite(SCL, HIGH);
+  delayMicroseconds(10);
+  for (int i = 0; i < 9 && digitalRead(SDA) == LOW; i++) {
+    digitalWrite(SCL, LOW);  delayMicroseconds(5);
+    digitalWrite(SCL, HIGH); delayMicroseconds(5);
+  }
+  pinMode(SDA, OUTPUT);
+  digitalWrite(SDA, LOW);  delayMicroseconds(5);
+  digitalWrite(SCL, HIGH); delayMicroseconds(5);
+  digitalWrite(SDA, HIGH); delayMicroseconds(5);
+}
+
+// SIM7080G の AT+CCLK?（網時刻）を取得し、有効な応答であれば DS3231 に反映する。
+// 応答形式: +CCLK: "yy/MM/dd,hh:mm:ss+zz"（zzはUTCオフセット15分単位、符号あり）
+bool syncRtcFromNetworkTime() {
+  String res = sendAT("AT+CCLK?", 3000);
+  int idx = res.indexOf("+CCLK: \"");
+  if (idx < 0) return false;
+  idx += 8;  // "+CCLK: \"" の直後
+  if ((int)res.length() < idx + 17) return false;
+
+  int yy  = res.substring(idx,      idx + 2).toInt();
+  int mon = res.substring(idx + 3,  idx + 5).toInt();
+  int day = res.substring(idx + 6,  idx + 8).toInt();
+  int hh  = res.substring(idx + 9,  idx + 11).toInt();
+  int mi  = res.substring(idx + 12, idx + 14).toInt();
+  int ss  = res.substring(idx + 15, idx + 17).toInt();
+  if (mon < 1 || mon > 12 || day < 1 || day > 31) return false;  // 未同期時は 80/01/06 等の無効値を返すため弾く
+
+  rtc.adjust(DateTime(2000 + yy, mon, day, hh, mi, ss));
+  Serial.print(F("✓ DS3231 を網時刻で設定: "));
+  Serial.println(getTimestamp());
+  return true;
+}
+
+// ══════════════════════════════════════════════
+// ウォッチドッグタイマー（nRF52840 内蔵 WDT）
+// 無人運用中にファームがハングした場合、自動リセットで復旧するための安全網。
+// 一度 START すると停止不可（電源再投入かリセットまで動作し続ける）。
+// ══════════════════════════════════════════════
+static uint32_t const WDT_TIMEOUT_MS = 120000UL;  // 120秒: この間キックが無ければリセット
+
+static void wdtInit(uint32_t timeoutMs) {
+  NRF_WDT->CONFIG  = (WDT_CONFIG_SLEEP_Run << WDT_CONFIG_SLEEP_Pos);  // スリープ中も継続動作
+  NRF_WDT->CRV     = (uint32_t)((uint64_t)timeoutMs * 32768ULL / 1000ULL);  // 32768Hz ティック換算
+  NRF_WDT->RREN    = WDT_RREN_RR0_Msk;  // チャンネル0のみ使用
+  NRF_WDT->TASKS_START = 1;
+}
+
+static inline void wdtFeed() {
+  NRF_WDT->RR[0] = WDT_RR_RR_Reload;  // キック（既定のリロードマジック値）
+}
+
+// ══════════════════════════════════════════════
+// アプリ層ウォッチドッグ（★2026-07-21 追加）
+//
+// ハードWDT（上記）は「wdtFeedが完全に止まる＝MCUフリーズ」した時だけ復旧する。
+// しかし実運用で発生した障害は、モデムはネットワークに接続したまま、GASへの送信
+// （SHCONN/SHREQ）だけが失敗し続け、ファームは送信リトライのループを回して
+// wdtFeedを呼び続ける「ソフトハング」だった。この場合ハードWDTには餌が入り続けるため
+// リセットがかからず、無人現場では復旧不能になった（有野川現場、2026-07-17〜）。
+//
+// 対策として「一定時間 GAS 送信が1回も成功しなかったら NVIC_SystemReset で強制再起動」
+// するアプリ層ウォッチドッグを設ける。再起動後は setup() が AT&F + CFUN=1,1 で
+// モデムもソフトリセットするため、モデム側スタックの詰まりも合わせて解消される。
+// ══════════════════════════════════════════════
+// ★2026-08-10: 固定定数をsendIntervalMsから導出する計算式に変更。
+//
+// 【経緯】sendIntervalMsはBLE経由のコントローラー操作やGASの`interval:`コマンドで
+// 実行時に変更できるが、APP_WDT_NO_SEND_RESET_MSは固定定数のままだったため、
+// 送信間隔を長く変更すると（旧来の固定値のままなら）1サイクル分の送信リトライが
+// 完了する前にアプリ層WDTが発動し、正常動作中でも再起動を繰り返す状態になり得た
+// （実際に2026-08-07、送信間隔だけ延ばしてWDT側を放置したことで無限リブートが
+// 発生した実例がある。CLAUDE.md §7参照）。sendIntervalMsから都度計算することで、
+// 実行時に間隔を変えても自動的に追従し、この食い違いを構造的に起こせなくする。
+//
+// マージンは「1サイクル分の送信失敗＋次サイクルでのリトライ成功」を待てる時間。
+// 送信間隔の1.5倍という式は、既存の実運用値（120分間隔→180分)から逆算した係数。
+static uint32_t computeAppWdtMs(uint32_t intervalMs) {
+  return intervalMs + intervalMs / 2;  // intervalMs × 1.5
+}
+static uint32_t lastGasSuccessMs = 0;  // 最後にGAS送信が成功した millis()（setup先頭で初期化）
+
+// 段階的復旧（★2026-07-21 追加、有野川障害の教訓）:
+// アプリWDTの「30分無送信で全再起動(NVIC_SystemReset)」の前に、より軽く速い一段目として
+// 「送信サイクルが規定回数連続で全滅したら、モデムだけソフトリセット(CFUN=0/1)して再接続」を挟む。
+// 有野川で疑われたモデムのSSL/HTTPスタック固着（CGATTは正常＝アタッチ維持のまま送信だけ失敗）は、
+// setup()でしか実行されないモデムリセットに降りていけず永続化した。この一段目で送信失敗時にも
+// モデムリセットへ降りられるようにする。これでも復旧しなければ30分の全再起動が最終backstop。
+static int const MODEM_RESET_FAIL_THRESHOLD = 3;  // 連続で全滅した送信サイクル数（5分間隔なら約15分）
+static int consecutiveSendFailures = 0;
+
+// ══════════════════════════════════════════════
+// アンテナ未接続保護（★2026-07-23 追加、有野川でのSIM7080G故障を受けて）
+//
+// 【経緯】有野川ではアンテナ接続が不良な状態のまま、ファームが登録要求＝送信を数日間
+// 繰り返した。その後モジュールは通信不能になり、別基板・別アンテナに載せ替えても復旧
+// しなかったためモジュール故障と判定した。
+// 症状（CSQは正常値・網登録不成立・網側にイベント痕跡なし・CEERに拒否理由なし）から
+// 送信系の異常が疑われるが、★故障部位も原因も特定できていない（ESD等の可能性も残る）。
+//
+// 【対策の根拠】信号を全く検出できない状態で登録要求を繰り返しても成功する見込みはなく、
+// 電力とデータを消費するだけで無意味である。加えて、不整合な負荷への送信継続がハードへ
+// 与える影響も避けたい（機序は未確認）。よって CSQ=99（圏外またはアンテナ未接続）が
+// 連続で規定回数観測されたら AT+CFUN=0 でRFを停止する。
+// クールダウン後に AT+CFUN=1 で復帰して再試行するので、一時的な圏外なら自動回復する。
+// ══════════════════════════════════════════════
+static int      const RF_PROTECT_CSQ99_THRESHOLD = 3;         // CSQ=99 が連続この回数で保護発動
+static uint32_t const RF_PROTECT_COOLDOWN_MS     = 1800000UL; // 30分 RF停止して待機
+static int      s_csq99Count       = 0;
+static bool     s_rfProtected      = false;
+static uint32_t s_rfProtectStartMs = 0;
+
+// RF保護中かどうかを返す。クールダウンが明けていればRFを復帰させて false を返す。
+// true の間は一切送信してはならない。
+static bool rfProtectActive() {
+  if (!s_rfProtected) return false;
+  if (millis() - s_rfProtectStartMs >= RF_PROTECT_COOLDOWN_MS) {
+    Serial.println(F("[RF保護] クールダウン終了 → AT+CFUN=1 でRFを再開し再試行します"));
+    sendAT("AT+CFUN=1", 5000);
+    delay(5000);
+    s_rfProtected = false;
+    s_csq99Count  = 0;
+    return false;
+  }
+  return true;
+}
+
+// CSQ値を観測し、信号が全く無い状態が続いたらRFを停止する。
+// csq: 0-31 = 受信強度、99 または負値 = 信号検出不可
+static void rfProtectObserveCsq(int csq) {
+  if (s_rfProtected) return;  // 保護中はRF停止のためCSQ=99が当然。判定しない
+
+  if (csq == 99 || csq < 0) {
+    s_csq99Count++;
+    Serial.print(F("[RF保護] 信号検出不可(CSQ=99) 連続 "));
+    Serial.print(s_csq99Count); Serial.print(F("/"));
+    Serial.println(RF_PROTECT_CSQ99_THRESHOLD);
+
+    if (s_csq99Count >= RF_PROTECT_CSQ99_THRESHOLD) {
+      Serial.println(F("\n‼ [RF保護] 信号を全く検出できません（アンテナ未接続・接続不良の可能性）"));
+      Serial.println(F("   送信しても成功する見込みが無いため AT+CFUN=0 でRFを停止します。"));
+      Serial.println(F("   アンテナ・ケーブル・コネクタを確認してください。"));
+      sendAT("AT+CFUN=0", 5000);
+      delay(1000);
+      s_rfProtected      = true;
+      s_rfProtectStartMs = millis();
+    }
+  } else {
+    s_csq99Count = 0;  // 信号を検出できたのでカウンタをクリア
+  }
+}
+
+static void appWatchdogCheck() {
+  if (millis() - lastGasSuccessMs >= computeAppWdtMs(sendIntervalMs)) {
+    Serial.println(F("\n‼ アプリWDT: 規定時間 GAS 送信成功なし → NVIC_SystemReset で強制再起動"));
+    Serial.flush();
+    delay(200);
+    NVIC_SystemReset();  // setup() から全再初期化（モデムも AT&F + CFUN=1,1 でリセットされる）
+  }
+}
+
+#ifdef COMM_MODE_LORA
+// LoRa 受信ポーリング（後方で定義）。sendAT() の待機ループ中にも呼ぶことで、
+// LTE-M送信中（数十秒〜数分）のUARTE1受信バッファ溢れによる取りこぼしを防ぐ。
+static void loraPoll();
+#endif
+
+// ══════════════════════════════════════════════
+// AT コマンド送受信
+// ══════════════════════════════════════════════
+// 応答バッファの上限（★2026-07-21）: 配線ノイズ・SIM7080Gの異常URC等でRX1に
+// ゴミデータが流れ込み続けた場合、上限が無いと res が際限なく肥大化してヒープを
+// 食い尽くす（AT+SHREQ=60秒・AT+COPS=?=180秒待機時に特にリスクが高い）。
+// 電波状況の良否とは無関係に発生しうるMCUハングの一因と推定されるため、
+// 上限超過分は読み捨てて（HWバッファは溢れさせない）ヒープ確保量を頭打ちにする。
+static uint16_t const SENDAT_MAX_RESPONSE_LEN = 2048;
+
+// ★2026-07-25: 従来はwaitMsをどんな場合も律儀にフルで待っていた（応答が数秒で返っても
+// タイムアウト時間いっぱい待機）。これがAT+SHREQ/AT+SHCONN等の待ち時間が成功時も失敗時も
+// ほぼタイムアウト値ぴったりになる原因だった。応答の完了を示すトークンを検出したら
+// 即座に返るようにし、起動処理・GAS送信の両方を大幅に短縮する。
+// waitForToken省略時（多くのAT+xxxコマンド）は "OK"/"ERROR" で終端とみなす。
+// AT+SHREQのように「OKはすぐ返るが実際の結果は+SHREQ:という別行で遅れて届く」コマンドは
+// 呼び出し側でwaitForTokenに"+SHREQ:"等を指定し、その行が来るまで待つようにする。
+static bool sendAtHasTerminator(const String& res, const char* waitForToken) {
+  if (waitForToken != nullptr) return res.indexOf(waitForToken) >= 0;
+  return res.indexOf("OK\r\n") >= 0 || res.indexOf("ERROR") >= 0;
+}
+
+// ★2026-08-10追加: sendAT()/sendATFull()実行中はtrue。loraRxWatchdog()のキック処理
+// （UART書き込み＋delay()）を止めるために参照する。詳細はloraRxWatchdog()のコメント参照。
+static bool s_atBusy = false;
+
+// ★2026-08-10(v1.20): ATコマンドを32バイトずつに分割して送る。
+//
+// 【なぜ必要か】XIAOとSIM7080Gの間はTX/RXの2線のみで、ハードウェアフロー制御(RTS/CTS)が
+// 配線されていない。115200bpsで長いATコマンドを一気に流し込むと、モデム側のUART受信
+// バッファが溢れてバイトを取りこぼす。実機では約500文字のコマンドでほぼ毎回、180文字級でも
+// 低頻度で、URLの途中に制御文字が混入する化け方を確認している。
+// 当初64バイト/15msで実装したが切り詰めが残り、32バイト/25msで解消した。
+// 送信中も受信バッファを読み捨てるのは、エコー(ATE0)が効いていなかった場合に
+// 送った分がそのまま返ってきてnRF52の受信リングバッファを溢れさせるため。
+static void writeAtCommand(const String& cmd) {
+  while (Serial1.available()) Serial1.read();  // 前のコマンドの残骸を持ち越さない
+
+  const size_t CHUNK = 32;
+  size_t len = cmd.length();
+  for (size_t i = 0; i < len; i += CHUNK) {
+    size_t n = (i + CHUNK < len) ? CHUNK : (len - i);
+    Serial1.print(cmd.substring(i, i + n));
+    Serial1.flush();                             // このチャンクの送出完了を待つ
+    while (Serial1.available()) Serial1.read();  // エコーが残っていた場合の保険
+    delay(25);                                   // モデム側の受信処理に猶予を与える
+    while (Serial1.available()) Serial1.read();
+  }
+  Serial1.print("\r\n");
+  Serial1.flush();
+}
+
+String sendAT(String cmd, int waitMs, const char* waitForToken) {
+  // ★s_atBusyはコマンド送信の"前"に立てる。送信中のコマンド文字列そのものが
+  // loraKickTx()の割り込みで化ける事象を実機で確認したため。
+  s_atBusy = true;
+  writeAtCommand(cmd);
+  long start = millis();
+  String res = "";
+  while (millis() - start < waitMs) {
+    wdtFeed();  // 長時間の AT 応答待ち（COPS スキャン等 最大3分）でもハング扱いされないよう給餌
+    while (Serial1.available()) {
+      char c = (char)Serial1.read();
+      if (res.length() < SENDAT_MAX_RESPONSE_LEN) res += c;
+    }
+#ifdef COMM_MODE_LORA
+    loraPoll();
+#endif
+    // 応答完了を示すトークンが見えたら、タイムアウトを待たずに即座に返る
+    if (sendAtHasTerminator(res, waitForToken)) {
+      delay(20);  // 直後にまだ届く残りバイトを拾うための短い猶予
+      while (Serial1.available()) {
+        char c = (char)Serial1.read();
+        if (res.length() < SENDAT_MAX_RESPONSE_LEN) res += c;
+      }
+      break;
+    }
+    yield();
+  }
+  s_atBusy = false;
+  return res;
+}
+
+// ステージ結果を 1 行で出力
+void simStage(const char* name, bool ok) {
+  Serial.print(ok ? F("[OK] ") : F("[NG] "));
+  Serial.println(name);
+}
+
+
+// ══════════════════════════════════════════════
+// ネットワーク初期化（ltem_signal_test から流用）
+// ══════════════════════════════════════════════
+bool initNetwork() {
+  // ★2026-07-23: RF保護中（アンテナ未接続と判断してCFUN=0中）は送信を一切行わない
+  if (rfProtectActive()) {
+    Serial.println(F("[RF保護] RF停止中のためネットワーク初期化をスキップします（アンテナ確認要）"));
+    return false;
+  }
+
+  // CREG モードをデフォルト（n=0）にリセット
+  sendAT("AT+CREG=0", 2000); delay(200);
+
+  // バンド設定を全バンドにリセット（AT&F では CBANDCFG がリセットされないため明示的に設定）
+  sendAT("AT+CBANDCFG=\"CAT-M\",1,2,3,4,5,8,12,13,18,19,20,25,26,28,66,71,85", 3000); delay(500);
+
+  // LTE-M モード・APN 設定
+  sendAT("AT+CNMP=38"); delay(500);  // LTE only
+  sendAT("AT+CMNB=1");  delay(500);  // Cat-M1
+  sendAT("AT+CGDCONT=1,\"IP\",\"" + String(APN) + "\""); delay(500);
+  if (strlen(APN_USER) > 0) {
+    sendAT("AT+CGAUTH=1,1,\"" + String(APN_PASS) + "\",\"" + String(APN_USER) + "\""); delay(500);
+  }
+  simStage("NET1: LTE-M モード & APN 設定", true);
+
+  // CREG: ネットワーク登録確認（最大 60 秒）
+  bool cregOk = false;
+  Serial.print(F("[   ] NET2: ネットワーク登録待ち (最大60秒)"));
+  for (int i = 0; i < 12; i++) {
+    Serial.print('.');
+    String reg = sendAT("AT+CREG?", 3000);
+    // stat=1（登録済みホーム）または stat=5（ローミング）を検出
+    // n=0: "+CREG: 0,1"  n=2: "+CREG: 2,1,..." どちらにも対応
+    int cregComma = reg.indexOf("+CREG: ");
+    if (cregComma >= 0) {
+      int statComma = reg.indexOf(",", cregComma + 7);
+      if (statComma >= 0) {
+        char stat = reg.charAt(statComma + 1);
+        if (stat == '1' || stat == '5') { cregOk = true; break; }
+      }
+    }
+    if (i < 11) delay(5000);
+  }
+  Serial.println();
+  simStage("NET2: ネットワーク登録 (CREG=1 or 5)", cregOk);
+
+  if (!cregOk) {
+    Serial.println(F("\n--- NET2 NG: 原因診断 ---"));
+
+    // 電波強度確認
+    String csq = sendAT("AT+CSQ", 3000);
+    int csqVal = -1;
+    int csqIdx = csq.indexOf("+CSQ: ");
+    if (csqIdx >= 0) csqVal = csq.substring(csqIdx + 6, csq.indexOf(",", csqIdx)).toInt();
+    Serial.print(F("  CSQ: "));
+    if (csqVal == 99 || csqVal < 0) Serial.println(F("99 → 圏外またはアンテナ未接続"));
+    else if (csqVal >= 20)          Serial.println(String(csqVal) + " → 電波良好");
+    else if (csqVal >= 10)          Serial.println(String(csqVal) + " → 電波普通");
+    else                            Serial.println(String(csqVal) + " → 電波弱い");
+
+    // ★2026-07-23: 信号を全く検出できない状態が続くならRFを停止する（無意味な送信の停止）
+    rfProtectObserveCsq(csqVal);
+    if (rfProtectActive()) {
+      Serial.println(F("[RF保護] RFを停止しました。今回のネットワーク初期化を中断します"));
+      return false;
+    }
+
+    // 詳細ネットワーク状態
+    String cpsi = sendAT("AT+CPSI?", 3000);
+    Serial.print(F("  CPSI: "));
+    if (cpsi.indexOf("NO SERVICE") >= 0) Serial.println(F("NO SERVICE → 電波なし / アンテナ未接続"));
+    else {
+      int pi = cpsi.indexOf("+CPSI:");
+      Serial.println(pi >= 0 ? cpsi.substring(pi) : cpsi);
+    }
+
+    // 拡張エラーレポート（★2026-07-23追加）: CSQ良好・COPSでキャリアが見えている
+    // (stat=1=利用可能)のにCREGが進まない場合、ネットワーク側のアタッチ拒否理由
+    // （Illegal MS / Roaming not allowed / PLMN not allowed 等）をここで特定できることがある
+    String ceer = sendAT("AT+CEER", 3000);
+    Serial.print(F("  CEER(拒否理由): "));
+    int ceerIdx = ceer.indexOf("+CEER:");
+    Serial.println(ceerIdx >= 0 ? ceer.substring(ceerIdx) : F("(応答なし)"));
+
+    // 詳細 CREG
+    sendAT("AT+CREG=2", 2000);
+    String creg2 = sendAT("AT+CREG?", 3000);
+    Serial.print(F("  CREG詳細: ")); Serial.println(creg2);
+
+    // バンド設定確認
+    String bandCfg = sendAT("AT+CBANDCFG?", 3000);
+    Serial.print(F("  CBANDCFG: ")); Serial.println(bandCfg);
+
+    // Cat-M1 Band 18（KDDI 日本）を追加してリスキャン
+    Serial.println(F("  → Cat-M1 Band 18 (KDDI) を設定してリスキャン..."));
+    sendAT("AT+CBANDCFG=\"CAT-M\",18", 3000); delay(500);
+    sendAT("AT+CMNB=1", 3000); delay(500);  // Cat-M1 のみ
+
+    // リスキャン待ち（最大 30 秒）
+    bool rescanOk = false;
+    Serial.print(F("  リスキャン中"));
+    for (int i = 0; i < 6; i++) {
+      Serial.print('.');
+      delay(5000);
+      String reg2 = sendAT("AT+CREG?", 3000);
+      int cregComma2 = reg2.indexOf("+CREG: ");
+      if (cregComma2 >= 0) {
+        int statComma2 = reg2.indexOf(",", cregComma2 + 7);
+        if (statComma2 >= 0) {
+          char stat2 = reg2.charAt(statComma2 + 1);
+          if (stat2 == '1' || stat2 == '5') { rescanOk = true; break; }
+        }
+      }
+    }
+    Serial.println();
+    simStage("NET2-RETRY: Band18 + CMNB=3 でリスキャン", rescanOk);
+
+    String cpsi2 = sendAT("AT+CPSI?", 3000);
+    Serial.print(F("  CPSI(再): "));
+    int pi2 = cpsi2.indexOf("+CPSI:");
+    Serial.println(pi2 >= 0 ? cpsi2.substring(pi2) : cpsi2);
+
+    if (!rescanOk) {
+      // 無線スタックリセット後にリスキャン
+      Serial.println(F("  → 無線スタックをリセット (CFUN=0→1)..."));
+      sendAT("AT+CFUN=0", 5000); delay(2000);
+      sendAT("AT+CFUN=1", 5000); delay(5000);
+      sendAT("AT+CNMP=38", 2000); delay(500); // LTE のみ
+      sendAT("AT+CMNB=1",  2000); delay(500); // Cat-M1 のみ
+
+      bool cfunOk = false;
+      Serial.print(F("  CFUN リセット後リスキャン中"));
+      for (int i = 0; i < 12; i++) {
+        Serial.print('.');
+        delay(5000);
+        String reg3 = sendAT("AT+CREG?", 3000);
+        int ci = reg3.indexOf("+CREG: ");
+        if (ci >= 0) {
+          int sc = reg3.indexOf(",", ci + 7);
+          if (sc >= 0 && (reg3.charAt(sc + 1) == '1' || reg3.charAt(sc + 1) == '5')) {
+            cfunOk = true; break;
+          }
+        }
+      }
+      Serial.println();
+      simStage("NET2-CFUN: 無線リセット後リスキャン", cfunOk);
+
+      // 利用可能ネットワーク全スキャン（AT+COPS=?）
+      Serial.println(F("  → 利用可能ネットワークをスキャン中（最大3分）..."));
+      String cops = sendAT("AT+COPS=?", 180000);
+      Serial.print(F("  COPS: "));
+      int copsIdx = cops.indexOf("+COPS:");
+      if (copsIdx >= 0) Serial.println(cops.substring(copsIdx));
+      else              Serial.println(F("(応答なし / ネットワーク見つからず)"));
+
+      if (cfunOk) rescanOk = true;
+    }
+
+    Serial.println(F("  ▶ 確認事項:"));
+    Serial.println(F("    1. アンテナが M5Stamp SIM7080G に接続されているか"));
+    Serial.println(F("    2. 1NCE ポータル(sim.1nce.net)で SIM が Active か確認"));
+    Serial.println(F("    3. 電波の弱い場所にいないか"));
+    Serial.println(F("-------------------------"));
+
+    if (rescanOk) {
+      cregOk = true;
+      simStage("NET2: リトライで登録成功", true);
+    }
+  }
+
+  // CGATT: データ Attach 確認
+  // 登録直後は Attach 完了待ちが必要。5秒×12回=最大60秒リトライ
+  // まだ 0 なら AT+CGACT=1,1 で手動アクティベートを試みる
+  bool attachOk = false;
+  Serial.print(F("[   ] NET3: データ Attach 待ち"));
+  for (int i = 0; i < 12; i++) {
+    Serial.print('.');
+    delay(5000);
+    String att = sendAT("AT+CGATT?", 3000);
+    if (att.indexOf("+CGATT: 1") >= 0) { attachOk = true; break; }
+  }
+  if (!attachOk) {
+    // 手動で PDP コンテキストをアクティベート
+    Serial.print(F(" (CGACT試行)"));
+    sendAT("AT+CGACT=1,1", 10000);
+    delay(3000);
+    String att2 = sendAT("AT+CGATT?", 3000);
+    if (att2.indexOf("+CGATT: 1") >= 0) attachOk = true;
+  }
+  Serial.println();
+  simStage("NET3: データ Attach (CGATT=1)", attachOk);
+  if (!attachOk) {
+    Serial.println(F("  → CGATT=0 のまま。APN 設定・SIM 契約を確認してください"));
+    String ceer = sendAT("AT+CEER", 3000);
+    Serial.print(F("  CEER(拒否理由): "));
+    int ceerIdx = ceer.indexOf("+CEER:");
+    Serial.println(ceerIdx >= 0 ? ceer.substring(ceerIdx) : F("(応答なし)"));
+    return false;
+  }
+  delay(1000);
+
+  // CNACT: IP アドレス取得
+  sendAT("AT+CNACT=0,1", 15000); delay(3000);
+  String cnact = sendAT("AT+CNACT?", 3000);
+  bool ipOk = cnact.indexOf("0,1") >= 0;
+  simStage("NET4: IP アドレス取得 (CNACT)", ipOk);
+  if (!ipOk) { Serial.print(F("  → CNACT 応答: ")); Serial.println(cnact); return false; }
+
+  return true;
+}
+
+// ══════════════════════════════════════════════
+// GAS 送信（ltem_signal_test の postToSheet を踏襲）
+// ══════════════════════════════════════════════
+
+
+// 全 Flex レコードを1回の GET でまとめて GAS へ送信
+// クエリ形式: ts=...&sim=...&n=3&mac0=...&payload0=...&rssi0=...&mac1=...
+// ★2026-08-10(v1.20): AT+SH*系（SHCONN/SHREQ/SHREAD）は全廃し、AT+HTTPTOFS方式へ
+//   統一した。接続の張りっぱなし・使い回しという概念自体が無くなっている
+//   （httpGetViaFs()がURL単位で完結する）。理由はhttpGetViaFs()の上のコメント参照。
+int getSimCsq();  // 後方で定義（通信失敗時の電波強度診断ログから使うため前方宣言）
+
+// ══════════════════════════════════════════════
+// GAS通信（AT+HTTPTOFS方式。★2026-08-10 v1.20で全面移行）
+// ══════════════════════════════════════════════
+// 【なぜAT+SH*系をやめたか】GAS Web AppのdoGet()は必ず302でscript.googleusercontent.comへ
+// リダイレクトし、実際の応答本文はその先にある。この302応答は
+//   ・ヘッダー全体が1010バイト（Location単体で470バイト）
+//   ・Content-Lengthが無く、常に Transfer-Encoding: chunked（curlで8回連続確認）
+// という形をしている。一方 AT+SHCONF="HEADERLEN" の仕様上限は350（マニュアルV1.04
+// §13.2.1）で、モデムは先頭350バイトしか保持できず、オフセット978にある
+// chunked の記述に構造的に到達できない。結果 +SHREQ が DataLen=0 を返し、本文を読めない。
+// 実機では起動直後の1回だけ成功して以降は失敗し続ける状態になり、
+// v1.20のダウンリンク予約取得（本文の読み取りが必須）が成立しなかった。
+//
+// 【AT+HTTPTOFSに何ができるか】モジュール内の別のHTTPクライアント実装（FOTA等で使う）で、
+// chunkedを正しく処理でき、ヘッダー長の制約も無い。ファイルシステムへ落として読み出す。
+// ただしリダイレクトは追従しないため、1段目で302のHTMLから<A HREF="...">を取り出し、
+// 2段目でその先を取得する2段構えにする。GAS側の変更は不要。
+//
+// 【混在できない】AT+HTTPTOFS実行後にAT+SHCONNがERRORになる事象を実機で確認している
+// （同じHTTP/SSLリソースを共有しているため状態が壊れると思われる）。
+// そのためテレメトリ送信も含め、GAS通信は全てこちらへ統一する。
+static String sendATFull(String cmd, int waitMs);  // 後方で定義（本文を固定時間読み切る版）
+bool initNetwork();                               // 後方で定義（復旧処理から呼ぶ）
+
+#define HTTPTOFS_DIR_INDEX 3            // 3 = "/customer/"（AT+CFSRFILEの<index>）
+#define HTTPTOFS_FILENAME  "gasdl.txt"
+
+// 正常なGAS応答は 'ok'/'OK' 程度（chunkedのためlen=0で届く）。これを大きく超える本文が
+// 実際にダウンロードできた場合は、Content-Length付きのHTMLエラーページを疑う。
+#define GAS_ERROR_PAGE_MIN_LEN 512
+
+// AT+CFSRFILE の応答から本文を取り出す。
+// 応答形式: "OK\r\n\r\n+CFSRFILE: <len>\r\n<data>\r\n\r\nOK\r\n"
+static String extractCfsrfileBody(const String& raw, int expectedLen) {
+  int bi = raw.indexOf("+CFSRFILE: ");
+  if (bi < 0) return "";
+  int nl = raw.indexOf('\n', bi);
+  if (nl < 0) return "";
+  int bodyStart = nl + 1;
+  int available = raw.length() - bodyStart;
+  int len = (expectedLen > 0 && expectedLen < available) ? expectedLen : available;
+  return raw.substring(bodyStart, bodyStart + len);
+}
+
+// AT+HTTPTOFSのダウンロード状態がIdle(0)になるまで待つ。
+// ★発行"前"に呼んではいけない。前回の状態読み出しを挟んだ途端に「status=200 len=0」が
+//   100%発生する事象を実機で確認している（外すと元に戻る）。完了待ちは発行"後"だけ。
+static bool waitHttpToFsIdle(int maxWaitMs) {
+  long start = millis();
+  while (millis() - start < maxWaitMs) {
+    String rl = sendAT("AT+HTTPTOFSRL?", 3000);
+    int ri = rl.indexOf("+HTTPTOFSRL: ");
+    if (ri >= 0 && rl.substring(ri + 13).toInt() == 0) return true;
+    delay(250);
+  }
+  return false;
+}
+
+// モデム内部のHTTP/ファイル系リソース不調からの段階的復旧。
+static int s_fsFailStreak = 0;
+static int s_lastHttpStatus = 0;  // 直近のhttpGetViaFs()が受けたHTTPステータス（切り分け用）
+static int s_lastHttpLen    = 0;  // 直近のhttpGetViaFs()が受けた本文バイト数（偽陽性検出用）
+
+// ★2026-08-10: GAS取得の成功率を実測するためのカウンタ。
+// GASの応答はchunked（Content-Lengthなし）で、モジュールが本文長を決められず
+// 「status=200 len=0」になることが断続的に起こる。一方Content-Length付きのURLは
+// 今のところ失敗していない。リトライで吸収できる水準なのか、取得元を
+// Content-Lengthが付く場所へ移す必要があるのかを、推測ではなく実測で判断する。
+static uint32_t s_gasFetchTry = 0;
+static uint32_t s_gasFetchOk  = 0;
+static void recoverHttpStack() {
+  if (s_fsFailStreak == 3) {
+    Serial.println(F("[GAS] 復旧: PDPコンテキストを張り直します"));
+    sendAT("AT+CNACT=0,0", 15000); delay(3000);
+    sendAT("AT+CNACT=0,1", 15000); delay(3000);
+  } else if (s_fsFailStreak >= 6) {
+    Serial.println(F("[GAS] 復旧: モデムを再起動します"));
+    s_fsFailStreak = 0;
+    sendAT("AT+CFUN=1,1", 10000);
+    delay(8000);
+    for (int t = 0; t < 20; t++) {
+      if (sendAT("AT", 1000).indexOf("OK") >= 0) break;
+      delay(500);
+    }
+    sendAT("ATE0", 2000);
+    initNetwork();
+  }
+}
+
+// 任意のURLをAT+HTTPTOFSで取得する。成功時は本文、失敗時は空文字列。
+// wantBody=false なら本文の読み出しを省略する（副作用だけが目的の送信で使う）。
+static String httpGetViaFs(const String& url, bool wantBody) {
+  delay(300);
+
+  // ★確保が残っていると AT+HTTPTOFS が書き込めず「status=200 len=0」になるため、
+  //   まず無条件にCFSTERMして前回の解放漏れを取り除く（未確保ならERRORだが無害）。
+  sendAT("AT+CFSTERM", 3000);
+
+  // ★CFSINIT/CFSTERMは「フラッシュバッファの確保/解放」。ダウンロードを挟むと確保状態が
+  //   無効になるらしく、確保したままCFSRFILEすると空が返る。削除用と読み出し用で分ける。
+  String delRes = sendAT("AT+CFSINIT", 3000);
+  delRes += sendAT("AT+CFSDFILE=" + String(HTTPTOFS_DIR_INDEX) + ",\"" + HTTPTOFS_FILENAME + "\"", 3000);
+  delRes += sendAT("AT+CFSTERM", 3000);
+
+  String res = sendAT("AT+HTTPTOFS=\"" + url + "\",\"/customer/" + HTTPTOFS_FILENAME + "\",50,5",
+                      60000, "+HTTPTOFS:");
+
+  int statusCode = 0, dataLen = 0;
+  int si = res.indexOf("+HTTPTOFS: ");
+  if (si >= 0) {
+    String t = res.substring(si + 11);
+    int c1 = t.indexOf(',');
+    if (c1 > 0) {
+      statusCode = t.substring(0, c1).toInt();
+      int e = c1 + 1;
+      while (e < (int)t.length() && isDigit(t[e])) e++;
+      dataLen = t.substring(c1 + 1, e).toInt();
+    }
+  }
+  s_lastHttpStatus = statusCode;
+  s_lastHttpLen    = dataLen;
+  Serial.print(F("[GAS] HTTPTOFS status=")); Serial.print(statusCode);
+  Serial.print(F(" len=")); Serial.println(dataLen);
+
+  if (wantBody) s_gasFetchTry++;
+
+  if (statusCode != 200 || (wantBody && dataLen <= 0)) {
+    Serial.print(F("[DEBUG] HTTPTOFS raw=[")); Serial.print(res); Serial.println(F("]"));
+    s_fsFailStreak++;
+    recoverHttpStack();
+    return "";
+  }
+  s_fsFailStreak = 0;
+  if (wantBody) s_gasFetchOk++;
+  if (!wantBody) return "ok";
+
+  // ★AT+HTTPTOFSは非同期。+HTTPTOFS URCが返った時点ではファイル書き込みが
+  //   完了していないことがあるため、Idleになるまで待ってから読む。
+  waitHttpToFsIdle(10000);
+
+  // ★CFSGFISはCFSINITで確保していないと正しい値を返さない。サイズ確認と読み出しを
+  //   同じCFSINIT/CFSTERMの中で行う（確保前に確認すると0が返り、正常なデータを捨てる）。
+  sendAT("AT+CFSINIT", 3000);
+
+  int fileSize = 0;
+  String gfis = sendAT("AT+CFSGFIS=" + String(HTTPTOFS_DIR_INDEX) + ",\"" + HTTPTOFS_FILENAME + "\"", 3000);
+  int gi = gfis.indexOf("+CFSGFIS: ");
+  if (gi >= 0) fileSize = gfis.substring(gi + 10).toInt();
+
+  if (fileSize != dataLen) {
+    sendAT("AT+CFSTERM", 3000);
+    Serial.print(F("[GAS] ファイルサイズ不一致（期待=")); Serial.print(dataLen);
+    Serial.print(F(" 実際=")); Serial.print(fileSize); Serial.println(F("）→ 破棄"));
+    return "";
+  }
+
+  String fileRes = sendATFull("AT+CFSRFILE=" + String(HTTPTOFS_DIR_INDEX) + ",\"" + HTTPTOFS_FILENAME +
+                              "\",0," + String(dataLen) + ",0", 5000);
+  sendAT("AT+CFSTERM", 3000);
+
+  String body = extractCfsrfileBody(fileRes, dataLen);
+  body.trim();
+  return body;
+}
+
+// 302のHTMLページ本体から <A HREF="..."> のURLを取り出す（&amp;も復元する）
+static String extractRedirectUrl(const String& html) {
+  int hi = html.indexOf("HREF=\"");
+  if (hi < 0) return "";
+  hi += 6;
+  int hEnd = html.indexOf("\"", hi);
+  if (hEnd < 0) return "";
+  String url = html.substring(hi, hEnd);
+  url.replace("&amp;", "&");
+  return url;
+}
+
+// GASへGETし、応答本文を文字列で返す（失敗時は空文字列）。
+static String gasGetText(const String& queryParams) {
+  String url1 = "https://script.google.com/macros/s/";
+  url1 += GAS_SCRIPT_ID;
+  url1 += "?";
+  url1 += queryParams;
+
+  String html;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) delay(1000);
+    Serial.println(attempt == 0 ? F("[GAS] 1段目を取得中...") : F("[GAS] 1段目を再取得中..."));
+    html = httpGetViaFs(url1, true);
+    if (html.length() == 0) continue;
+    // Googleのエラーページ（404等）を本文として扱わない。URLが途中で切れた証拠。
+    if (html.indexOf("<!DOCTYPE html>") >= 0 && html.indexOf("HREF=\"") < 0) {
+      Serial.println(F("[GAS] Googleのエラーページが返された（URLが壊れている可能性）"));
+      html = "";
+      continue;
+    }
+    break;
+  }
+  if (html.length() == 0) {
+    Serial.println(F("[GAS] 1段目の取得に失敗"));
+    return "";
+  }
+
+  // GASが（リダイレクトせず）直接本文を返した場合はそのまま使う
+  if (html.indexOf("Moved Temporarily") < 0 && html.indexOf("HREF=\"") < 0) return html;
+
+  String url2 = extractRedirectUrl(html);
+  if (url2.length() == 0) {
+    Serial.println(F("[GAS] リダイレクト先URLが取り出せない"));
+    return "";
+  }
+
+  String body;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) delay(1000);
+    Serial.println(attempt == 0 ? F("[GAS] 2段目（リダイレクト先）を取得中...")
+                                : F("[GAS] 2段目を再取得中..."));
+    body = httpGetViaFs(url2, true);
+    if (body.length() > 0) break;
+  }
+  return body;
+}
+
+// ★2026-08-10(v1.20): AT+SH*系からAT+HTTPTOFS方式へ変更（理由は上のコメント参照）。
+//   本文は読まないので1段目だけでよい。GAS Web AppはdoGet()を実行し終えてから
+//   リダイレクトを返すため、1段目が成功した時点でGAS側の記録処理は完了している。
+bool postToGAS(String queryParams) {
+#if TEST_FORCE_SEND_FAIL > 0
+  static int s_forceFailRemaining = TEST_FORCE_SEND_FAIL;
+  if (s_forceFailRemaining > 0) {
+    s_forceFailRemaining--;
+    Serial.print(F("[TEST] 強制送信失敗（実通信スキップ）残り "));
+    Serial.print(s_forceFailRemaining);
+    Serial.println(F(" 回"));
+    return false;
+  }
+#endif
+
+  String url = "https://script.google.com/macros/s/";
+  url += GAS_SCRIPT_ID;
+  url += "?";
+  url += queryParams;
+
+  Serial.println(F("[GAS] データ送信中..."));
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) delay(1000);
+    if (httpGetViaFs(url, false).length() > 0) {
+      // ★2026-08-30追加: postToGAS()はwantBody=falseで本文を読まないため、GASが例外を
+      //   投げてHTMLエラーページを返しても「status=200」だけを見て成功と表示していた。
+      //   実際にSPREADSHEET_ID未設定のGASを相手に「✓ 送信成功」と出続け、シートには
+      //   1行も入らない状態に丸一日気づけなかった（2026-08-30）。
+      //   正常時のGAS応答は 'ok'/'OK' 数バイトのchunkedで、モジュールは長さを決められず
+      //   len=0 を返す。一方Googleのエラーページは Content-Length 付きなので数KBが実際に
+      //   ダウンロードされる。この非対称を使って取り違えを検出する。
+      if (s_lastHttpLen > GAS_ERROR_PAGE_MIN_LEN) {
+        Serial.print(F("⚠ GASがエラーページを返した可能性（本文 "));
+        Serial.print(s_lastHttpLen);
+        Serial.println(F(" バイト）。シートに記録されていない恐れがあります"));
+        Serial.println(F("  → GAS側のSPREADSHEET_ID設定・デプロイ内容を確認してください"));
+      }
+      Serial.println(F("✓ GAS 送信成功！"));
+      lastGasSuccessMs = millis();  // アプリ層ウォッチドッグ: 送信成功を記録
+      return true;
+    }
+    Serial.print(F("✗ GAS 送信失敗（")); Serial.print(attempt + 1);
+    Serial.println(F("回目/3）"));
+  }
+  return false;
+}
+
+// ══════════════════════════════════════════════
+// リモートコマンド確認（HTTPS/GAS経由でポーリング、★2026-08-04追加）
+// ══════════════════════════════════════════════
+// MQTT(EMQX)経由のリモートリセットを実装したが、SIM7080Gのこのファームウェアでは
+// 内蔵MQTTクライアント(AT+SM*)・生ソケットへのTLS適用(AT+CASSLCFG)の両方が
+// "operation not allowed"で機能しないことが実機検証で判明した。EMQXはTLS必須(8883番のみ)
+// のため代替不可。既に安定動作しているGASのHTTPS経由（AT+SHREQ/SHREAD）でコマンドを
+// ポーリングする方式に変更した。GAS側の対応はcase02_Gateway/gas/gateway_common/Code.gs
+// のdoGet()内 action=check_cmd / action=set_cmd を参照。
+// ★2026-08-28: 固定文字列 "gateway_v11_test" から、XIAO固有ID由来の一意なIDへ変更。
+//   Gateway 2台が同じIDでGASに接続すると、pending_cmd_<deviceId> の取得競合が起き、
+//   status_report・log_dump も混ざって個体を識別できなくなる。
+//   （これはDeviceIDの群分離とは独立した問題。群を分けても解決しない）
+//
+//   XIAO nRF52840 の FICR->DEVICEID（64bit、工場書込みで一意）から "gw_<16桁hex>" を作る。
+//   16桁を切り詰めないのは、識別空間を狭める合理的な理由がないため。
+//
+//   ★実装上の注意：一時Stringのc_str()を保持すると関数終了後にポインタが無効になるため、
+//   固定長のグローバル配列に snprintf で書き込む。初期化は checkRemoteCmd() が
+//   最初に呼ばれるより前（setup()の冒頭）で行うこと。
+//   ★運用上の注意：XIAO交換＝Gateway ID変更になる。現場名はファームに焼かず、
+//   GAS台帳で「論理名 ↔ XIAO固有ID」を対応付ける（旧IDの予約整理も必要）。
+static char GW_DEVICE_ID[24] = "gw_uninitialized";
+
+static void initGwDeviceId() {
+  snprintf(GW_DEVICE_ID, sizeof(GW_DEVICE_ID), "gw_%08lX%08lX",
+           (unsigned long)NRF_FICR->DEVICEID[1],
+           (unsigned long)NRF_FICR->DEVICEID[0]);
+}
+
+// ★2026-08-04追加: stop/start/send_nowコマンド用の状態フラグ。
+// s_gasSendPausedはBLE/LoRa受信・check_cmdの確認自体は止めず、GASへのデータ送信
+// （flushRecords()）だけをスキップする（受信も含めて全部止めると、次のstartコマンドを
+// 受け取る手段が無くなり、リモートで再開できなくなるため）。
+static bool s_gasSendPaused  = false;
+static bool s_forceSendOnce  = false;  // send_nowで次回1回だけ一時停止中でも強制送信する
+
+#ifdef COMM_MODE_LORA
+static void saveConfig();  // 後方で定義（送信間隔の永続化。LoRaビルドのみ内蔵フラッシュ保存機構あり）
+#endif
+
+// ★2026-08-04: 通常のsendAT()は応答に"OK\r\n"が現れた時点で早期終了する（AT応答の高速化のため）。
+// これはATコマンドの応答には向いているが、HTML本文のような自由文には向かない。
+// 本文中にたまたま"OK"という文字列が含まれると、そこで読み込みを打ち切ってしまい、
+// 本来もっと長いはずのレスポンスが途中で切れてしまう不具合があった（GASの302リダイレクト
+// ページ本文を読もうとした際に発生）。固定時間分は必ず読み切る専用の関数で対応する。
+static String sendATFull(String cmd, int waitMs) {
+  s_atBusy = true;  // 理由はsendAT()のコメント参照
+  writeAtCommand(cmd);
+  String res = "";
+  long start = millis();
+  while (millis() - start < waitMs) {
+    wdtFeed();
+    while (Serial1.available()) res += (char)Serial1.read();
+    yield();
+  }
+  s_atBusy = false;
+  return res;
+}
+
+// SHREADの応答（"+SHREAD: <長さ>\r\n<本文>\r\n\r\nOK"）から本文部分だけを取り出す
+
+// ★2026-08-04追加: ステータス確認コマンド用。CSQ・稼働時間・空きヒープをGASへ即時報告する。
+void sendStatusReport() {
+  int csq = getSimCsq();
+  uint32_t uptimeMin = millis() / 60000UL;
+  int freeHeap = dbgHeapFree();  // Adafruit nRF52コア標準の空きヒープ取得（bootloader utility/debug.h）
+
+  String path = "action=status_report&device_id=";
+  path += GW_DEVICE_ID;
+  path += "&csq="; path += String(csq);
+  path += "&uptime_min="; path += String(uptimeMin);
+  path += "&free_heap="; path += String(freeHeap);
+
+  bool ok = postToGAS(path);
+  Serial.print(F("[CMD] ステータス報告 csq=")); Serial.print(csq);
+  Serial.print(F(" uptime_min=")); Serial.print(uptimeMin);
+  Serial.print(F(" free_heap=")); Serial.print(freeHeap);
+  Serial.println(ok ? F(" → GASへ送信成功") : F(" → GASへ送信失敗"));
+}
+
+// ★2026-08-04追加: RTC再同期コマンド用。網時刻(AT+CCLK)での強制補正を今すぐ実行する。
+void triggerRtcResync() {
+  if (!rtcAvailable) {
+    Serial.println(F("[CMD] RTCが利用できないため再同期できません"));
+    return;
+  }
+  bool ok = syncRtcFromNetworkTime();
+  Serial.println(ok ? F("[CMD] RTC再同期成功") : F("[CMD] RTC再同期失敗（網時刻の取得に失敗）"));
+}
+
+// ★2026-08-04追加: 診断ログ吸い上げコマンド用。gwlog.csvの末尾（直近ログ）を
+// hexエンコードしてGASへ送る。AT+SHREQの512バイト上限に収めるため、送れるのは
+// 末尾の一部（目安180バイト程度）のみ。現場に行かずに直近の状況を確認する用途。
+void sendLogDumpToGAS() {
+  File f = SD.open("gwlog.csv", FILE_READ);
+  if (!f) {
+    Serial.println(F("[CMD] gwlog.csvを開けないためログ送信不可（SDカード未挿入等）"));
+    return;
+  }
+
+  uint32_t const TAIL_BYTES = 180;
+  uint32_t fileSize = f.size();
+  uint32_t start = (fileSize > TAIL_BYTES) ? (fileSize - TAIL_BYTES) : 0;
+  f.seek(start);
+
+  String hex = "";
+  while (f.available()) {
+    uint8_t b = (uint8_t)f.read();
+    if (b < 0x10) hex += '0';
+    hex += String(b, HEX);
+  }
+  f.close();
+
+  String path = "action=log_dump&device_id=";
+  path += GW_DEVICE_ID;
+  path += "&log=";
+  path += hex;
+
+  bool ok = postToGAS(path);
+  Serial.print(F("[CMD] ログ吸い上げ（末尾")); Serial.print(hex.length() / 2);
+  Serial.print(F("バイト）"));
+  Serial.println(ok ? F(" → GASへ送信成功") : F(" → GASへ送信失敗"));
+}
+
+// ══════════════════════════════════════════════
+// LoRaダウンリンク（Class A + 確認応答方式。★v1.20で追加）
+// ══════════════════════════════════════════════
+// 【全体像】スプレッドシート → GAS → Gateway → LoRa → 子機(Flex v3.20) の順に設定変更を
+// 届け、子機からの確認応答を逆順で返す。設計・実機検証の経緯は
+// case02_Gateway/test_sketches/03_lora_downlink_sender を参照。
+//
+// 【なぜキャッシュが要るか】子機は省電力のため、自分がアップリンクを送った直後の
+// 2秒間しか受信できない。その2秒の間にGASへHTTPSで問い合わせる（数秒〜数十秒かかる）
+// ことは不可能なので、Gatewayは事前に「どの子機に何を送るか」をローカルに持っておき、
+// アップリンクを受けた瞬間にネットワークを介さず即座にLoRa送信する。
+// 予約の取得はcheckRemoteCmd()の応答に相乗りしている（HTTPリクエストを増やさないため）。
+//
+// 【送りっぱなしにしない】送信しただけでは予約を消さず、子機からの確認フレーム
+// (PktType 0x05)を受けて初めて完了とする。取りこぼしても失われず、子機の次サイクルで
+// 自動的に再試行される。規定回数試しても確認が返らなければ未達としてGASへ報告する。
+#ifdef COMM_MODE_LORA
+
+// ★2026-08-28: 当該群の機器番号1〜31（DeviceID下位5bit）に合わせて 15→31 へ拡張。
+#define MAX_PENDING_CHILDREN   31   // 当該群の子機（機器番号1〜31）
+#define DOWNLINK_MAX_ATTEMPTS  3    // この回数送っても確認が返らなければ未達として打ち切る
+
+// ★同じ子機への連続送信を抑制する時間。
+//
+// 【なぜ必要か】子機は同じデータを LORA_TX_REPEAT 回（現在2回）冗長送信する。
+// Gatewayはこれを「2回のアップリンク」として扱ってしまい、1度の起床で試行回数を
+// 2つ消費していた（実機で attempts=2 を確認）。DOWNLINK_MAX_ATTEMPTS=3 のうち
+// 2回分が1回の起床で消えるため、実質1.5サイクル分しか再試行できない。
+// 子機の冗長送信は数百ms間隔なので、それより十分長く、かつ子機の最短送信間隔
+// （テスト時2分）より短い値にする。
+#define DOWNLINK_DEDUP_MS 10000UL
+
+// ダウンリンク結果のステータスコード（子機ファーム・GASと一致させること）
+#define DL_STATUS_OK          0
+#define DL_STATUS_RANGE_ERROR 1
+#define DL_STATUS_CLAMPED     2
+#define DL_STATUS_NO_ACK      99   // Gateway自身が付ける「未達」
+
+struct PendingDownlink {
+  bool     active;
+  uint8_t  childId;
+  uint16_t sleepMin;
+  uint8_t  avg;
+  uint8_t  median;
+  uint8_t  attempts;
+  uint32_t seq;         // 予約の通し番号。報告に含めてGAS側で新旧を判別させる
+  bool     statusOnly;  // trueなら設定変更フラグを立てずに送る（ステータス確認）
+  uint32_t lastSendMs;  // 最後にこの子機へ送信した時刻（連続送信の抑制用）
+};
+static PendingDownlink s_pending[MAX_PENDING_CHILDREN];
+
+// GASへの報告キュー。
+// ★loraPoll()はsendAT()の待機ループからも呼ばれるため、その中で直接HTTPS通信を
+//   始めると再帰的にAT通信が入れ子になって破綻する。受信処理では「キューに積む」だけにし、
+//   実際の送信はloop()の安全な場所で行う。
+struct DownlinkReport {
+  bool     used;
+  bool     finalResult;  // true=downlink_result（最終）/ false=downlink_sent（中間報告）
+  uint8_t  childId;
+  uint8_t  status;
+  uint16_t sleepMin;
+  uint8_t  avg;
+  uint8_t  median;
+  uint8_t  attempts;
+  uint32_t seq;
+  uint16_t wdtMin;  // 子機の確認応答に載る、適用後に有効になるWDTタイムアウト（分）
+};
+#define MAX_REPORTS 32
+static DownlinkReport s_reports[MAX_REPORTS];
+
+static void queueReport(bool finalResult, uint8_t childId, uint8_t status,
+                        uint16_t sleepMin, uint8_t avg, uint8_t median,
+                        uint8_t attempts, uint32_t seq, uint16_t wdtMin = 0) {
+  int slot = -1;
+  for (int i = 0; i < MAX_REPORTS; i++) {
+    if (!s_reports[i].used) {
+      slot = i;
+      break;
+    }
+  }
+
+  // ★LTE-M不調でキューが満杯でも、最終結果を失うとGASの予約が未完了のまま残り、
+  //   子機への再送が続いてしまう。中間報告(downlink_sent)は失ってもよいため、
+  //   最終結果だけは既存の中間報告を上書きして優先する。
+  if (slot < 0 && finalResult) {
+    for (int i = 0; i < MAX_REPORTS; i++) {
+      if (!s_reports[i].finalResult) {
+        slot = i;
+        Serial.println(F("[REPORT] キュー満杯のため中間報告を最終結果で上書きします"));
+        break;
+      }
+    }
+  }
+
+  if (slot < 0) {
+    Serial.println(F("[REPORT] キューが満杯のため報告を破棄しました"));
+    return;
+  }
+
+  s_reports[slot].used        = true;
+  s_reports[slot].finalResult = finalResult;
+  s_reports[slot].childId     = childId;
+  s_reports[slot].status      = status;
+  s_reports[slot].sleepMin    = sleepMin;
+  s_reports[slot].avg         = avg;
+  s_reports[slot].median      = median;
+  s_reports[slot].attempts    = attempts;
+  s_reports[slot].seq         = seq;
+  s_reports[slot].wdtMin      = wdtMin;
+}
+
+// ★「実際に送信したダウンリンク」の控え。
+//
+// 【なぜ必要か】確認応答を受けた時点でs_pending[]を見てseqを決めていたところ、
+// 送信してから応答が返るまでの間にキャッシュ更新が走って新しい予約(seq)へ
+// 入れ替わっていると、古い応答を新しい予約の完了として報告してしまう。
+// 実機で「seq=7を送信 → キャッシュがseq=8に更新 → seq=7の応答をseq=8として報告」が発生し、
+// 一度も送信していないseq=8が完了扱いで消えた。送信時点の内容をここに控えて突き合わせる。
+struct SentDownlink {
+  bool     valid;
+  uint8_t  childId;
+  uint8_t  attempts;
+  uint32_t seq;
+};
+static SentDownlink s_lastSent[MAX_PENDING_CHILDREN];
+
+static SentDownlink* findLastSent(uint8_t childId) {
+  for (int i = 0; i < MAX_PENDING_CHILDREN; i++) {
+    if (s_lastSent[i].valid && s_lastSent[i].childId == childId) return &s_lastSent[i];
+  }
+  return nullptr;
+}
+
+static void recordSent(uint8_t childId, uint8_t attempts, uint32_t seq) {
+  SentDownlink* e = findLastSent(childId);
+  if (e == nullptr) {
+    for (int i = 0; i < MAX_PENDING_CHILDREN; i++) {
+      if (!s_lastSent[i].valid) { e = &s_lastSent[i]; break; }
+    }
+  }
+  if (e == nullptr) return;
+  e->valid    = true;
+  e->childId  = childId;
+  e->attempts = attempts;
+  e->seq      = seq;
+}
+
+static PendingDownlink* findPending(uint8_t childId) {
+  for (int i = 0; i < MAX_PENDING_CHILDREN; i++) {
+    if (s_pending[i].active && s_pending[i].childId == childId) return &s_pending[i];
+  }
+  return nullptr;
+}
+
+// check_cmdの応答2行目以降（"HEX2:sleepMin:avg:median:attempts:seq:mode"）を
+// 予約キャッシュへ取り込む。bodyは応答全文（1行目のコマンドを含む）。
+// ★キャッシュは毎回作り直す。GAS側が正なので、消えた予約はここで自動的に落ちる。
+static void applyDownlinkCache(const String& body) {
+  for (int i = 0; i < MAX_PENDING_CHILDREN; i++) s_pending[i].active = false;
+
+  int slot = 0;
+  int from = body.indexOf('\n');           // 1行目（コマンド）は読み飛ばす
+  if (from < 0) {
+    Serial.println(F("[CACHE] 保留中のダウンリンク予約はありません"));
+    return;
+  }
+  from++;
+
+  while (from < (int)body.length() && slot < MAX_PENDING_CHILDREN) {
+    int nl = body.indexOf('\n', from);
+    String line = (nl < 0) ? body.substring(from) : body.substring(from, nl);
+    from = (nl < 0) ? body.length() : nl + 1;
+    line.trim();
+    if (line.length() == 0) continue;
+
+    // ':'の位置を6個探す（7フィールド）
+    int pos[6];
+    int found = 0, scan = 0;
+    while (found < 6) {
+      int c = line.indexOf(':', scan);
+      if (c < 0) break;
+      pos[found++] = c;
+      scan = c + 1;
+    }
+    if (found < 6) {
+      Serial.print(F("[CACHE] 書式不正のため無視: ")); Serial.println(line);
+      continue;
+    }
+
+    // ★2026-08-28: 値域検証は必ず「格納型へ縮小変換する前」に行うこと。
+    //   以前は (uint8_t)strtoul(...) のように切り詰めてから検証していたため、GASが誤って
+    //   "101" を返すと 0x101 が 0x01 へ化け、実在する別の子機あての予約として受理された。
+    //   群検証も切り詰め後の値に対して行われるので、他群あての異常値が自群の実在IDに
+    //   化けて誤配送される経路になっていた（avg/medianの257→1、sleepMinの65537→1も同じ）。
+    //   したがって一旦 long / unsigned long のまま受けてから値域を見る。
+    unsigned long childIdRaw  = strtoul(line.substring(0, pos[0]).c_str(), nullptr, 16);
+    long          sleepMinRaw = line.substring(pos[0] + 1, pos[1]).toInt();
+    long          avgRaw      = line.substring(pos[1] + 1, pos[2]).toInt();
+    long          medianRaw   = line.substring(pos[2] + 1, pos[3]).toInt();
+    long          attemptsRaw = line.substring(pos[3] + 1, pos[4]).toInt();
+    long          seqRaw      = line.substring(pos[4] + 1, pos[5]).toInt();
+    bool          statusOnly  = line.substring(pos[5] + 1).toInt() != 0;
+
+    // ★群の検証。GAS側でも群別に配信するが、誤配信時の多重防御として必ず検証する。
+    if (childIdRaw > 0xFF || (childIdRaw & 0x1F) == 0 ||
+        (childIdRaw >> 5) != GATEWAY_GROUP_ID) {
+      Serial.print(F("[CACHE] 自群(")); Serial.print(GATEWAY_GROUP_ID);
+      Serial.print(F(")宛でないため無視: ")); Serial.println(line);
+      continue;
+    }
+
+    // ★ステータス確認(statusOnly)はsleep/avg/medianを使わない（GAS側は0を送ってくる）ので
+    //   値域チェックの対象外にする。通常の設定変更だけ範囲を検証する。
+    //   attempts/seqはstatusOnlyでも使うため常に検証する。
+    if (attemptsRaw < 0 || attemptsRaw > 255 || seqRaw < 0) {
+      Serial.print(F("[CACHE] 値が範囲外のため無視: ")); Serial.println(line);
+      continue;
+    }
+    if (!statusOnly && (sleepMinRaw < 1 || sleepMinRaw > 1440 ||
+                        avgRaw < 1 || avgRaw > 255 ||
+                        medianRaw < 1 || medianRaw > 255)) {
+      Serial.print(F("[CACHE] 値が範囲外のため無視: ")); Serial.println(line);
+      continue;
+    }
+
+    uint8_t childId = (uint8_t)childIdRaw;  // 上で0x01〜0xFFに収まることを確認済み
+
+    s_pending[slot].active     = true;
+    s_pending[slot].childId    = childId;
+    s_pending[slot].sleepMin   = (uint16_t)sleepMinRaw;
+    s_pending[slot].avg        = (uint8_t)avgRaw;
+    s_pending[slot].median     = (uint8_t)medianRaw;
+    s_pending[slot].attempts   = (uint8_t)attemptsRaw;  // ★GAS側が正（Gatewayが再起動しても引き継がれる）
+    s_pending[slot].seq        = (uint32_t)seqRaw;
+    s_pending[slot].statusOnly = statusOnly;
+    s_pending[slot].lastSendMs = 0;  // キャッシュ更新時は抑制をリセット（新しい予約として扱う）
+    slot++;
+
+    Serial.print(F("[CACHE] 予約: 子機0x")); Serial.print(childId, HEX);
+    if (statusOnly) Serial.print(F(" ステータス確認のみ"));
+    Serial.print(F(" 間隔=")); Serial.print(sleepMinRaw);
+    Serial.print(F("分 平均=")); Serial.print(avgRaw);
+    Serial.print(F(" メジアン=")); Serial.print(medianRaw);
+    Serial.print(F(" 試行済=")); Serial.print(attemptsRaw);
+    Serial.print(F(" seq=")); Serial.println(seqRaw);
+  }
+  Serial.print(F("[CACHE] 有効な予約 ")); Serial.print(slot); Serial.println(F(" 件を保持しました"));
+}
+
+// 溜まった報告をGASへ送る。★loop()の安全な場所からのみ呼ぶこと
+// （loraPoll()の中から呼ぶとAT通信が入れ子になって破綻する）。
+static void processReportQueue() {
+  for (int i = 0; i < MAX_REPORTS; i++) {
+    if (!s_reports[i].used) continue;
+
+    // GAS側は child を大文字16進2桁で判定する（/^[0-9A-F]{2}$/）ため、ここで整形する
+    char childHex[3];
+    snprintf(childHex, sizeof(childHex), "%02X", s_reports[i].childId);
+
+    String q;
+    if (s_reports[i].finalResult) {
+      q  = "action=downlink_result&child="; q += childHex;
+      q += "&group=";    q += String(GATEWAY_GROUP_ID);
+      q += "&status=";   q += String(s_reports[i].status);
+      q += "&sleep=";    q += String(s_reports[i].sleepMin);
+      q += "&avg=";      q += String(s_reports[i].avg);
+      q += "&median=";   q += String(s_reports[i].median);
+      q += "&attempts="; q += String(s_reports[i].attempts);
+      q += "&seq=";      q += String(s_reports[i].seq);
+      q += "&wdt=";      q += String(s_reports[i].wdtMin);
+    } else {
+      q  = "action=downlink_sent&child="; q += childHex;
+      q += "&group=";    q += String(GATEWAY_GROUP_ID);
+      q += "&attempts="; q += String(s_reports[i].attempts);
+      q += "&seq=";      q += String(s_reports[i].seq);
+    }
+
+    Serial.print(F("[REPORT] GASへ報告: ")); Serial.println(q);
+    if (postToGAS(q)) {
+      s_reports[i].used = false;
+    } else {
+      Serial.println(F("[REPORT] 報告に失敗。次サイクルで再送します"));
+      return;  // 通信不調とみなし、残りは次回に回す
+    }
+  }
+}
+
+static bool hasQueuedReports() {
+  for (int i = 0; i < MAX_REPORTS; i++) if (s_reports[i].used) return true;
+  return false;
+}
+
+#endif  // COMM_MODE_LORA
+
+// GASへ1回問い合わせ、コマンドとダウンリンク予約を取り込む。
+// 戻り値: true=応答本文を取得できた / false=通信に失敗した（呼び出し側で再試行する）
+static bool checkRemoteCmdOnce() {
+  String query = "action=check_cmd&device_id=";
+  query += GW_DEVICE_ID;
+#ifdef COMM_MODE_LORA
+  // ★v1.20: dl=1 を付けると、応答の2行目以降にLoRaダウンリンクの予約が相乗りしてくる。
+  //   予約取得のためにHTTPリクエストを増やさずに済む（通信時間・失敗ポイントを増やさない）。
+  //   dl=1を送らない旧ファーム(gateway_v1.1)には従来どおり1行だけが返る（GAS側で分岐）。
+  //   groupはGASが自群宛ての予約だけを返すために使用する。
+  query += "&dl=1&group=";
+  query += String(GATEWAY_GROUP_ID);
+#endif
+
+  // ★2026-08-10(v1.20): AT+SH*系からAT+HTTPTOFS方式へ変更。
+  //   AT+SHREQはGASの302（chunked・Content-Lengthなし）の本文長を決定できず、
+  //   実機で +SHREQ: "GET",302,0 が返り続けて本文を読めなかった（理由はgasGetText()の
+  //   上のコメント参照）。リダイレクト追跡もgasGetText()の中で行う。
+  String cmd = gasGetText(query);
+  if (cmd.length() == 0) return false;
+
+  cmd.trim();
+
+#ifdef COMM_MODE_LORA
+  // ★v1.20: 2行目以降のダウンリンク予約をキャッシュへ取り込み、cmdは1行目だけに絞る。
+  //   （この分離をしないと "none\n08:..." のような文字列をコマンドとして判定してしまう）
+  applyDownlinkCache(cmd);
+  int nlPos = cmd.indexOf('\n');
+  if (nlPos >= 0) cmd = cmd.substring(0, nlPos);
+  cmd.trim();
+#endif
+
+  if (cmd.length() == 0 || cmd == "none") {
+    Serial.println(F("[CMD] 保留コマンドなし"));
+    return true;  // 通信は成功している（保留コマンドが無いだけ）
+  }
+
+  Serial.print(F("[CMD] 受信: ")); Serial.println(cmd);
+
+  // ★2026-08-04: ここまで到達できた（=コマンドを正しく受け取れた）ことが確定してから、
+  // 初めてGAS側に消費済みを通知する（ack_cmd）。リダイレクト追跡の失敗等で途中で
+  // return してしまった場合はack_cmdを呼ばないので、次サイクルで再送される。
+  String ackPath = "action=ack_cmd&device_id=";
+  ackPath += GW_DEVICE_ID;
+  postToGAS(ackPath);
+
+  if (cmd == "reset") {
+    Serial.println(F("[CMD] resetコマンドを受信。再起動します..."));
+    delay(200);
+    NVIC_SystemReset();
+  } else if (cmd == "stop") {
+    // ★2026-08-04: GASへのデータ送信のみ停止。BLE/LoRa受信・check_cmdの確認は継続する
+    // （継続しないと次のstartコマンドを受け取れず、リモートで再開できなくなるため）。
+    s_gasSendPaused = true;
+    Serial.println(F("[CMD] stopコマンドを受信。GASへのデータ送信を一時停止します"));
+  } else if (cmd == "start") {
+    s_gasSendPaused = false;
+    Serial.println(F("[CMD] startコマンドを受信。GASへのデータ送信を再開します"));
+  } else if (cmd == "send_now") {
+    // 次の flushRecords() 呼び出しを、一時停止中でも強制的に実行させる
+    s_forceSendOnce = true;
+    Serial.println(F("[CMD] send_nowコマンドを受信。今回のサイクルで送信します"));
+  } else if (cmd.startsWith("interval:")) {
+    // 例: "interval:10" → 送信間隔を10分に変更する
+    int minutes = cmd.substring(9).toInt();
+    if (minutes < 1 || minutes > 1440) {
+      Serial.print(F("[CMD] intervalの値が不正（1〜1440分の範囲で指定）: "));
+      Serial.println(cmd);
+    } else {
+      sendIntervalMs = (uint32_t)minutes * 60000UL;
+#ifdef COMM_MODE_LORA
+      saveConfig();  // 再起動後も維持されるよう内蔵フラッシュへ保存（LoRaビルドのみ）
+#endif
+      Serial.print(F("[CMD] 送信間隔を変更: ")); Serial.print(minutes); Serial.println(F("分"));
+    }
+  } else if (cmd == "status_now") {
+    sendStatusReport();
+  } else if (cmd == "rtc_resync") {
+    triggerRtcResync();
+  } else if (cmd == "log_dump") {
+    sendLogDumpToGAS();
+  } else {
+    Serial.println(F("  （未対応のコマンドのため無視）"));
+  }
+  return true;
+}
+
+// ★2026-08-10(v1.20): 失敗したその場で再試行する。
+//
+// 【なぜ必要か】GAS Web Appの応答は Transfer-Encoding: chunked（Content-Lengthなし）で、
+// AT+SHREQ が DataLen=0 を返して本文を読めないことが断続的に起こる（実機で確認済み。
+// AT+SHCONF="HEADERLEN"の上限が仕様上350バイトで、GASの1010バイトのヘッダーを
+// 保持できないことが背景にある。モジュール側の制約でこちらからは解消できない）。
+// 従来はここで諦めて次の確認周期（3〜15分後）まで何もしなかったため、予約がなかなか
+// 届かなかった。
+//
+// 【なぜ確認周期を短くするのではなく再試行なのか】確認周期を短くしても1回あたりの
+// 成功率は変わらないうえ、GAS通信中(s_atBusy)はダウンリンク送信を見送る設計のため、
+// 通信頻度を上げるほど「子機が起きた瞬間にAT通信中」となる確率が上がって逆効果になる。
+// 失敗したときだけ短い間隔でやり直すのが、通信量を増やさずに成功率を上げる方法。
+#define CMD_FETCH_MAX_ATTEMPTS 3
+#define CMD_FETCH_RETRY_WAIT_MS 5000UL
+
+void checkRemoteCmd() {
+  for (int attempt = 1; attempt <= CMD_FETCH_MAX_ATTEMPTS; attempt++) {
+    if (checkRemoteCmdOnce()) return;
+    if (attempt < CMD_FETCH_MAX_ATTEMPTS) {
+      Serial.print(F("[CMD] 取得に失敗（")); Serial.print(attempt);
+      Serial.print(F("回目/")); Serial.print(CMD_FETCH_MAX_ATTEMPTS);
+      Serial.println(F("）→ 5秒後にやり直します"));
+      // 待機中もLoRa受信を止めない（子機の起床を取りこぼさないため）
+      uint32_t t0 = millis();
+      while (millis() - t0 < CMD_FETCH_RETRY_WAIT_MS) {
+        wdtFeed();
+#ifdef COMM_MODE_LORA
+        loraPoll();
+#endif
+        yield();
+      }
+    } else {
+      Serial.println(F("[CMD] 取得に失敗。予約キャッシュは前回の内容を保持したまま次の周期で再試行します"));
+    }
+  }
+}
+
+// ══════════════════════════════════════════════
+// SD カード操作
+// ══════════════════════════════════════════════
+static bool sdAvailable = false;
+static uint32_t s_sdLogFailCount = 0;  // ★2026-07-25追加: 書き込み失敗の可視化用（従来は失敗が完全に無音だった）
+
+// gateway.csv への1行書き込み。戻り値は成否（呼び出し側でログ件数の実績と突き合わせられるように）。
+bool sdLog(String line) {
+  if (!sdAvailable) return false;
+  File f = SD.open("gateway.csv", FILE_WRITE);
+  if (!f) {
+    s_sdLogFailCount++;
+    Serial.print(F("✗ [SD] gateway.csv を開けませんでした（累計失敗 "));
+    Serial.print(s_sdLogFailCount);
+    Serial.println(F(" 回）"));
+    return false;
+  }
+  size_t written = f.println(line);
+  f.close();
+  if (written == 0) {
+    s_sdLogFailCount++;
+    Serial.print(F("✗ [SD] gateway.csv 書き込み失敗（累計失敗 "));
+    Serial.print(s_sdLogFailCount);
+    Serial.println(F(" 回）"));
+    return false;
+  }
+  return true;
+}
+
+// ══════════════════════════════════════════════
+// レコード更新（BLE/LoRa共通）
+//
+// mac は識別キー。BLEは実MACアドレス、LoRaはMACを持たないため
+// {0,0,0,0,0,DeviceID} の疑似MACで代用する（Device IDで一意性を担保）。
+// ══════════════════════════════════════════════
+// ★2026-07-26追加: I2C通信のノイズ（LTE-M送信中の電気的ノイズ等が疑われる）でDS3231から
+// 破損した値を読んでしまい、GAS側に全く見当違いな実測時刻が記録される事象を
+// project07_NEXCOの連続動作テストで確認した。年が明らかにおかしい場合は読み取り失敗と
+// みなし、直前の正常な値（fallbackEpoch）を代わりに使う。
+static uint32_t readRtcEpochSafe(uint32_t fallbackEpoch) {
+  if (!rtcAvailable) return 0;
+  DateTime now = rtc.now();
+  if (now.year() < 2026 || now.year() > 2035) {
+    Serial.print(F("✗ [RTC] 読み取り値が異常（年=")); Serial.print(now.year());
+    Serial.println(F("）。直前の値を使用します"));
+    return fallbackEpoch;
+  }
+  return (uint32_t)(now.unixtime() - JST_OFFSET_SEC);
+}
+
+static void updateRecordFromPayload(const uint8_t mac[6], const uint8_t *payload, uint8_t payloadLen, int rssi) {
+  if (xSemaphoreTake(recordMutex, 0) == pdTRUE) {
+    int idx = -1;
+    for (int i = 0; i < recordCount; i++) {
+      if (memcmp(records[i].mac, mac, 6) == 0) { idx = i; break; }
+    }
+    if (idx < 0 && recordCount < MAX_DEVICES) idx = recordCount++;
+    if (idx >= 0) {
+      memcpy(records[idx].mac, mac, 6);
+      memcpy(records[idx].payload, payload, payloadLen);
+      records[idx].payloadLen = payloadLen;
+      records[idx].rssi       = rssi;
+      records[idx].lastSeen   = millis();
+      records[idx].rtcEpoch   = readRtcEpochSafe(records[idx].rtcEpoch);
+    }
+    xSemaphoreGive(recordMutex);
+  }
+
+#if !LTEM_SEND_ENABLED
+  // LTE-M送信が無効な「SD記録のみモード」では、GAS送信サイクルを待たず
+  // 受信のたびに即座にSDへ記録する（flushRecords()は呼ばれないため）。
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X-%02X-%02X-%02X-%02X-%02X",
+           mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
+  String hex = "";
+  for (uint8_t j = 0; j < payloadLen; j++) {
+    if (payload[j] < 0x10) hex += '0';
+    hex += String(payload[j], HEX);
+  }
+  sdLog(getTimestamp() + "," + String(macStr) + "," + hex + "," + String(rssi));
+#endif
+}
+
+#ifdef COMM_MODE_BLE
+// ══════════════════════════════════════════════
+// BLE スキャンコールバック
+// ══════════════════════════════════════════════
+void scanCallback(ble_gap_evt_adv_report_t* report) {
+  // Manufacturer Specific Data を探す
+  uint8_t* data = report->data.p_data;
+  uint16_t len  = report->data.len;
+  uint8_t* msd  = nullptr;
+  uint8_t  msdLen = 0;
+
+  for (uint16_t i = 0; i + 1 < len; ) {
+    uint8_t fieldLen  = data[i];
+    if (fieldLen == 0) break;
+    if (i + fieldLen + 1 > len) break;  // 破損/不正パケットによるバッファ外読み出しを防ぐ
+    uint8_t fieldType = data[i + 1];
+    if (fieldType == 0xFF && fieldLen >= 3) {  // AD Type: Manufacturer Specific
+      if (data[i + 2] == MFR_COMPANY_ID_L && data[i + 3] == MFR_COMPANY_ID_H) {
+        msd    = &data[i + 4];               // Company ID の後ろがペイロード
+        msdLen = fieldLen - 3;
+        if (msdLen > MAX_PAYLOAD) msdLen = MAX_PAYLOAD;
+      }
+    }
+    i += fieldLen + 1;
+  }
+
+  if (msd == nullptr) { Bluefruit.Scanner.resume(); return; }
+  // 横河ver1.1のセンサフレームは18バイト固定（FW_VERSIONバイトを持たないFlexとは異なる
+  // レイアウト。project06_yokogawa/ver1.1/src/main.cpp 参照）。短いフレームを通すと、
+  // 後段でCH2〜8を未受信領域から読み出してクラウドへ送ってしまうため、
+  // PktType / DeviceID の判定より前に固定長を検証する。
+  if (msdLen != 18) {
+    Serial.print(F("[BLE] 不正なMSD長を破棄: "));
+    Serial.print(msdLen);
+    Serial.println(F(" バイト（期待値18）"));
+    Bluefruit.Scanner.resume();
+    return;
+  }
+  // MSD フォーマット: msd[0]=Pkt type, msd[1]=Device ID
+  uint8_t pktType  = (msdLen >= 1) ? msd[0] : 0xFF;
+  uint8_t deviceId = (msdLen >= 2) ? msd[1] : 0xFF;
+
+  // Company ID だけでは無関係な BLE 機器を誤検出することがあるため、
+  // Pkt type・Device ID がホワイトリストに一致するものだけを Flex とみなす
+  if (!isAllowedFlexPacket(pktType, deviceId)) {
+    // Company ID 0xFFFFの無関係な機器を毎回ログすると騒がしいだけなので出力しない（想定内の棄却）
+    Bluefruit.Scanner.resume();
+    return;
+  }
+
+  Serial.print(F("[BLE] MSD パケット受信 Device ID=0x"));
+  if (deviceId < 0x10) Serial.print('0');
+  Serial.println(deviceId, HEX);
+
+  updateRecordFromPayload(report->peer_addr.addr, msd, msdLen, report->rssi);
+
+  Bluefruit.Scanner.resume();
+}
+#endif  // COMM_MODE_BLE
+
+#ifdef COMM_MODE_LORA
+// ══════════════════════════════════════════════
+// LoRa（E220-900T22S(JP)）受信（v1.1新規）
+//
+// Flex側（Monita_Flex_構成_v3.10.md §6、v3.10_lora/main.cpp）が送るフレーム:
+//   [0]SYNC=0xAA [1]LEN [2..LEN+1]MSDペイロード [LEN+2]チェックサム(単純和)
+// MSDペイロードはBLEのMSDからCompany ID(2B)を除いた部分と同一レイアウト
+//   [0]PktType [1]DeviceID [2]FWVersion [3-10]CH1-4(int16 LE) [11-12]BATT
+//   [13]Hour [14]Min [15-18]CH1-4 Range
+//
+// M0・M1はGPIO1本（D3）で共通駆動する（本ファームは常にM0=M1で駆動するため、
+// 基板側でE220のM0・M1ピンを物理的に短絡しておくこと。回路図に反映要）。
+// UARTE1（第2ハードウェアUART）をRX専用として使う。
+// ★実機未検証: UARTE1経由の受信・チェックサム・M0/M1タイミングは基板完成後に実測・確認すること。
+// ══════════════════════════════════════════════
+#define LORA_MODE_SWITCH_DELAY_MS 100U  // 暫定値、要実測
+
+static Uart loraSerial(NRF_UARTE1, UARTE1_IRQn, LORA_RX_PIN, LORA_TX_PIN);
+
+// ★2026-07-23: Adafruit nRF52コアで第2UART(UARTE1)を自前で使う場合、割り込みハンドラを
+// このように手動で転送しないと send/receive の完了通知が届かず、write()が2バイト目以降で
+// 永久にブロックする（1バイト目は空バッファへ直接載るため気づかれにくい）。
+// 実機デバッグで loraSerial.write() が2回目の呼び出しで無期限にハングすることを確認し、
+// この転送関数が抜けていたことが原因と特定した。
+extern "C" void UARTE1_IRQHandler(void) {
+  loraSerial.IrqHandler();
+}
+
+static bool loraSetMode(bool high) {
+  digitalWrite(LORA_M0M1_PIN, high ? HIGH : LOW);
+  delay(LORA_MODE_SWITCH_DELAY_MS);
+  return true;
+}
+static inline bool loraModeNormal() { return loraSetMode(false); }
+static inline bool loraModeConfig() { return loraSetMode(true); }
+
+// 設定コマンド（Flex側 v3.10_lora/main.cpp と同一値。全台共通）。
+// レジスタ配置は E220-900T22S(JP) 公式データシート（CLEALINK TECHNOLOGY、Rev.2.1.1）
+// 表8〜11で確認済み（2026-07-17、test_sketches 18〜21 で実機検証済み）:
+//   0x03 REG1: bit1:0=送信出力(00=Not available/01=13dBm(default)/10=7dBm/11=0dBm)
+//   0x05 REG3: bit7=RSSIバイト有効化(0=無効(default)/1=有効) / bit6=送信方式(0=透過(default)/1=固定)
+// ★実機の工場出荷状態はREG1=0x00(送信出力Not available)・REG3=0x40(固定送信モード)
+//   という異常値だったため、透過送信・有効な送信出力になるよう明示的に書き込む。
+// ★Gateway（受信側）はRSSIバイト有効化(REG3 bit7=1)も設定し、受信データの直後に
+//   付加されるRSSIバイトをloraPoll()で読み取ってrecords[].rssiに反映する。
+#define LORA_CFG_REG_START 0x00
+#define LORA_CFG_REG_LEN   6
+static const uint8_t LORA_CFG_ADDH = 0x00;
+static const uint8_t LORA_CFG_ADDL = 0x00;
+static const uint8_t LORA_CFG_REG0 = 0x68;  // UART9600bps + エア速度(SF7/BW125kHz、実機確認値)
+static const uint8_t LORA_CFG_REG1 = 0x01;  // ペイロード長200B(default)/RSSIノイズ無効/送信出力13dBm
+static const uint8_t LORA_CFG_REG2 = 0x00;  // チャンネル0
+static const uint8_t LORA_CFG_REG3 = 0x80;  // RSSIバイト有効化ON/透過送信モード
+
+static bool loraReadConfig(uint8_t *out6) {
+  // ★2026-07-23: 受信バッファの掃除ループに時間制限が無く、E220が継続的にバイトを
+  // 送り続ける状態（Configモードへの切替失敗等でNormalモードのまま無線ノイズを
+  // 垂れ流している場合等）になるとここで無限ループしフリーズすることが判明。
+  // 掃除は最大300msまでとし、それでも終わらなければ異常とみなして打ち切る。
+  {
+    unsigned long drainStart = millis();
+    while (loraSerial.available()) {
+      loraSerial.read();
+      if (millis() - drainStart > 300UL) {
+        Serial.println(F("[LORA] 受信バッファの掃除がタイムアウト（E220がConfigモードに"
+                          "切り替わっていない、またはノイズを継続受信している可能性）"));
+        break;
+      }
+    }
+  }
+  loraSerial.write((uint8_t)0xC1);
+  loraSerial.write((uint8_t)LORA_CFG_REG_START);
+  loraSerial.write((uint8_t)LORA_CFG_REG_LEN);
+
+  const int respLen = 3 + LORA_CFG_REG_LEN;
+  uint8_t resp[3 + LORA_CFG_REG_LEN];
+  int idx = 0;
+  unsigned long t0 = millis();
+  while (millis() - t0 < 500UL && idx < respLen) {
+    if (loraSerial.available()) resp[idx++] = (uint8_t)loraSerial.read();
+  }
+  if (idx < respLen) return false;
+  if (resp[0] != 0xC1) return false;
+  memcpy(out6, &resp[3], LORA_CFG_REG_LEN);
+  return true;
+}
+
+static void loraWriteConfig() {
+  loraSerial.write((uint8_t)0xC0);
+  loraSerial.write((uint8_t)LORA_CFG_REG_START);
+  loraSerial.write((uint8_t)LORA_CFG_REG_LEN);
+  loraSerial.write(LORA_CFG_ADDH);
+  loraSerial.write(LORA_CFG_ADDL);
+  loraSerial.write(LORA_CFG_REG0);
+  loraSerial.write(LORA_CFG_REG1);
+  loraSerial.write(LORA_CFG_REG2);
+  loraSerial.write(LORA_CFG_REG3);
+  delay(200);
+  unsigned long t0 = millis();
+  while (millis() - t0 < 300UL) { while (loraSerial.available()) loraSerial.read(); }
+}
+
+// デバッグ用: 6バイトをHEXで出力（期待値と実測値の突き合わせに使う）
+static void loraPrintRegs(const char* label, const uint8_t regs[LORA_CFG_REG_LEN]) {
+  Serial.print(F("[LORA] ")); Serial.print(label); Serial.print(F(": "));
+  for (int i = 0; i < LORA_CFG_REG_LEN; i++) {
+    if (regs[i] < 0x10) Serial.print('0');
+    Serial.print(regs[i], HEX);
+    Serial.print(' ');
+  }
+  Serial.println();
+}
+
+// 起動時に1回呼ぶ（Gatewayは常時稼働のためFlexのように毎起床では確認しない）。
+// 現在の設定値を確認し、想定値と異なれば書き込む。
+static bool loraCheckAndConfigure() {
+  if (!loraModeConfig()) return false;
+
+  uint8_t cur[LORA_CFG_REG_LEN] = {0};
+  bool readOk = loraReadConfig(cur);
+  bool matches = readOk &&
+      cur[0] == LORA_CFG_ADDH && cur[1] == LORA_CFG_ADDL &&
+      cur[2] == LORA_CFG_REG0 && cur[3] == LORA_CFG_REG1 &&
+      cur[4] == LORA_CFG_REG2 && cur[5] == LORA_CFG_REG3;
+
+  Serial.print(F("[LORA] config read "));
+  Serial.println(!readOk ? F("失敗") : (matches ? F("一致") : F("不一致→書込")));
+  if (readOk) {
+    loraPrintRegs("実測値(読込)", cur);
+    uint8_t expected[LORA_CFG_REG_LEN] = {LORA_CFG_ADDH, LORA_CFG_ADDL, LORA_CFG_REG0,
+                                           LORA_CFG_REG1, LORA_CFG_REG2, LORA_CFG_REG3};
+    loraPrintRegs("期待値      ", expected);
+  }
+
+  if (!readOk) { loraModeNormal(); return false; }
+
+  if (!matches) {
+    // ★2026-07-23: 書込直後の確認読み込みがタイミング次第で失敗することがある
+    // （E220内部のレジスタ書込処理完了前に読み返してしまう等）と実機で確認したため、
+    // 最大2回まで「書込→確認」をリトライする。
+    bool verifyOk = false;
+    for (int attempt = 1; attempt <= 2 && !verifyOk; attempt++) {
+      loraWriteConfig();
+      // 書込後に読み返して実際に反映されたか確認する（配線不良等で書込が効いていないケースの検出）
+      uint8_t verify[LORA_CFG_REG_LEN] = {0};
+      bool verifyReadOk = loraReadConfig(verify);
+      verifyOk = verifyReadOk &&
+          verify[0] == LORA_CFG_ADDH && verify[1] == LORA_CFG_ADDL &&
+          verify[2] == LORA_CFG_REG0 && verify[3] == LORA_CFG_REG1 &&
+          verify[4] == LORA_CFG_REG2 && verify[5] == LORA_CFG_REG3;
+
+      Serial.print(F("[LORA] config write 確認("));
+      Serial.print(attempt); Serial.print(F("/2): "));
+      Serial.println(verifyOk ? F("OK") : F("NG"));
+      if (verifyReadOk) loraPrintRegs("書込後の実測値", verify);
+      else              Serial.println(F("[LORA] 書込後の読込自体に失敗（応答なし）"));
+    }
+    if (!verifyOk) {
+      Serial.println(F("[LORA] 2回とも書込確認NG（配線・電源を確認）"));
+      loraModeNormal();
+      return false;
+    }
+  }
+
+  return loraModeNormal();
+}
+
+// 受信フレームの組み立てバッファ（状態機械）
+//
+// E220はREG3(bit7=RSSIバイト有効化)の設定により、受信データの直後にRSSIバイトを
+// 自動付加する（dBm = RSSIバイト－256、公式データシート記載の式）。
+// そのためチェックサム確認後、もう1バイト（RSSI）を待ってからフレーム完成とする。
+//
+// ★E220-900T22S(JP)の受信感度限界は公式データシート記載でおよそ-140dBm付近
+//   （それを下回ると復調できずパケットロスになる）。実運用でRSSIが-140dBm近く
+//   まで下がってくる現場では、送信距離・アンテナ設置・障害物を見直すこと。
+//   （2026-07-17、test_sketches 18〜21 での実機検証・データシート確認より）
+// フレーム途中（SYNC受信後〜RSSI受信前）で一定時間バイトが届かない場合、
+// バイト抜け等で永久に詰まった状態になるのを防ぐため探索状態へ強制的に戻す
+// （19_lora_parentで発見・対策した「途中で受信が止まり続きのバイトが来ない」
+// 問題と同種の対策。2026-07-17追加）。
+#define LORA_FIELD_TIMEOUT_MS 500UL
+
+enum LoraRxState { LORA_WAIT_SYNC, LORA_WAIT_LEN, LORA_WAIT_BODY, LORA_WAIT_CKSUM, LORA_WAIT_RSSI };
+static LoraRxState s_loraState = LORA_WAIT_SYNC;
+static uint8_t     s_loraLen = 0;
+static uint8_t     s_loraBody[MAX_PAYLOAD];
+static uint8_t     s_loraBodyIdx = 0;
+static uint8_t     s_loraSum = 0;
+static uint8_t     s_loraRssiRaw = 0;
+static uint32_t    s_loraFieldStartMs = 0;
+
+// ★2026-07-29追加: 「USBホストが居ないとLoRa受信が止まる」現象の切り分け用カウンタ。
+// PCにシリアル接続できない状態でもBLEステータス経由で中身を確認できるようにする。
+// これで以下の3つを区別できる:
+//   生バイト数=0          → E220が何も出力していない（RF受信していない/モード違い）
+//   バイトは来るがCKSUM NG → UART通信が化けている
+//   CKSUM OKだが受信台数0  → 受信後のフィルタ（isAllowedFlexPacket等）で弾かれている
+static uint32_t s_loraRxBytes    = 0;  // UARTE1から読んだ生バイトの累計
+static uint32_t s_loraCksumNg    = 0;
+static uint32_t s_loraRejected = 0;  // 受信フィルタで棄却したフレーム数（下記の理由別カウンタの合計）
+// ★2026-08-28: 棄却理由を分けて数える。「電波は来ているのに受信台数0」のとき、
+//   群の焼き間違い（群不一致）と別プロトコルの混信（PktType不一致）と
+//   ID無効値（下位5bit=0）を切り分けられるようにするため。
+static uint32_t s_loraRejPktType = 0;  // PktTypeが期待値(0x04)と違う
+static uint32_t s_loraRejGroup   = 0;  // DeviceID上位3bitが自群と不一致
+static uint32_t s_loraRejLocalNo = 0;  // DeviceID下位5bitが0（無効値）
+static uint32_t s_loraRejLen     = 0;  // センサフレーム長が29バイトでない
+static uint32_t s_loraFramesOk   = 0;  // チェックサムまで通ったフレーム数
+static bool     s_loraConfigOk   = false;  // 起動時のconfig check結果
+
+// ★2026-07-29追加: UARTE1 受信ストールからの自己復旧。
+// Adafruit nRF52コアのUartドライバは RXD.MAXCNT=1 の1バイトDMAで、
+// 「ENDRX割り込みの中でのみ TASKS_STARTRX を再発行する」構造になっている
+// （framework-arduinoadafruitnrf52/cores/nRF5/Uart.cpp の IrqHandler 参照）。
+// このため割り込み連鎖が一度でも途切れると受信が永久に再開せず、
+// EVENTS_ERROR（オーバーラン等）は有効化もクリアもされていないため検出もされない。
+// 実際「起動時のconfig readは成功するのに、その後は永久に0バイト」という
+// 症状が出たため、一定時間受信が無ければRXを再起動して自力復帰させる。
+#define LORA_RX_STALL_MS 30000UL   // この時間1バイトも来なければストールとみなす
+static uint32_t s_loraLastRxMs  = 0;  // 最後に1バイト受信した時刻
+static uint32_t s_loraRekicks   = 0;  // RX再起動の実行回数
+static uint8_t  s_loraErrSrcAcc = 0;  // 観測したERRORSRCの累積OR（bit0=OVERRUN,1=PARITY,2=FRAMING,3=BREAK）
+
+// ★2026-07-29追加: 「本当に通常モード(Mode0)にいるか」をM0/M1に触らずに検査する。
+// Mode0(透過)では 0xC1... は設定コマンドとして解釈されず、そのまま電波として送出されるため
+// 応答は返ってこない。逆に応答が返れば、モジュールは設定モード(Mode3)に留まっている＝
+// M0/M1の制御が効いていない。Mode3ではRF受信を行わないので「コマンドには応答するが
+// 受信データが1バイトも出ない」という症状の説明になる。
+static bool s_loraProbeDone     = false;  // 検査を実施したか
+static bool s_loraProbeInConfig = false;  // 検査結果: trueなら設定モードのままだった
+static void loraProbeMode() {
+  while (loraSerial.available()) loraSerial.read();
+  loraSerial.write((uint8_t)0xC1);
+  loraSerial.write((uint8_t)LORA_CFG_REG_START);
+  loraSerial.write((uint8_t)1);
+
+  bool answered = false;
+  unsigned long t0 = millis();
+  while (millis() - t0 < 300UL) {
+    if (loraSerial.available()) { answered = true; break; }
+  }
+  while (loraSerial.available()) loraSerial.read();  // 応答は読み捨て（受信カウンタを汚さない）
+
+  s_loraProbeDone     = true;
+  s_loraProbeInConfig = answered;
+  Serial.print(F("[LORA] モード検査: "));
+  Serial.println(answered ? F("★設定モード(Mode3)のまま＝M0/M1制御が効いていない")
+                          : F("通常モード(Mode0)にいる＝モードは正常"));
+}
+
+// ★2026-07-29追加: 起動直後のE220「受信不能ラッチ」を解除するキック送信。
+//
+// 【経緯】バッテリー給電時に、E220がコマンド(Config)には正常応答するのに
+// 通常モードでRF受信データを1バイトも出さない状態が再現した。UARTのエラーは0、
+// M0/M1も通常モードと確認済み（loraProbeMode()）、UARTEの再武装も無効だったため、
+// E220モジュール内部が受信不能状態でラッチしていたと考えられる。
+// 実機では「通常モードで数バイト送信させる」と受信が復活することを確認した
+// （PC給電では再現せず、電源投入時の電圧の立ち上がり方が引き金と推定）。
+// XIAOをリセットしてもE220は給電され続けるため、この状態はMCUのリセットでは解除されない。
+//
+// 送出する3バイトは全て0x00。受信側の状態機械は同期バイト0xAAを探すため、
+// 他機がこれをフレームとして誤認することはない。
+static void loraKickTx() {
+  const uint8_t dummy[3] = {0x00, 0x00, 0x00};
+  loraSerial.write(dummy, sizeof(dummy));
+  loraSerial.flush();
+  delay(200);  // 送信完了待ち（AUX未接続のため固定ディレイ）
+  while (loraSerial.available()) loraSerial.read();  // 反射・エコーがあれば捨てる
+}
+
+// UARTE1のエラー要因を回収し、受信が止まっていれば受信を再起動する
+static void loraRxWatchdog() {
+  // ERRORSRCは書き戻すとクリアされる。何が起きたかを累積して残す
+  uint32_t errsrc = NRF_UARTE1->ERRORSRC;
+  if (errsrc) {
+    NRF_UARTE1->ERRORSRC = errsrc;
+    s_loraErrSrcAcc |= (uint8_t)(errsrc & 0x0F);
+  }
+  if (NRF_UARTE1->EVENTS_ERROR) NRF_UARTE1->EVENTS_ERROR = 0;
+
+  // ★2026-08-10追加: AT通信中はキック処理（loraModeNormal()のdelay＋loraKickTx()の
+  // UART書き込み＋delay）を先送りする。sendAT()の待機ループ中はloraPoll()が呼ばれ
+  // 続けるため、その中でここが発火すると、SIM7080Gへ送信中のAT文字列がバイト単位で
+  // 化けてERRORになる事象を03_lora_downlink_sender（同一のGAS通信ロジック）で
+  // 実機確認した。s_loraLastRxMsを更新しないため、AT通信が終わった直後の
+  // loraPoll()呼び出しで改めてこの条件に入り、確実にキックされる。
+  if (s_atBusy) return;
+
+  if (millis() - s_loraLastRxMs >= LORA_RX_STALL_MS) {
+    s_loraLastRxMs = millis();  // 次の判定まで再度この時間だけ待つ
+    s_loraRekicks++;
+    NRF_UARTE1->TASKS_STARTRX = 1;  // DMA受信を再武装する（既に動作中でも実害はない）
+    Serial.print(F("[LORA] 受信ストール検出 → RX再起動 #"));
+    Serial.print(s_loraRekicks);
+    Serial.print(F(" ERRORSRC累積=0x"));
+    Serial.println(s_loraErrSrcAcc, HEX);
+
+    // 初回のストール時だけモードを検査する（毎回やると余計な電波を出すため）
+    if (!s_loraProbeDone) loraProbeMode();
+
+    // モードが設定側に張り付いている可能性に備え、通常モードを再設定してから
+    // 受信不能ラッチ解除のキックを送る（起動時と同じ処置。実機で復帰を確認済み）
+    loraModeNormal();
+    loraKickTx();
+  }
+}
+
+// 1バイト処理して、フレーム＋RSSIまで完成したら true を返す
+// （s_loraBody[0..s_loraLen-1]・s_loraRssiRaw が有効）
+static bool loraFeedByte(uint8_t b) {
+  switch (s_loraState) {
+    case LORA_WAIT_SYNC:
+      if (b == 0xAA) { s_loraSum = b; s_loraState = LORA_WAIT_LEN; s_loraFieldStartMs = millis(); }
+      return false;
+    case LORA_WAIT_LEN:
+      s_loraLen = b;
+      s_loraSum = (uint8_t)(s_loraSum + b);
+      s_loraBodyIdx = 0;
+      if (s_loraLen == 0 || s_loraLen > MAX_PAYLOAD) { s_loraState = LORA_WAIT_SYNC; return false; }
+      s_loraState = LORA_WAIT_BODY;
+      return false;
+    case LORA_WAIT_BODY:
+      s_loraBody[s_loraBodyIdx++] = b;
+      s_loraSum = (uint8_t)(s_loraSum + b);
+      if (s_loraBodyIdx >= s_loraLen) s_loraState = LORA_WAIT_CKSUM;
+      return false;
+    case LORA_WAIT_CKSUM:
+      if (b != s_loraSum) { s_loraCksumNg++; s_loraState = LORA_WAIT_SYNC; return false; }  // チェックサム不一致は破棄
+      s_loraState = LORA_WAIT_RSSI;
+      return false;
+    case LORA_WAIT_RSSI:
+      s_loraRssiRaw = b;
+      s_loraState = LORA_WAIT_SYNC;
+      return true;
+    default:
+      s_loraState = LORA_WAIT_SYNC;
+      return false;
+  }
+}
+
+// ── LoRa送信（★v1.20で追加。v1.1は受信専用だった） ──────────────────
+static void loraPrintFrameHex(const uint8_t *msd, uint8_t msdLen, uint8_t sum) {
+  Serial.print(F("[LORA] TXフレーム(HEX): AA "));
+  if (msdLen < 0x10) Serial.print('0');
+  Serial.print(msdLen, HEX);
+  Serial.print(' ');
+  for (uint8_t i = 0; i < msdLen; i++) {
+    if (msd[i] < 0x10) Serial.print('0');
+    Serial.print(msd[i], HEX);
+    Serial.print(' ');
+  }
+  if (sum < 0x10) Serial.print('0');
+  Serial.println(sum, HEX);
+}
+
+// ★フレーム全体をRAM上に組み立ててから1回のブロック書き込みで送る。
+//   バイト単位のwrite()だとFlex側に届かない実機不具合があった（19_lora_parentのPING送信で
+//   実績のある方式に揃えている）。
+static void loraSendFrame(const uint8_t *msd, uint8_t msdLen) {
+  uint8_t sum = (uint8_t)(0xAAU + msdLen);
+  for (uint8_t i = 0; i < msdLen; i++) sum = (uint8_t)(sum + msd[i]);
+
+  loraPrintFrameHex(msd, msdLen, sum);
+
+  uint8_t frame[3 + 32];  // [SYNC][LEN][payload...][checksum]
+  uint8_t n = 0;
+  frame[n++] = 0xAA;
+  frame[n++] = msdLen;
+  for (uint8_t i = 0; i < msdLen; i++) frame[n++] = msd[i];
+  frame[n++] = sum;
+
+  loraSerial.write(frame, n);
+  loraSerial.flush();
+}
+
+// ── ダウンリンク送信・確認応答（★v1.20で追加） ──────────────────────
+static const uint16_t DOWNLINK_COMPANY_ID   = 0xC0DE;  // 要: 子機ファームと一致させること
+static const uint8_t  DOWNLINK_PKT_TYPE     = 0x81;
+static const uint8_t  DOWNLINK_ACK_PKT_TYPE = 0x05;
+
+enum DownlinkFlag {
+  DL_FLAG_TIME       = 1u << 0,
+  DL_FLAG_SLEEP_MIN  = 1u << 1,
+  DL_FLAG_AVG_MEDIAN = 1u << 2,
+};
+
+// ★アップリンクを検知してから応答するまでの待ち時間。
+//
+// 【なぜ「即座」ではダメだったか】実機の計測で以下が判明した（子機の送信開始を0msとする）:
+//     85ms  子機のアップリンク送出完了
+//    110ms  Gatewayが検知 → 即座に応答すると…
+//    229ms  ダウンリンクが電波に乗る
+//    289ms  子機のE220がUARTへ出力するが、子機はまだ送信直後で受信が止まっており取りこぼす
+//    450ms  子機が受信復活＆受信窓を開く（もう手遅れ）
+//   つまりダウンリンクが「窓が開く前」に通り過ぎていた。窓を10秒に広げても改善しなかったのは
+//   このためで、受信機の故障でもタイミングの偶然でもなく、構造的に早すぎたのが原因。
+//
+// 【この値の決め方】子機が窓を開けるのは自分の送信開始から約450ms後。Gatewayの検知は
+// 約110ms後なので、そこから350ms以上待てば窓に入る。余裕を見て400msとし、実際の送出は
+// 検知から約520ms後（子機の窓が開いた70ms後）になる。子機の窓が2秒あるので十分内側。
+#define DOWNLINK_RESPONSE_DELAY_MS 400UL
+
+// GASから受け取ったパラメータでダウンリンクを送信する。
+// ★statusOnly=trueなら変更フラグを一切立てない(flags=0)。子機は変更が無くても確認応答
+//   （現在の設定値・WDTタイムアウト）を必ず返すため、設定を変えずに「ステータス確認」だけ
+//   行いたい時に使う。sleepMinutes等の値は送信されるが子機側では無視される。
+static void sendDownlinkCommand(uint8_t targetDeviceId, uint16_t sleepMinutes,
+                                uint8_t samplesPerAvg, uint8_t measureCount,
+                                bool statusOnly) {
+  loraModeNormal();  // Configモードへ入らず、Normalモードのまま送信する（実機確認済みの方式）
+
+  uint8_t flags = statusOnly ? 0 : (DL_FLAG_SLEEP_MIN | DL_FLAG_AVG_MEDIAN);
+
+  // 時刻欄はDL_FLAG_TIMEを立てていないため子機側で無視されるが、GatewayにはDS3231が
+  // あるので実時刻を載せておく（将来この機能を有効にする際にそのまま使える）。
+  DateTime now = rtc.now();
+
+  uint8_t payload[15];
+  payload[0]  = (uint8_t)(DOWNLINK_COMPANY_ID >> 8);
+  payload[1]  = (uint8_t)(DOWNLINK_COMPANY_ID & 0xFF);
+  payload[2]  = DOWNLINK_PKT_TYPE;
+  payload[3]  = targetDeviceId;
+  payload[4]  = flags;
+  payload[5]  = (uint8_t)(now.year() % 100);
+  payload[6]  = now.month();
+  payload[7]  = now.day();
+  payload[8]  = now.hour();
+  payload[9]  = now.minute();
+  payload[10] = now.second();
+  payload[11] = (uint8_t)(sleepMinutes >> 8);
+  payload[12] = (uint8_t)(sleepMinutes & 0xFF);
+  payload[13] = samplesPerAvg;
+  payload[14] = measureCount;
+
+  Serial.print(F("[DOWNLINK] 送信: 宛先=0x")); Serial.print(targetDeviceId, HEX);
+  Serial.print(F(" sleepMin=")); Serial.print(sleepMinutes);
+  Serial.print(F(" avg=")); Serial.print(samplesPerAvg);
+  Serial.print(F(" median=")); Serial.println(measureCount);
+
+  loraSendFrame(payload, sizeof(payload));
+  delay(300);  // 送信完了待ち（AUX未接続のため固定ディレイ）
+
+  // ★送信直後にUARTE1のDMA受信を明示的に再武装する。
+  // 実機で「ダウンリンクを1回送信した直後からGatewayの受信が完全に止まる」事象を確認した。
+  // 子機はこの直後（2秒の受信窓の中）に確認応答を返してくるため、ここで取りこぼすと
+  // 永久に確認が取れず再試行を繰り返すことになる。ストール検出を待たずに復帰させる。
+  NRF_UARTE1->TASKS_STARTRX = 1;
+}
+
+// 子機のアップリンクを検知したときの処理。予約があればダウンリンクを送る。
+static void onUplinkReceived(uint8_t childId) {
+  PendingDownlink* p = findPending(childId);
+  if (p == nullptr) return;
+
+  // ★AT通信中はダウンリンクを送らない。
+  //   sendAT()の待機ループからloraPoll()が呼ばれるため、ここでLoRa送信（UARTへの書き込みと
+  //   delay）を行うと、SIM7080Gへ送信中のATコマンド文字列がバイト単位で化ける事象を実機で
+  //   確認している（loraRxWatchdog()のs_atBusyと同じ理由）。
+  //   予約はactiveのまま残るので、子機の次の起床で改めて送信される（1周期遅れるだけ）。
+  if (s_atBusy) {
+    Serial.print(F("[DOWNLINK] 子機0x")); Serial.print(childId, HEX);
+    Serial.println(F(" のアップリンクを検知しましたが、AT通信中のため次サイクルに見送ります"));
+    return;
+  }
+
+  // ★子機の冗長送信（LORA_TX_REPEAT）を1回の起床として扱う。
+  //   これが無いと同じ起床で試行回数を複数消費してしまう。
+  if (p->lastSendMs != 0 && (millis() - p->lastSendMs) < DOWNLINK_DEDUP_MS) {
+    Serial.print(F("[DOWNLINK] 子機0x")); Serial.print(childId, HEX);
+    Serial.println(F(" の冗長送信とみなし、この分の応答は省略します"));
+    return;
+  }
+
+  if (p->attempts >= DOWNLINK_MAX_ATTEMPTS) {
+    // 規定回数送っても確認が返らなかった → 未達として打ち切り、GASへ報告する
+    Serial.print(F("[DOWNLINK] 子機0x")); Serial.print(childId, HEX);
+    Serial.print(F(" へ")); Serial.print(p->attempts);
+    Serial.println(F("回送信しましたが確認が返りません。未達として打ち切ります"));
+    queueReport(true, childId, DL_STATUS_NO_ACK, 0, 0, 0, p->attempts, p->seq);
+    p->active = false;
+    return;
+  }
+
+  p->attempts++;
+  Serial.print(F("[DOWNLINK] 子機0x")); Serial.print(childId, HEX);
+  Serial.print(F(" のアップリンクを検知（")); Serial.print(p->attempts);
+  Serial.print(F("回目/")); Serial.print(DOWNLINK_MAX_ATTEMPTS);
+  Serial.print(F("）→ ")); Serial.print(DOWNLINK_RESPONSE_DELAY_MS);
+  Serial.println(F("ms待ってから送信します（子機が受信窓を開くのを待つ）"));
+
+  // ★即座に送ると子機の受信窓が開く前に到着してしまう（DOWNLINK_RESPONSE_DELAY_MS参照）。
+  //   ここでloraPoll()付きの待機を使ってはいけない。この関数自体がloraPoll()から
+  //   呼ばれているため、待機中に別の子機のアップリンクが来ると再帰してしまう。
+  //   受信バイトはUARTE割り込みでリングバッファに積まれるので、ここでポーリングを止めても
+  //   取りこぼしにはならず、処理が数百ms遅れるだけで済む。
+  {
+    uint32_t t0 = millis();
+    while (millis() - t0 < DOWNLINK_RESPONSE_DELAY_MS) { wdtFeed(); yield(); }
+  }
+  sendDownlinkCommand(childId, p->sleepMin, p->avg, p->median, p->statusOnly);
+  p->lastSendMs = millis();
+  recordSent(childId, p->attempts, p->seq);  // 確認応答をこの予約に紐付けるための控え
+  queueReport(false, childId, 0, p->sleepMin, p->avg, p->median, p->attempts, p->seq);
+}
+
+// 子機からの確認応答を受けた時の処理。予約を完了扱いにし、結果をGASへ報告する。
+//   ack: [0]0x05 [1]DeviceID [2]status [3-4]適用sleepMin(BE) [5]適用avg [6]適用median
+//        [7-8]適用後に有効になるWDTタイムアウト(分,BE)
+static void onDownlinkAckReceived(const uint8_t* ack, uint8_t len) {
+  if (len < 7) return;
+  uint8_t  childId       = ack[1];
+  uint8_t  status        = ack[2];
+  uint16_t applied       = ((uint16_t)ack[3] << 8) | ack[4];
+  uint8_t  appliedAvg    = ack[5];
+  uint8_t  appliedMedian = ack[6];
+  // 旧フレーム(7バイト)との互換のため、WDT欄が無い場合は0扱いにする
+  uint16_t appliedWdtMin = (len >= 9) ? (((uint16_t)ack[7] << 8) | ack[8]) : 0;
+
+  // ★seqと試行回数は「実際に送信した時の控え」から取る。
+  //   現在のs_pending[]から取ると、送信〜応答の間にキャッシュ更新で新しい予約へ
+  //   入れ替わっていた場合に、古い応答を新しい予約の完了として誤報告してしまう。
+  SentDownlink* sent = findLastSent(childId);
+  if (sent == nullptr) {
+    Serial.print(F("[DOWNLINK] 送信控えが無い子機0x")); Serial.print(childId, HEX);
+    Serial.println(F(" からの応答のため無視します"));
+    return;
+  }
+  uint8_t  attempts = sent->attempts;
+  uint32_t seq      = sent->seq;
+
+  Serial.print(F("[DOWNLINK] ★子機0x")); Serial.print(childId, HEX);
+  Serial.print(F(" から確認応答: status=")); Serial.print(status);
+  Serial.print(F(" 適用値 間隔=")); Serial.print(applied);
+  Serial.print(F("分 平均=")); Serial.print(appliedAvg);
+  Serial.print(F(" メジアン=")); Serial.print(appliedMedian);
+  Serial.print(F(" WDT=")); Serial.print(appliedWdtMin); Serial.println(F("分"));
+
+  queueReport(true, childId, status, applied, appliedAvg, appliedMedian, attempts, seq, appliedWdtMin);
+  sent->valid = false;  // この控えは消費した
+
+  // ★再試行を止めてよいのは「今キャッシュにある予約」＝「今受け取った応答の予約」の時だけ。
+  //   応答待ちの間に新しい予約へ入れ替わっていた場合、その新しい予約はまだ未送信なので
+  //   activeのまま残し、次のアップリンクで送信されるようにする。
+  PendingDownlink* p = findPending(childId);
+  if (p != nullptr && p->seq == seq) p->active = false;
+}
+
+// loop() から毎回呼ぶ。受信バッファを読み切り、完成したフレームがあればレコードへ反映する。
+static void loraPoll() {
+  while (loraSerial.available()) {
+    uint8_t b = (uint8_t)loraSerial.read();
+    s_loraRxBytes++;
+    s_loraLastRxMs = millis();  // 受信が生きている証跡（ストール監視の基準）
+    if (loraFeedByte(b)) {
+      s_loraFramesOk++;
+      if (s_loraLen < 2) {
+        Serial.print(F("[LORA] 不正な短フレームを破棄: "));
+        Serial.print(s_loraLen);
+        Serial.println(F(" バイト"));
+        s_loraRejected++;
+        continue;
+      }
+      uint8_t pktType  = s_loraBody[0];
+      uint8_t deviceId = s_loraBody[1];
+
+      // ★v1.20: ダウンリンクの確認応答（子機→Gateway）。センサデータではないので
+      //   レコード更新には回さず、ここで処理を終える。
+      if (pktType == DOWNLINK_ACK_PKT_TYPE) {
+        onDownlinkAckReceived(s_loraBody, s_loraLen);
+        continue;
+      }
+
+      // 横河ver1.3のセンサデータは29バイト固定（PktType+DeviceID+CH1-5(int32×5)+
+      // CH6-8(int16×3)+予備1B。2026-09-10、CH1-5の小数精度確保のためint16→int32へ
+      // 拡張し19→29バイトに変更。project06_yokogawa/ver1.3/src/main.cpp 参照）。
+      // 短いフレームを許すと未受信のCHが残留値のままクラウドへ出るため、厳密一致で検証する。
+      if (s_loraLen != 29) {
+        Serial.print(F("[LORA] 不正なセンサフレーム長を破棄: "));
+        Serial.print(s_loraLen);
+        Serial.println(F(" バイト（期待値29）"));
+        s_loraRejected++;
+        s_loraRejLen++;
+        continue;
+      }
+
+      if (!isAllowedLoRaPacket(pktType, deviceId)) {
+        // ★無関係な電波を拾うたびにログを出すと埋もれるため本文は出さないが、
+        //   件数だけはハートビートに出す。棄却が増え続けている＝群の焼き間違いや
+        //   混信を疑う手がかりになる（以前は0x0Eの登録漏れをこれで見落とした）。
+        s_loraRejected++;
+        if (pktType != EXPECTED_PKT_TYPE)  s_loraRejPktType++;
+        else if ((deviceId & 0x1F) == 0)   s_loraRejLocalNo++;
+        else                               s_loraRejGroup++;
+        continue;
+      }
+      int rssiDbm = (int)s_loraRssiRaw - 256;
+      Serial.print(F("[LORA] フレーム受信 Device ID=0x"));
+      if (deviceId < 0x10) Serial.print('0');
+      Serial.print(deviceId, HEX);
+      Serial.print(F(" RSSI="));
+      Serial.print(rssiDbm);
+      Serial.println(F("dBm"));
+
+      // LoRaにはBLEのようなMACアドレスが無いため、DeviceIDで一意化した疑似MACを使う
+      uint8_t pseudoMac[6] = {0, 0, 0, 0, 0, deviceId};
+      updateRecordFromPayload(pseudoMac, s_loraBody, s_loraLen, rssiDbm);
+
+      // ★v1.20: 子機が起きた＝受信窓が開く直前。予約があればここでダウンリンクを送る。
+      //   センサデータの取り込みを先に済ませてから呼ぶこと（この中で数百ms待つため）。
+      onUplinkReceived(deviceId);
+    }
+  }
+
+  // フレーム途中で一定時間バイトが届かない場合は同期探索状態へ強制的に戻す
+  // （バイト抜け等で永久に詰まった状態になるのを防ぐ）
+  if (s_loraState != LORA_WAIT_SYNC && millis() - s_loraFieldStartMs > LORA_FIELD_TIMEOUT_MS) {
+    Serial.println(F("[LORA] フレーム途中でタイムアウト。再同期します"));
+    s_loraState = LORA_WAIT_SYNC;
+  }
+
+  loraRxWatchdog();  // UARTE1のRXが止まっていないか監視し、必要なら再起動する
+}
+#endif  // COMM_MODE_LORA
+
+// ネットワーク登録状態を簡易確認し、切れていれば再接続する
+// （長時間運用中に基地局都合で接続が切れるケースへの対策）
+bool ensureNetworkReady() {
+  String att = sendAT("AT+CGATT?", 3000);
+  if (att.indexOf("+CGATT: 1") >= 0) return true;
+
+  Serial.println(F("⚠ ネットワーク切断を検知。再接続を試みます..."));
+  return initNetwork();
+}
+
+#ifdef MQTT_CMD_ENABLED
+// ══════════════════════════════════════════════
+// MQTT経由のリモートコマンド受信（★2026-08-03追加、テスト段階）
+// ══════════════════════════════════════════════
+// SIM7080G内蔵MQTTクライアント（AT+SM*系コマンド）でEMQXブローカーに接続し、
+// cmdトピックを購読してコマンドを受け取る。既存の5分おきの送信サイクルに
+// 相乗りさせる形（毎回、短時間だけMQTT接続→cmd確認→切断）で、常時接続は行わない。
+// 今はペイロードが"reset"のときだけ対応（NVIC_SystemResetで再起動）。
+//
+// 接続情報は現状テスト用の共有アカウント（device_user）を使用。本運用時は
+// Gateway専用のEMQXユーザーを発行し、ここを差し替えること。
+//
+// ★2026-08-04: test.mosquitto.org:1883（平文）で自前MQTT実装（CONNECT/SUBSCRIBE/
+// PUBLISH受信）の正しさを検証済み。TLS対応も完了したので、本来の接続先であるEMQX（8883、
+// TLS必須）に戻す。切り分け用に平文ブローカーへ戻したい場合はここを1にする。
+#define MQTT_USE_PLAIN_TEST_BROKER 0
+
+#if MQTT_USE_PLAIN_TEST_BROKER
+static char const* MQTT_HOST      = "test.mosquitto.org";
+static int  const  MQTT_PORT      = 1883;
+static char const* MQTT_USERNAME  = "";   // 空文字なら認証情報を送らない
+static char const* MQTT_PASSWORD  = "";
+static char const* MQTT_CMD_TOPIC = "monita/gw/test/cmd";  // 公開ブローカー上の検証用トピック
+#else
+static char const* MQTT_HOST      = "l7921bd0.ala.asia-southeast1.emqxsl.com";
+static int  const  MQTT_PORT      = 8883;
+static char const* MQTT_USERNAME  = "device_user";
+static char const* MQTT_PASSWORD  = "123456789";
+static char const* MQTT_CMD_TOPIC = "v1/device_user/cmd";
+#endif
+// CLEANSS=0（永続セッション）でオフライン中に届いたコマンドも取りこぼさないようにするため、
+// 毎回同じClientIDで接続する必要がある（ClientIDが変わるとブローカー側で別セッション扱いになる）。
+static char const* MQTT_CLIENT_ID = "monita_gw_v11_test";
+
+// ★2026-08-04: モジュール内蔵MQTTスタック（AT+SM*系）は、このモジュール
+// （1951B17SIM7080 / SIM7080G_P1.03_20210823）では動作しないことを実機で確認済み。
+// 設定値の格納・PDP有効・セッション無し・TLS無し・公開ブローカー・認証無し・HTTP未使用と
+// あらゆる条件を潰してもAT+SMCONNが数秒かけて "+CME ERROR: operation not allowed" を返す一方、
+// 同じホスト・同じポートへの生TCP接続（AT+CAOPEN）は1秒未満で成功する（+CAOPEN: 0,0）。
+// そのため、生TCPソケットの上にMQTTプロトコルを自前で実装する方式に切り替えた。
+//
+// 実装しているのはMQTT 3.1.1のうち本用途に必要な最小限:
+//   CONNECT / CONNACK / SUBSCRIBE / SUBACK / PUBLISH(受信) / PINGREQ / DISCONNECT
+// QoSは0のみ（コマンド受信用途では再送より単純さを優先。取りこぼしは次サイクルで拾える）。
+
+// 生TCPソケットのID（AT+CACIDで選択する識別子）
+static int const MQTT_TCP_CID = 0;
+
+// ── MQTTパケット組み立てのヘルパ ──
+
+// 残り長（Remaining Length）を可変長バイト列でバッファへ書く。MQTTの可変長整数形式。
+static int mqttWriteRemainingLength(uint8_t* buf, int len) {
+  int i = 0;
+  do {
+    uint8_t b = len % 128;
+    len /= 128;
+    if (len > 0) b |= 0x80;
+    buf[i++] = b;
+  } while (len > 0);
+  return i;
+}
+
+// UTF-8文字列を「2バイトの長さ + 本体」の形式でバッファへ書く（MQTTの文字列表現）
+static int mqttWriteString(uint8_t* buf, const char* str) {
+  int len = strlen(str);
+  buf[0] = (uint8_t)(len >> 8);
+  buf[1] = (uint8_t)(len & 0xFF);
+  memcpy(buf + 2, str, len);
+  return len + 2;
+}
+
+// 生TCPソケットへ任意のバイト列を送信する（AT+CASEND）
+static bool mqttTcpSend(const uint8_t* data, int len) {
+  char cmd[48];
+  snprintf(cmd, sizeof(cmd), "AT+CASEND=%d,%d,5000", MQTT_TCP_CID, len);
+  Serial1.print(cmd); Serial1.print("\r\n");
+
+  // ">" プロンプトを待ってからデータ本体を送る
+  String res = "";
+  long start = millis();
+  while (millis() - start < 5000) {
+    wdtFeed();
+    while (Serial1.available()) res += (char)Serial1.read();
+    if (res.indexOf(">") >= 0) break;
+    yield();
+  }
+  if (res.indexOf(">") < 0) {
+    Serial.println(F("✗ [MQTT] CASEND: 入力プロンプトが返らない"));
+    return false;
+  }
+
+  Serial1.write(data, len);
+
+  res = "";
+  start = millis();
+  while (millis() - start < 5000) {
+    wdtFeed();
+    while (Serial1.available()) res += (char)Serial1.read();
+    if (res.indexOf("OK") >= 0 || res.indexOf("ERROR") >= 0) break;
+    yield();
+  }
+  return res.indexOf("OK") >= 0;
+}
+
+// AT+CARECVを1回だけ発行し、その時点でバッファにあるデータを取り出す（無ければ即0で返る）。
+// 応答は "+CARECV: <長さ>,<データ>" の形式で、データ部はバイナリのまま返る。
+static int mqttTcpRecvOnce(uint8_t* outBuf, int maxLen) {
+  char cmd[32];
+  snprintf(cmd, sizeof(cmd), "AT+CARECV=%d,%d", MQTT_TCP_CID, maxLen);
+  Serial1.print(cmd); Serial1.print("\r\n");
+
+  // 応答をバイト列として受け取る（バイナリを含むためStringではなく生バッファで扱う）
+  static uint8_t raw[600];
+  int rawLen = 0;
+  long start = millis();
+  bool sawTerminator = false;
+  while (millis() - start < 3000) {
+    wdtFeed();
+    while (Serial1.available() && rawLen < (int)sizeof(raw)) {
+      raw[rawLen++] = (uint8_t)Serial1.read();
+    }
+    // 末尾に "OK\r\n" か "ERROR" が来たら受信完了とみなす
+    if (rawLen >= 4) {
+      for (int i = 0; i <= rawLen - 4; i++) {
+        if (raw[i] == 'O' && raw[i+1] == 'K' && raw[i+2] == '\r' && raw[i+3] == '\n') { sawTerminator = true; break; }
+      }
+    }
+    if (sawTerminator) break;
+    yield();
+  }
+  if (rawLen == 0) return 0;
+
+  // "+CARECV: " を探し、その後ろの "<長さ>," を読んでデータ開始位置を求める
+  int hdr = -1;
+  for (int i = 0; i <= rawLen - 9; i++) {
+    if (memcmp(raw + i, "+CARECV: ", 9) == 0) { hdr = i + 9; break; }
+  }
+  if (hdr < 0) return 0;
+
+  int recvLen = 0;
+  int p = hdr;
+  while (p < rawLen && raw[p] >= '0' && raw[p] <= '9') {
+    recvLen = recvLen * 10 + (raw[p] - '0');
+    p++;
+  }
+  if (p >= rawLen || raw[p] != ',') return 0;
+  p++;  // カンマの次がデータ本体
+
+  if (recvLen <= 0) return 0;
+  if (recvLen > maxLen) recvLen = maxLen;
+  if (p + recvLen > rawLen) recvLen = rawLen - p;  // 取りこぼし時は取れた分だけ
+
+  memcpy(outBuf, raw + p, recvLen);
+  return recvLen;
+}
+
+// ★2026-08-04修正: AT+CARECVは「その時点でバッファにあるデータ」を即座に返すだけで、
+// データが届くまで待ってはくれない（ブローカー側の応答はネットワーク越しに数百ms〜数秒
+// かかるため、送信直後に1回呼ぶだけでは常に「受信0バイト」になっていた）。
+// 到着まで一定間隔でCARECVを再発行するポーリングループでラップする。
+static int mqttTcpRecv(uint8_t* outBuf, int maxLen, int waitMs) {
+  long start = millis();
+  while (millis() - start < waitMs) {
+    wdtFeed();
+    int n = mqttTcpRecvOnce(outBuf, maxLen);
+    if (n > 0) return n;
+    delay(300);
+  }
+  return 0;
+}
+
+// MQTT CONNECTパケットを送り、CONNACKで接続が受理されたかを確認する
+static bool mqttSendConnect() {
+  uint8_t pkt[256];
+  uint8_t payload[200];
+  int pl = 0;
+
+  // 可変ヘッダ: プロトコル名"MQTT" + レベル4(3.1.1) + 接続フラグ + KeepAlive
+  pl += mqttWriteString(payload + pl, "MQTT");
+  payload[pl++] = 0x04;  // Protocol Level 4 = MQTT 3.1.1
+
+  // 接続フラグ: CleanSession(0x02) + UserName(0x80) + Password(0x40)
+  uint8_t flags = 0x02;
+  bool useAuth = (strlen(MQTT_USERNAME) > 0);
+  if (useAuth) flags |= 0x80 | 0x40;
+  payload[pl++] = flags;
+
+  payload[pl++] = 0x00; payload[pl++] = 0x3C;  // KeepAlive = 60秒
+
+  // ペイロード: ClientID [+ UserName + Password]
+  pl += mqttWriteString(payload + pl, MQTT_CLIENT_ID);
+  if (useAuth) {
+    pl += mqttWriteString(payload + pl, MQTT_USERNAME);
+    pl += mqttWriteString(payload + pl, MQTT_PASSWORD);
+  }
+
+  int i = 0;
+  pkt[i++] = 0x10;  // CONNECT
+  i += mqttWriteRemainingLength(pkt + i, pl);
+  memcpy(pkt + i, payload, pl);
+  i += pl;
+
+  if (!mqttTcpSend(pkt, i)) return false;
+
+  uint8_t resp[16];
+  int n = mqttTcpRecv(resp, sizeof(resp), 10000);
+  if (n < 4 || resp[0] != 0x20) {
+    Serial.print(F("✗ [MQTT] CONNACKが返らない（受信"));
+    Serial.print(n); Serial.println(F("バイト）"));
+    return false;
+  }
+  // CONNACKの4バイト目が接続結果コード（0=受理）
+  if (resp[3] != 0x00) {
+    Serial.print(F("✗ [MQTT] ブローカーが接続を拒否 コード="));
+    Serial.println(resp[3]);
+    // 1=プロトコル版不可, 2=ClientID不可, 3=サーバ利用不可, 4=認証情報不正, 5=認可されていない
+    return false;
+  }
+  return true;
+}
+
+// 指定トピックをQoS0で購読する
+static bool mqttSendSubscribe(const char* topic) {
+  uint8_t pkt[192];
+  uint8_t payload[160];
+  int pl = 0;
+
+  payload[pl++] = 0x00; payload[pl++] = 0x01;  // Packet Identifier = 1
+  pl += mqttWriteString(payload + pl, topic);
+  payload[pl++] = 0x00;  // 要求QoS = 0
+
+  int i = 0;
+  pkt[i++] = 0x82;  // SUBSCRIBE（下位ビット0010は仕様で固定）
+  i += mqttWriteRemainingLength(pkt + i, pl);
+  memcpy(pkt + i, payload, pl);
+  i += pl;
+
+  if (!mqttTcpSend(pkt, i)) return false;
+
+  uint8_t resp[16];
+  int n = mqttTcpRecv(resp, sizeof(resp), 10000);
+  if (n < 4 || resp[0] != 0x90) {
+    Serial.println(F("✗ [MQTT] SUBACKが返らない"));
+    return false;
+  }
+  if (resp[4] == 0x80) {
+    Serial.println(F("✗ [MQTT] 購読が拒否された（ACLの権限を確認）"));
+    return false;
+  }
+  return true;
+}
+
+// 受信したPUBLISHパケットからペイロード（本文）を取り出す。
+// 取り出せた場合は true を返し、outPayload に文字列として格納する。
+static bool mqttParsePublish(const uint8_t* buf, int len, String& outPayload) {
+  if (len < 2 || (buf[0] & 0xF0) != 0x30) return false;  // 0x30 = PUBLISH
+
+  // 残り長（可変長整数）を読む
+  int p = 1;
+  int multiplier = 1;
+  int remainingLen = 0;
+  while (p < len) {
+    uint8_t b = buf[p++];
+    remainingLen += (b & 0x7F) * multiplier;
+    if ((b & 0x80) == 0) break;
+    multiplier *= 128;
+  }
+
+  if (p + 2 > len) return false;
+  int topicLen = (buf[p] << 8) | buf[p + 1];
+  p += 2 + topicLen;  // トピック名を読み飛ばす（QoS0なのでPacket Identifierは無い）
+  if (p > len) return false;
+
+  int payloadLen = remainingLen - (2 + topicLen);
+  if (payloadLen <= 0 || p + payloadLen > len) return false;
+
+  outPayload = "";
+  for (int i = 0; i < payloadLen; i++) outPayload += (char)buf[p + i];
+  return true;
+}
+
+#if !MQTT_USE_PLAIN_TEST_BROKER
+static bool s_mqttCaCertWritten = false;
+
+// EMQX用CA証明書（emqxsl_ca_cert.h、公開情報）をSIM7080Gのファイルシステムに書き込み、
+// SSL用形式に変換する。モジュール内蔵フラッシュに残るため、電源投入後1回だけでよい。
+static bool mqttWriteCaCert() {
+  if (s_mqttCaCertWritten) return true;
+
+  size_t certLen = strlen(EMQXSL_CA_CERT);
+
+  sendAT("AT+CFSINIT", 3000);
+
+  char cmd[64];
+  snprintf(cmd, sizeof(cmd), "AT+CFSWFILE=3,\"ca.crt\",0,%u,10000", (unsigned)certLen);
+  Serial1.print(cmd); Serial1.print("\r\n");
+
+  // "DOWNLOAD" プロンプトを待ってから、証明書本体を生データで送る
+  String res = "";
+  long start = millis();
+  while (millis() - start < 3000) {
+    wdtFeed();
+    while (Serial1.available()) res += (char)Serial1.read();
+    if (res.indexOf("DOWNLOAD") >= 0) break;
+    yield();
+  }
+  if (res.indexOf("DOWNLOAD") < 0) {
+    Serial.println(F("✗ [MQTT] CA証明書書き込み: DOWNLOADプロンプト待ちタイムアウト"));
+    sendAT("AT+CFSTERM", 3000);
+    return false;
+  }
+
+  Serial1.write((const uint8_t*)EMQXSL_CA_CERT, certLen);
+
+  res = "";
+  start = millis();
+  while (millis() - start < 5000) {
+    wdtFeed();
+    while (Serial1.available()) res += (char)Serial1.read();
+    if (res.indexOf("OK") >= 0) break;
+    yield();
+  }
+  if (res.indexOf("OK") < 0) {
+    Serial.println(F("✗ [MQTT] CA証明書の書き込みに失敗"));
+    sendAT("AT+CFSTERM", 3000);
+    return false;
+  }
+
+  // CFSTERM（フラッシュバッファ解放＝ファイル確定）を先に行ってから CONVERT する
+  sendAT("AT+CFSTERM", 3000);
+  sendAT("AT+CSSLCFG=\"CONVERT\",2,\"ca.crt\"", 5000);
+
+  s_mqttCaCertWritten = true;
+  Serial.println(F("✓ [MQTT] CA証明書をモジュールへ書き込み完了"));
+  return true;
+}
+
+// 生TCPソケット（AT+CACID/CAOPEN経由）にTLSを適用する設定を行う。
+// SSLコンテキストはctxindex=2を使う（GAS用HTTPS(ctxindex=1)とはSNIが異なるため分離必須。
+// 詳細はmqttCheckAndHandleCmd()導入時のコメント参照）。
+static bool mqttSetupTls() {
+  if (!mqttWriteCaCert()) return false;
+
+  sendAT("AT+CMEE=2", 3000);  // 詳細なエラーコードを返すようにする（デバッグ用）
+  sendAT("AT+CSSLCFG=\"sslversion\",2,3", 3000);       // TLS1.2
+  sendAT("AT+CSSLCFG=\"ignorertctime\",2,1", 3000);    // RTC未同期でも証明書の期限切れ扱いにしない
+  sendAT("AT+CSSLCFG=\"sni\",2,\"" + String(MQTT_HOST) + "\"", 3000);
+
+  // ★2026-08-04: AT+CACIDは「既に選択済みの値と同じcidを再度書き込む」とERRORになることを確認した
+  // （実機で AT+CACID? が "+CACID: 0" を返しているのに AT+CACID=0 がERRORになる事象）。
+  // 既定でcid=0が選択されているため、目的のcidと異なる場合のみ書き込む。
+  String curCid = sendAT("AT+CACID?", 3000);
+  Serial.print(F("[MQTT-DBG] CACID?: ")); Serial.println(curCid);
+  if (curCid.indexOf("+CACID: " + String(MQTT_TCP_CID)) < 0) {
+    Serial.print(F("[MQTT-DBG] CACID=: ")); Serial.println(sendAT("AT+CACID=" + String(MQTT_TCP_CID), 3000));
+  }
+
+  Serial.print(F("[MQTT-DBG] CASSLCFG=?: ")); Serial.println(sendAT("AT+CASSLCFG=?", 3000));
+  Serial.print(F("[MQTT-DBG] CASSLCFG?(前): ")); Serial.println(sendAT("AT+CASSLCFG?", 3000));
+
+  // ★2026-08-04: CACERT/CRINDEXがERRORになる事象の切り分けのため、先にSSLを有効化してから
+  // CACERT/CRINDEXを設定する順序に変更して試す。
+  Serial.print(F("[MQTT-DBG] SSL: ")); Serial.println(sendAT("AT+CASSLCFG=" + String(MQTT_TCP_CID) + ",\"SSL\",1", 3000));
+  Serial.print(F("[MQTT-DBG] CACERT: ")); Serial.println(sendAT("AT+CASSLCFG=" + String(MQTT_TCP_CID) + ",\"CACERT\",\"ca.crt\"", 3000));
+  String res = sendAT("AT+CASSLCFG=" + String(MQTT_TCP_CID) + ",\"CRINDEX\",2", 3000);
+  Serial.print(F("[MQTT-DBG] CRINDEX: ")); Serial.println(res);
+
+  Serial.print(F("[MQTT-DBG] CASSLCFG?(後): ")); Serial.println(sendAT("AT+CASSLCFG?", 3000));
+  return res.indexOf("OK") >= 0;
+}
+#endif  // !MQTT_USE_PLAIN_TEST_BROKER
+
+// EMQXへ生TCP+TLSで接続し、cmdトピックに届いているコマンドを確認・処理する。
+// ネットワーク接続済み（ensureNetworkReady()成功後）に呼ぶこと。
+void mqttCheckAndHandleCmd() {
+  Serial.println(F("--- [MQTT] コマンド確認 ---"));
+
+#if !MQTT_USE_PLAIN_TEST_BROKER
+  if (!mqttSetupTls()) {
+    Serial.println(F("✗ [MQTT] TLS設定に失敗"));
+    return;
+  }
+#endif
+
+  // 既に選択済みの値と同じcidを再度書き込むとERRORになるため、必要な場合のみ書き込む
+  // （TLS利用時はmqttSetupTls()内で既に選択済みのはず）
+  String curCid = sendAT("AT+CACID?", 3000);
+  if (curCid.indexOf("+CACID: " + String(MQTT_TCP_CID)) < 0) {
+    sendAT("AT+CACID=" + String(MQTT_TCP_CID), 3000);
+  }
+
+  // 前回の接続が残っている場合に備えて閉じておく（未接続ならエラーになるが無害）
+  sendAT("AT+CACLOSE=" + String(MQTT_TCP_CID), 5000);
+
+  String openRes = sendAT("AT+CAOPEN=" + String(MQTT_TCP_CID) + ",0,\"TCP\",\"" +
+                          String(MQTT_HOST) + "\"," + String(MQTT_PORT), 30000);
+  // 応答は "+CAOPEN: <cid>,<result>"。result=0 が成功
+  int ri = openRes.indexOf("+CAOPEN: ");
+  int result = -1;
+  if (ri >= 0) {
+    int comma = openRes.indexOf(",", ri);
+    if (comma > 0) result = openRes.substring(comma + 1).toInt();
+  }
+  if (result != 0) {
+    Serial.print(F("✗ [MQTT] TCP接続失敗 result="));
+    Serial.println(result);
+    // 20=名前解決失敗, 21=ネットワーク未有効, 23=接続拒否, 27=接続失敗
+    return;
+  }
+
+  if (!mqttSendConnect()) {
+    sendAT("AT+CACLOSE=" + String(MQTT_TCP_CID), 5000);
+    return;
+  }
+  Serial.println(F("✓ [MQTT] ブローカーへ接続"));
+
+  if (!mqttSendSubscribe(MQTT_CMD_TOPIC)) {
+    sendAT("AT+CACLOSE=" + String(MQTT_TCP_CID), 5000);
+    return;
+  }
+  Serial.println(F("✓ [MQTT] cmdトピックを購読"));
+
+  // 購読直後に届くメッセージ（retain済みのものを含む）を少し待って受信する
+  uint8_t buf[400];
+  int n = mqttTcpRecv(buf, sizeof(buf), 5000);
+
+  String payload;
+  bool hasCmd = (n > 0) && mqttParsePublish(buf, n, payload);
+
+  // DISCONNECTを送ってからソケットを閉じる（ブローカー側に正常終了を伝える）
+  uint8_t disc[2] = { 0xE0, 0x00 };
+  mqttTcpSend(disc, 2);
+  sendAT("AT+CACLOSE=" + String(MQTT_TCP_CID), 5000);
+
+  if (!hasCmd) {
+    Serial.println(F("  コマンドなし"));
+    return;
+  }
+
+  payload.trim();
+  Serial.print(F("[MQTT] cmd受信: ")); Serial.println(payload);
+
+  if (payload == "reset") {
+    Serial.println(F("[MQTT] resetコマンドを受信。再起動します..."));
+    delay(200);
+    NVIC_SystemReset();
+  } else {
+    Serial.println(F("  （未対応のコマンドのため無視）"));
+  }
+}
+
+#endif  // MQTT_CMD_ENABLED
+
+// モデムのソフトリセット（★2026-07-21）:
+// 送信が連続で全滅した際、CGATTがOKでも上位(SSL/HTTP/PDP)が固着している可能性があるため、
+// 無線を一旦落として(CFUN=0/1)から再登録・再接続する。全再起動より軽く速い一段目の復旧手段。
+bool modemSoftReset() {
+  Serial.println(F("\n⚠ 送信が連続失敗 → モデムをソフトリセット(CFUN=0/1)して再接続します"));
+  sendAT("AT+CFUN=0", 5000); delay(2000);
+  sendAT("AT+CFUN=1", 5000); delay(5000);
+  sendAT("AT+CNMP=38", 2000); delay(500);  // LTE only
+  sendAT("AT+CMNB=1",  2000); delay(500);  // Cat-M1
+  bool ok = initNetwork();                 // CREG/CGATT/CNACT を張り直す
+  Serial.println(ok ? F("✓ モデムソフトリセット後 再接続成功")
+                    : F("✗ ソフトリセット後も再接続失敗（30分の全再起動backstopに委ねる）"));
+  return ok;
+}
+
+// SIM7080G（LTE-M モデム）自身の受信電波強度を取得する
+// 戻り値: 0-31（値が大きいほど良好）、99=圏外/取得失敗
+int getSimCsq() {
+  String csq = sendAT("AT+CSQ", 3000);
+  int idx = csq.indexOf("+CSQ: ");
+  if (idx < 0) return 99;
+  return csq.substring(idx + 6, csq.indexOf(",", idx)).toInt();
+}
+
+// XIAO nRF52840 固有の Device ID（工場設定レジスタ FICR、64bit）を16進文字列で返す
+String getXiaoId() {
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%08lX%08lX",
+           (unsigned long)NRF_FICR->DEVICEID[1],
+           (unsigned long)NRF_FICR->DEVICEID[0]);
+  return String(buf);
+}
+
+// SIM7080G の IMEI（15桁の一意な番号）を取得する
+// ★注意: これはモジュール自体の識別番号であり、SIMカードの識別番号ではない
+//   （SIMを挿し替えてもIMEIは変わらない）。SIMカード自体の識別にはgetSimIccid()を使う。
+String getSimImei() {
+  String res = sendAT("AT+GSN", 3000);
+  for (int i = 0; i < (int)res.length(); i++) {
+    if (isDigit(res[i])) {
+      int j = i;
+      while (j < (int)res.length() && isDigit(res[j])) j++;
+      if (j - i >= 10) return res.substring(i, j);  // IMEI は15桁程度の連続した数字
+      i = j;
+    }
+  }
+  return "";
+}
+
+// SIMカード自体のICCID（19〜20桁、契約者・回線を特定できる番号）を取得する。
+// ★2026-08-30追加: 社内デバイス管理でSIMカード自体を識別する必要があるため。
+//   IMEI（モジュール識別）とは別物で、SIMを挿し替えるとこちらの値が変わる。
+String getSimIccid() {
+  String res = sendAT("AT+CCID", 3000);
+  for (int i = 0; i < (int)res.length(); i++) {
+    if (isDigit(res[i])) {
+      int j = i;
+      while (j < (int)res.length() && isDigit(res[j])) j++;
+      if (j - i >= 15) return res.substring(i, j);  // ICCIDは19〜20桁程度の連続した数字
+      i = j;
+    }
+  }
+  return "";
+}
+
+// 起動確認送信: 機器の設定情報を1行だけ GAS へ送る（子機データとは別行）
+void postBootInfoRow() {
+  Serial.println(F("--- 起動情報送信 ---"));
+  String xiaoId   = getXiaoId();
+  String simImei  = getSimImei();
+  String simIccid = getSimIccid();
+  int    csq      = getSimCsq();
+
+  String params = "ts=";
+  params += getTimestamp();
+  params += "&sim=";
+  params += SIM_NAME;
+  params += "&csq=";
+  params += String(csq);
+  params += "&row_type=info";
+  params += "&xiao_id=";
+  params += xiaoId;
+  params += "&sim_imei=";
+  params += simImei;
+  params += "&sim_iccid=";
+  params += simIccid;
+  params += "&sd=";
+  params += (sdAvailable ? "1" : "0");
+  params += "&interval_min=";
+  params += String(sendIntervalMs / 60000UL);
+  params += "&devcount=";
+  params += String(recordCount);
+  params += "&gw_fw=";
+  params += String(GATEWAY_FW_VERSION);
+  // ★2026-08-28: GAS側でGateway個体と受信対象群を識別できるようにする。
+  //   info行はデータ行と別のリクエストで、buildBatchQuery()の512バイト予算とは無関係。
+  //   ここでの増分は "&gw_id=gw_<16桁>"(26B) + "&group=N"(8B) = 34B で、
+  //   scriptPath全体は約280バイト。SHREQ_MAX_URL_BYTES(512)に十分収まる。
+  params += "&gw_id=";
+  params += GW_DEVICE_ID;
+  params += "&group=";
+  params += String(GATEWAY_GROUP_ID);
+
+  postToGAS(params);
+}
+
+// ══════════════════════════════════════════════
+// バッファを GAS へ送信＆SD へ記録（全台を1回の POST にまとめる）
+//
+// 送信失敗時は再送キュー（pendingRecords）に保持し、次回サイクルで
+// ライブ受信データとマージして再送する（同一 MAC はライブ側を優先）。
+// これにより一時的な通信断でデータをロストしない。
+// ══════════════════════════════════════════════
+// ★2026-07-25: 固定台数での分割から、実際のバイト数を積算する動的分割に変更。
+// SIMCom公式AT Command Manualで AT+SHREQ の <url>（scriptPath全体）が「max is 512 bytes」と
+// 明記されていることを確認済み。「基本は512バイト以内に収め、よっぽどの例外でない限り
+// 送信回数を増やさない」という運用ポリシー（2026-07-25確定）のもと、ペイロードの
+// エンコード方式が変わっても常に上限ギリギリまで詰め込めるよう、固定台数ではなく
+// 実測バイト数で都度判定する方式にした。
+static uint16_t const SHREQ_MAX_URL_BYTES = 512;
+
+// merged[start..n) から、scriptPath全体（/macros/s/+ID+?+params）が512バイトを超えない
+// 範囲で可能な限り多くの台数を1バッチに詰め込む。採用した台数を返し、outParamsに
+// 完成したクエリ文字列（q=...&n=...&d=...）を格納する。
+// 最低1台は必ず入れる（1台分だけで512バイトを超える異常系は上位のAT+SHREQ側で失敗として扱う）。
+//
+// ★2026-07-25: 固定オーバーヘッド削減（v1.1譲り）。
+//   ts: DS3231のタイムスタンプはSDカード記録専用とし、GAS送信からは廃止
+//      （受信日時はGAS側のnew Date()で代用可能なため）。
+//   sim: キャリア名は基本固定運用のため送信自体を廃止（必要ならGAS/スプレッドシート側で管理）。
+//   csq: "csq=23"(7B)→"q="+1バイトhex(5B)に短縮。値の意味は
+//        [gateway_csq_signal_strength_notes]（開発メモ）参照。
+//
+// ★横河ver1.1/1.3向け改修（8CH対応）: 汎用gateway_v1.20（4CH固定・v3.03/v3.20の
+// FW_VERSIONバイトを前提にしたpayloadオフセット、CLOUD_FMT_V2でのBATT付加）から分岐。
+// 横河ver1.1(BLE)/ver1.3(LoRa)のペイロードはFW_VERSION/BATTバイトが無く、
+// payload[2]からCH1〜8が並ぶ独自レイアウトのため非互換。
+// BLE(ver1.1): Epoch(4B)+DeviceID(1B)+CH1-8(int16×8=16B) = 21バイト/台 = 42 hex文字
+//   （project06_yokogawa/gateway_v1.1と同一ワイヤフォーマット。GAS側はgateway_v1.1/gas/Code.gs
+//   をそのまま流用できる）。
+// ★2026-09-10: LoRa(ver1.3)は、スプレッドシート側の小数精度確保のためCH1-5が
+// int16→int32(µε×100)へ拡張されたことに合わせてワイヤフォーマットも変更した。
+//   Epoch(4B)+DeviceID(1B)+CH1-5(int32×5=20B)+CH6-8(int16×3=6B) = 31バイト/台 = 62 hex文字
+//   （project06_yokogawa/gateway_v1.2/gas/Code.gsもこの形式に合わせて更新済み）。
+int buildBatchQuery(const FlexRecord* merged, int start, int n,
+                     int csq, String& outParams) {
+  String baseUrl = "/macros/s/";
+  baseUrl += GAS_SCRIPT_ID;
+  baseUrl += "?";
+
+  char qHex[3];
+  snprintf(qHex, sizeof(qHex), "%02X", (uint8_t)csq);
+
+  String header = "q=";
+  header += qHex;
+
+  String body = "";
+  int count = 0;
+  for (int i = start; i < n; i++) {
+    const FlexRecord& rec = merged[i];
+
+#if defined(COMM_MODE_LORA)
+    // 横河ver1.3(LoRa)は29バイト固定（受信側のs_loraLen!=29チェックで既に保証済み）。
+    if (rec.payloadLen < 29) continue;
+
+    char chunk[63];
+    snprintf(chunk, sizeof(chunk),
+             "%02X%02X%02X%02X%02X"
+             "%02X%02X%02X%02X" "%02X%02X%02X%02X" "%02X%02X%02X%02X"
+             "%02X%02X%02X%02X" "%02X%02X%02X%02X"
+             "%02X%02X" "%02X%02X" "%02X%02X",
+             (uint8_t)(rec.rtcEpoch & 0xFF),
+             (uint8_t)((rec.rtcEpoch >> 8) & 0xFF),
+             (uint8_t)((rec.rtcEpoch >> 16) & 0xFF),
+             (uint8_t)((rec.rtcEpoch >> 24) & 0xFF),
+             rec.payload[1],                                                      // DeviceID
+             rec.payload[2],  rec.payload[3],  rec.payload[4],  rec.payload[5],   // CH1(int32)
+             rec.payload[6],  rec.payload[7],  rec.payload[8],  rec.payload[9],   // CH2(int32)
+             rec.payload[10], rec.payload[11], rec.payload[12], rec.payload[13],  // CH3(int32)
+             rec.payload[14], rec.payload[15], rec.payload[16], rec.payload[17],  // CH4(int32)
+             rec.payload[18], rec.payload[19], rec.payload[20], rec.payload[21],  // CH5(int32)
+             rec.payload[22], rec.payload[23],                                    // CH6(int16)
+             rec.payload[24], rec.payload[25],                                    // CH7(int16)
+             rec.payload[26], rec.payload[27]);                                   // CH8(int16)
+#else
+    // 横河ver1.1(BLE)は18バイト固定。PktType+DeviceID+CH1-8に満たない不正レコードを除外。
+    if (rec.payloadLen < 18) continue;
+
+    char chunk[43];
+    snprintf(chunk, sizeof(chunk),
+             "%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+             (uint8_t)(rec.rtcEpoch & 0xFF),
+             (uint8_t)((rec.rtcEpoch >> 8) & 0xFF),
+             (uint8_t)((rec.rtcEpoch >> 16) & 0xFF),
+             (uint8_t)((rec.rtcEpoch >> 24) & 0xFF),
+             rec.payload[1],                                    // DeviceID
+             rec.payload[2],  rec.payload[3],                   // CH1
+             rec.payload[4],  rec.payload[5],                   // CH2
+             rec.payload[6],  rec.payload[7],                   // CH3
+             rec.payload[8],  rec.payload[9],                   // CH4
+             rec.payload[10], rec.payload[11],                  // CH5
+             rec.payload[12], rec.payload[13],                  // CH6
+             rec.payload[14], rec.payload[15],                  // CH7
+             rec.payload[16], rec.payload[17]);                 // CH8
+#endif
+
+    // "&n=" の桁数は最終台数が決まるまで確定しないため、2桁分（最大99台）を先に見込んでおく
+    // "&d=" は先頭1回だけ付く。chunk長は実値（LoRa=62文字/BLE=42文字）から使う。
+    size_t chunkLen = strlen(chunk);
+    size_t oneLen = (count == 0) ? (String(F("&d=")).length() + chunkLen) : chunkLen;
+    size_t projected = baseUrl.length() + header.length() + String(F("&n=99")).length()
+                        + body.length() + oneLen;
+    if (count > 0 && projected > SHREQ_MAX_URL_BYTES) {
+      break;  // 512バイトを超えるので、この台はここでは入れず次のバッチへ回す
+    }
+    if (count == 0) body += "&d=";
+    body += chunk;
+    count++;
+    // ※ SD記録はネットワーク確認より前に flushRecords() 内で実施済み
+    //   （LTE-M停止時もデータを残すため）
+  }
+
+  outParams = header + "&n=" + String(count) + body;
+  Serial.print(F("[BATCH] ")); Serial.print(count); Serial.print(F(" 台、クエリ長 "));
+  Serial.print(baseUrl.length() + outParams.length()); Serial.println(F(" / 512 バイト"));
+  return count;
+}
+
+// buildBatchQuery()で組み立て済みのクエリを1回のGETで送信する（失敗時30秒後に1回だけ再試行）
+bool postBatch(const String& params) {
+  // ★2026-07-25: 「接続を1回張って複数回のSHREQを使い回す」最適化を撤回。
+  // 実機検証の結果、同一AT+SHCONN接続で2回目以降のAT+SHREQが恒常的に
+  // ステータスコード0（応答解析失敗）を返す事象を確認した。GAS側には実際に
+  // データが届いていた（スプレッドシートに記録されていた）ため、TCP/TLS接続
+  // 自体は生きているが、SIM7080G内部のAT応答処理が壊れていると見られる。
+  // SIMCom公式のHTTP(S)アプリケーションノートも「1接続につき1リクエスト」の
+  // 例しか示しておらず、複数リクエストの使い回しはサポート対象外の可能性が高い。
+  // バッチごとに毎回 接続→送信→切断 を行う元の設計に戻す（速度より正しさを優先）。
+  bool ok = postToGAS(params);
+  if (!ok) {
+    // 一時的な通信不良を想定し、30秒待って1回だけ即時リトライ（再接続からやり直す）
+    Serial.println(F("✗ 送信失敗。30秒後に再試行..."));
+    delay(30000);
+    ok = postToGAS(params);
+  }
+  return ok;
+}
+
+void flushRecords() {
+  if (xSemaphoreTake(recordMutex, pdMS_TO_TICKS(200)) != pdTRUE) return;
+
+  // ★2026-08-28: 以下3つの作業配列（liveSnap / merged / failedMerged）は必ずstaticにすること。
+  //   FlexRecordは44バイトなので MAX_DEVICES=32 では1配列1,408バイト、3つで4,224バイト。
+  //   Adafruit nRF52コアのloopタスクのスタックは LOOP_STACK_SZ=(256*4) ワード＝4,096バイトしか
+  //   なく、自動変数のままだと flushRecords() に入った時点でスタックオーバーフローする
+  //   （-fstack-usage の実測で4,416バイト。MAX_DEVICES=20の頃は2,832バイトで収まっていた）。
+  //   flushRecords()はloopタスクからのみ呼ばれ（loop() / setup() / loop()先頭の
+  //   handlePendingBleCommands()。BLEコールバックはフラグを立てるだけで直接呼ばない）、
+  //   再入しないためstatic化しても競合しない。RAMは+4.2KB。
+  //   ★MAX_DEVICESを増やすときはここのスタック実測をやり直すこと。
+  int liveN = recordCount;
+  static FlexRecord liveSnap[MAX_DEVICES];
+  memcpy(liveSnap, records, sizeof(FlexRecord) * liveN);
+  recordCount = 0;
+
+  xSemaphoreGive(recordMutex);
+
+  // ライブデータ＋再送キューをマージ。
+  // ★2026-07-25: 以前は同一MACのライブデータがあれば再送キュー側を「重複」として破棄していたが、
+  // これは別時刻の実測値であり重複ではない（子機はBLEで最新値を常時ブロードキャストするだけなので、
+  // 再送キューの値とライブ値は異なる測定サイクルのデータ）。破棄すると送信失敗した測定が
+  // 恒久的に失われるため、両方をそのまま送信する（GAS側は受信ごとに行を追加するだけなので
+  // 同一DeviceIDが1バッチに複数件あっても問題ない）。
+  static FlexRecord merged[MAX_DEVICES];  // ★static必須。理由はliveSnapのコメント参照
+  int n = 0;
+  for (int i = 0; i < liveN && n < MAX_DEVICES; i++) merged[n++] = liveSnap[i];
+
+  int pendingSpaceDropped = 0;  // バッファ上限で本当に破棄された件数のみカウント
+  for (int i = 0; i < pendingCount; i++) {
+    if (n < MAX_DEVICES) merged[n++] = pendingRecords[i];
+    else pendingSpaceDropped++;
+  }
+  pendingCount = 0;
+
+  // ★2026-07-25: 再送キュー分とライブ分が1バッチにまとまる場合、rtcEpoch昇順（古い実測時刻が先）
+  // に並べ替える。以前はライブ→再送キューの順（新しい→古い）で送られており、スプレッドシートの
+  // 見た目が時系列と逆転して分かりにくかった。単純挿入ソート（nはMAX_DEVICES=32以下）。
+  for (int i = 1; i < n; i++) {
+    FlexRecord key = merged[i];
+    int j = i - 1;
+    while (j >= 0 && merged[j].rtcEpoch > key.rtcEpoch) {
+      merged[j + 1] = merged[j];
+      j--;
+    }
+    merged[j + 1] = key;
+  }
+
+  if (n == 0) { Serial.println(F("送信対象レコードなし")); return; }
+  if (pendingSpaceDropped > 0) {
+    Serial.print(F("  → 再送キュー ")); Serial.print(pendingSpaceDropped);
+    Serial.println(F(" 件はバッファ上限のため破棄"));
+  }
+
+  String ts = getTimestamp();
+  Serial.print(F("フラッシュ: ")); Serial.print(n); Serial.println(F(" 件"));
+
+  // ★2026-07-23: SD記録は LTE-M の状態に関わらず、送信を試みる前に必ず実行する。
+  // 旧実装は下の ensureNetworkReady() 失敗時に early return しており、LTE-Mが停止すると
+  // SDにも一切残らずデータが完全に失われていた（有野川の教訓）。
+  // 記録対象はライブ受信分のみ（再送キュー分は前回のサイクルで記録済みのため重複させない）。
+  // ★2026-07-25: 以前はsdLog()の戻り値を見ずに「liveN件を記録」と無条件表示していたため、
+  // 実際は書き込みに失敗していても成功したかのようなログが残っていた。実成功件数を数えて表示する。
+  int sdWrittenCount = 0;
+  for (int i = 0; i < liveN; i++) {
+    char mac[18];
+    snprintf(mac, sizeof(mac), "%02X-%02X-%02X-%02X-%02X-%02X",
+             liveSnap[i].mac[5], liveSnap[i].mac[4], liveSnap[i].mac[3],
+             liveSnap[i].mac[2], liveSnap[i].mac[1], liveSnap[i].mac[0]);
+    String hex = "";
+    for (int j = 0; j < liveSnap[i].payloadLen; j++) {
+      if (liveSnap[i].payload[j] < 0x10) hex += '0';
+      hex += String(liveSnap[i].payload[j], HEX);
+    }
+    if (sdLog(ts + "," + String(mac) + "," + hex + "," + String(liveSnap[i].rssi))) sdWrittenCount++;
+  }
+  if (liveN > 0) {
+    Serial.print(F("[SD] ")); Serial.print(sdWrittenCount); Serial.print(F("/")); Serial.print(liveN);
+    Serial.println(F(" 件を記録"));
+  }
+
+  // ネットワーク状態確認・必要なら再接続
+  if (!ensureNetworkReady()) {
+    Serial.println(F("✗ ネットワーク再接続失敗（SD記録は完了済み）。今回分は再送キューへ保留"));
+    pendingCount = n;
+    memcpy(pendingRecords, merged, sizeof(FlexRecord) * n);
+    return;
+  }
+
+  // SIM7080G 自身のセルラー受信電波強度（BLE RSSI とは別物）
+  int csq = getSimCsq();
+  s_lastCsq = csq;  // コントローラー向けステータス用にキャッシュ
+
+  // クエリ長がAT+SHREQの512バイト上限に達しないよう、実バイト数を見ながら動的に分割して送信する。
+  // ★2026-07-25: 「接続を使い回す」最適化は撤回済み（postBatch()内で毎回postToGAS()を
+  // 呼び、バッチごとに接続→送信→切断のフルシーケンスを行う。詳細はpostBatch()のコメント参照）。
+  static FlexRecord failedMerged[MAX_DEVICES];  // ★static必須。理由はliveSnapのコメント参照
+  int failedN = 0;
+  bool cycleHadSuccess = false;  // このサイクルで1バッチでも送信成功したか
+
+  {
+    int start = 0;
+    while (start < n) {
+      String params;
+      int count = buildBatchQuery(merged, start, n, csq, params);
+
+      bool ok = postBatch(params);
+      if (ok) {
+        cycleHadSuccess = true;
+        Serial.print(F("✓ 送信成功（")); Serial.print(count); Serial.println(F(" 件、再送キュー クリア）"));
+      } else {
+        Serial.print(F("✗ 再試行も失敗。")); Serial.print(count);
+        Serial.println(F(" 件を次回送信サイクルで再送キューとしてリトライします"));
+        for (int k = 0; k < count && failedN < MAX_DEVICES; k++) failedMerged[failedN++] = merged[start + k];
+      }
+      start += count;
+    }
+  }
+
+  pendingCount = failedN;
+  if (failedN > 0) memcpy(pendingRecords, failedMerged, sizeof(FlexRecord) * failedN);
+
+  // 段階的復旧: 送信サイクルが全滅したら連続失敗をカウント。閾値でモデムをソフトリセット。
+  if (cycleHadSuccess) {
+    consecutiveSendFailures = 0;
+  } else {
+    consecutiveSendFailures++;
+    Serial.print(F("連続送信失敗: ")); Serial.print(consecutiveSendFailures);
+    Serial.print(F("/")); Serial.println(MODEM_RESET_FAIL_THRESHOLD);
+    if (consecutiveSendFailures >= MODEM_RESET_FAIL_THRESHOLD) {
+      modemSoftReset();
+      consecutiveSendFailures = 0;  // リセットを試みたので一旦クリア（それでも失敗が続けば再度カウント→再試行）
+    }
+  }
+}
+
+static uint32_t lastSend = 0;
+
+#ifdef COMM_MODE_LORA
+// ★v1.20: ダウンリンク予約の確認間隔。
+//
+// 【なぜ送信サイクルと分けるか】テレメトリ送信は120分間隔だが、その周期でしか予約を
+// 取りに行かないと「Gatewayが予約を知るまで最大120分 → 子機に届くまでさらに最大120分」で、
+// スプレッドシートで指示してから結果が戻るまで最悪6時間かかる。
+// Gatewayは AC 電源なので、予約確認だけを短い周期で回しても電力の問題は無い
+// （増えるのはLTE-Mのデータ通信量のみ。1回あたり1〜2KB程度）。
+// テレメトリ送信の周期はここでは変えない（送信間隔を変える場合はCLAUDE.md §7に従い
+// アプリ層WDT(computeAppWdtMs)との整合も必ず確認すること）。
+// ★★★ 通しテスト用スイッチ（2026-08-10） ★★★
+// ダウンリンクの通し確認（スプレッドシート指示 → 結果表示まで）を8分以内に収めるため、
+// テスト中だけ確認間隔を短くする。本番運用時は 0（現在は0＝本番設定）。
+// ※テレメトリ送信間隔(SEND_INTERVAL_DEFAULT_MS)はここでは変えていないので、
+//   アプリ層WDT(computeAppWdtMs)との整合は従来のまま保たれる。
+#define DOWNLINK_E2E_TEST 0
+
+// ★切り分け用（2026-08-10、役目を終えたので0）。起動時に1回だけ、Content-Lengthが付く
+//   固定URLを取得して、モデム・回線が本文を取得できる状態かを確認する。
+//
+// 【この確認で分かったこと】GAS取得が「status=200 len=0」で失敗し続けた時間帯でも、
+// Content-Length付きのURL（www.google.com/robots.txt 6624B、humans.txt 286B）は
+// 同一ホスト・同一タイミングで確実に取得できた。つまり電源・回線・本文サイズは要因では
+// なく、GASのchunked応答（Content-Lengthなし）をモジュールが安定して扱えないのが原因。
+// ただし「必ず失敗する」ではなく「不安定」で、定常状態の実測は約79%（3時間強の運転で
+// 26/33）。予約確認のサイクル単位では14回中14回とも、リトライを含めて取得できている
+// （最悪でモデム再起動を挟んで2分19秒）。したがってリトライで吸収できると判断し、
+// 取得元をContent-Lengthが付く場所へ移す構成変更は見送った。
+// 同種の切り分けが再び必要になったら1に戻す。
+#define PROBE_CONTENT_LENGTH_URL 0
+
+#if DOWNLINK_E2E_TEST
+#define CMD_CHECK_INTERVAL_MS (3UL * 60UL * 1000UL)    // 【テスト用】3分
+#else
+#define CMD_CHECK_INTERVAL_MS (15UL * 60UL * 1000UL)   // 15分
+#endif
+#define CMD_CHECK_JITTER_SECONDS 180UL                 // ±3分
+#define CMD_CHECK_INTERVAL_MIN_MS (30UL * 1000UL)      // テスト用3分でも0以下にしない下限
+
+// ★子機の送信周期は60分（乱数ジッターは±10秒）で、従来の固定15分確認周期とは4周期ごとに
+// 重なる。同じ時刻にGAS通信(s_atBusy)が始まると子機アップリンクのダウンリンク送信を毎回
+// 見送る状態が永久に続き得るため、Gateway側もnRF52840内蔵RNGで確認周期をずらす。
+// ★2026-08-30修正: SoftDevice(BLE)有効中のRNG直接アクセスによる即時リセットを解消。
+//
+// 【症状】LoRaビルドで、STAGE6完了直後に必ずリセットし、postBootInfoRow()に一度も
+//   到達しない無限リブートに陥っていた（2026-08-24〜08-30の実機ログ20起動すべてで再現）。
+//   E220を外しても給電を変えても不変で、毎回まったく同じ命令位置・同じ経過時間で落ちた。
+//
+// 【原因】nRF52のRNGはSoftDeviceに占有される「制限付きペリフェラル」で、SoftDevice有効中に
+//   アプリがNRF_RNGへ直接レジスタアクセスすることは許されない。LoRaビルドは
+//   bleControllerBegin()でSoftDeviceを有効にするため、この関数に入った瞬間に必ず落ちていた。
+//   乱数はSoftDevice API経由で取得しなければならない。
+//   （導入は d47c62e / FW88→90。BLEビルドではmakeCmdCheckIntervalMs()自体が
+//     #ifdef COMM_MODE_LORA の中なので発現しない）
+//
+// 用途は確認周期のジッターなので乱数品質の要求は緩い。取得できない場合はmicros()で代替する。
+static uint8_t gatewayTrueRandomByte() {
+  uint8_t sdEnabled = 0;
+  (void) sd_softdevice_is_enabled(&sdEnabled);
+
+  if (sdEnabled) {
+    uint8_t value = 0;
+    for (int i = 0; i < 50; i++) {  // プールの補充待ち（通常は数ms以内）
+      uint8_t avail = 0;
+      if (sd_rand_application_bytes_available_get(&avail) == NRF_SUCCESS && avail >= 1) {
+        if (sd_rand_application_vector_get(&value, 1) == NRF_SUCCESS) return value;
+      }
+      delay(1);
+    }
+    return (uint8_t)(micros() & 0xFF);  // ジッター用途なので取れなくても実害はない
+  }
+
+  // SoftDeviceが無効なときだけ直接アクセスしてよい
+  NRF_RNG->TASKS_START = 1;
+  NRF_RNG->EVENTS_VALRDY = 0;
+  while (NRF_RNG->EVENTS_VALRDY == 0) { wdtFeed(); }  // 万一止まってもWDTで拾えるよう給餌
+  uint8_t value = (uint8_t)NRF_RNG->VALUE;
+  NRF_RNG->EVENTS_VALRDY = 0;
+  NRF_RNG->TASKS_STOP = 1;
+  return value;
+}
+
+static uint32_t makeCmdCheckIntervalMs() {
+  uint16_t raw = ((uint16_t)gatewayTrueRandomByte() << 8) | gatewayTrueRandomByte();
+  int32_t jitterSeconds = (int32_t)(raw % (CMD_CHECK_JITTER_SECONDS * 2UL + 1UL))
+                       - (int32_t)CMD_CHECK_JITTER_SECONDS;
+  int32_t intervalMs = (int32_t)CMD_CHECK_INTERVAL_MS + jitterSeconds * 1000L;
+  if (intervalMs < (int32_t)CMD_CHECK_INTERVAL_MIN_MS) intervalMs = CMD_CHECK_INTERVAL_MIN_MS;
+  return (uint32_t)intervalMs;
+}
+
+static uint32_t lastCmdCheck = 0;
+static uint32_t nextCmdCheckIntervalMs = CMD_CHECK_INTERVAL_MS;
+
+// ★報告（downlink_sent / downlink_result）は確認間隔を待たずに送る。
+//   確認間隔の到来を待つと、子機の応答を受けてから結果がスプレッドシートに出るまで
+//   最大でもう1周期ぶん遅れる。報告があるときだけ送信するので通信量は増えない。
+//   失敗し続けたときに叩き続けないよう、最短の再試行間隔だけ設けておく。
+#define REPORT_RETRY_INTERVAL_MS (60UL * 1000UL)
+static uint32_t lastReportTry = 0;
+#endif
+
+#ifdef COMM_MODE_LORA
+// ══════════════════════════════════════════════
+// コントローラー連携（BLE GATT サーバ）— LoRaビルド専用（v1.1新規）
+//
+// LoRaビルドではBLE無線がFlex受信に使われないため、これをコントローラー(Monitaコントローラー)
+// との設定通信用のGATTペリフェラルとして使う。GPIOは消費しない（内蔵無線のみ）。
+//
+// ★暫定インターフェース仕様（コントローラー側ファームと合わせること）:
+//   サービスUUID:  6f5e4d3c-2b1a-9e8d-7c6b-01000000-... （下記配列、[12]バイトで各要素を区別）
+//   - 送信間隔設定 (Write, uint16 LE, 単位:分)   [12]=0x02  … 0は無視。書込で即保存・反映
+//   - コマンド     (Write, uint8)               [12]=0x03  … 0x01=即時送信 0x02=NW再登録
+//                                                            0x03=起動確認送信 0xFF=フルリセット
+//   - ステータス   (Read/Notify, 8バイト)        [12]=0x04  … 下記 buildStatus() 参照
+//
+// ★セキュリティ: 動作確認優先のため現段階は無認証（SECMODE_OPEN）。実運用前にボンディング必須化する。
+// ★重い処理（送信・再登録・リセット）はBLEコールバック内で直接実行せず、フラグを立てて
+//   loop()先頭の handlePendingBleCommands() で実行する（BLEスタックをブロックしないため）。
+// ══════════════════════════════════════════════
+
+// 128bit UUID（LSB→MSB順）。[12]バイトでサービス/各キャラクタリスティックを区別する。
+#define GWCFG_UUID(code) { \
+  0x00,0x00,0x00,0x00,0x6b,0x7c,0x8d,0x9e, \
+  0x1a,0x2b,0x3c,0x4d,(code),0x00,0x5e,0x6f }
+static const uint8_t GWCFG_UUID_SVC[16]      = GWCFG_UUID(0x01);
+static const uint8_t GWCFG_UUID_INTERVAL[16] = GWCFG_UUID(0x02);
+static const uint8_t GWCFG_UUID_COMMAND[16]  = GWCFG_UUID(0x03);
+static const uint8_t GWCFG_UUID_STATUS[16]   = GWCFG_UUID(0x04);
+
+static BLEService        gwCfgService(GWCFG_UUID_SVC);
+static BLECharacteristic gwCharInterval(GWCFG_UUID_INTERVAL);
+static BLECharacteristic gwCharCommand(GWCFG_UUID_COMMAND);
+static BLECharacteristic gwCharStatus(GWCFG_UUID_STATUS);
+
+// BLEコールバックからloop()へ渡す保留要求（コールバックはこれを立てるだけ）
+static volatile bool     s_pendingIntervalChange = false;
+static volatile uint32_t s_pendingIntervalMs     = 0;
+static volatile uint8_t  s_pendingCommand         = 0;  // 0=なし
+
+#define GWCFG_FILENAME  "/gwcfg.bin"
+#define GWCFG_MAGIC     0x4D47  // 'MG'
+
+// 内蔵フラッシュから送信間隔を読み込む（無ければ既定値のまま）
+static void loadConfig() {
+  InternalFS.begin();
+  Adafruit_LittleFS_Namespace::File f(InternalFS);
+  f = InternalFS.open(GWCFG_FILENAME, Adafruit_LittleFS_Namespace::FILE_O_READ);
+  if (!f) return;
+  uint16_t magic = 0; uint32_t val = 0;
+  bool ok = (f.read((uint8_t*)&magic, sizeof(magic)) == (int)sizeof(magic)) &&
+            (f.read((uint8_t*)&val,   sizeof(val))   == (int)sizeof(val));
+  f.close();
+  if (ok && magic == GWCFG_MAGIC && val >= 60000UL) {  // 1分未満は誤設定として弾く
+    sendIntervalMs = val;
+    Serial.print(F("[CFG] 保存済み送信間隔を読込: ")); Serial.print(val / 60000UL); Serial.println(F("分"));
+  }
+}
+
+// 現在の送信間隔を内蔵フラッシュへ保存（LittleFSは追記のため一旦削除してから書く）
+static void saveConfig() {
+  if (InternalFS.exists(GWCFG_FILENAME)) InternalFS.remove(GWCFG_FILENAME);
+  Adafruit_LittleFS_Namespace::File f(InternalFS);
+  f = InternalFS.open(GWCFG_FILENAME, Adafruit_LittleFS_Namespace::FILE_O_WRITE);
+  if (!f) { Serial.println(F("[CFG] 保存失敗（フラッシュ書込不可）")); return; }
+  uint16_t magic = GWCFG_MAGIC;
+  f.write((uint8_t*)&magic, sizeof(magic));
+  f.write((uint8_t*)&sendIntervalMs, sizeof(sendIntervalMs));
+  f.close();
+}
+
+// ★2026-07-29追加: HFCLK（64MHz高速クロック）の供給源と稼働状態を1バイトにまとめる。
+// nRF52840のHFCLKは、明示的に要求しない限り内蔵RC発振器(HFINT、精度±1.5%程度)で動き、
+// TASKS_HFCLKSTARTを叩くか、RADIO(BLE)・USBのようにHFXOを必須とする機能が要求したときだけ
+// 外付け水晶(HFXO、±20〜40ppm)に切り替わる。UARTEのボーレートはHFCLKから作られるため、
+// HFINTのままだとE220とのUART通信が化けて「電波は届いているのに1台も受信できない」
+// 状態になり得る（PC接続時のみ受信できる症状の検証用。2026-07-29の切り分け）。
+//   bit0 = SRC   : 1=HFXO(水晶) / 0=HFINT(内蔵RC)
+//   bit1 = STATE : 1=稼働中 / 0=停止
+// → 0x03=水晶で稼働(正常) / 0x02=内蔵RCで稼働(UART誤差の懸念あり)
+static uint8_t readHfclkStatus() {
+  uint32_t st = NRF_CLOCK->HFCLKSTAT;
+  uint8_t v = 0;
+  if (st & CLOCK_HFCLKSTAT_SRC_Msk)   v |= 0x01;
+  if (st & CLOCK_HFCLKSTAT_STATE_Msk) v |= 0x02;
+  return v;
+}
+
+// 255で頭打ちにして1バイトへ収める（桁溢れで小さい値に見えるのを防ぐ）
+static uint8_t sat8(uint32_t v) { return (v > 255U) ? 255U : (uint8_t)v; }
+
+// ステータス12バイトを組み立てる
+// [0]FWバージョン [1]受信台数 [2]SD有無 [3]NW接続OK [4-5]送信間隔(分,LE) [6]最終CSQ [7]HFCLK状態
+// ★2026-07-29追加のLoRa診断（いずれも255飽和）:
+// [8]LoRa生受信バイト数 [9]チェックサムNG数
+// [10] bit0-6=CKSUM通過フレーム数(127飽和) / bit7=起動時config check成功
+// [11]起動からの経過秒/4（観測のたびに0付近へ戻る場合は再起動を繰り返している）
+// [12]UARTE1 ERRORSRC累積(bit0=OVERRUN,1=PARITY,2=FRAMING,3=BREAK) [13]RX再起動回数
+#define GW_STATUS_LEN 14
+static void buildStatus(uint8_t out[GW_STATUS_LEN]) {
+  uint16_t mins = (uint16_t)(sendIntervalMs / 60000UL);
+  out[0] = GATEWAY_FW_VERSION;
+  out[1] = (uint8_t)recordCount;
+  out[2] = sdAvailable ? 1 : 0;
+  out[3] = s_lastNetOk ? 1 : 0;
+  out[4] = mins & 0xFF;
+  out[5] = (mins >> 8) & 0xFF;
+  out[6] = (uint8_t)s_lastCsq;
+  out[7] = readHfclkStatus();
+#ifdef COMM_MODE_LORA
+  out[8]  = sat8(s_loraRxBytes);
+  out[9]  = sat8(s_loraCksumNg);
+  uint8_t frames = (s_loraFramesOk > 127U) ? 127U : (uint8_t)s_loraFramesOk;
+  out[10] = (uint8_t)(frames | (s_loraConfigOk ? 0x80 : 0x00));
+  // [12]: bit0-3=ERRORSRC累積 / bit6=モード検査実施済み / bit7=検査結果「設定モードのまま」
+  out[12] = (uint8_t)(s_loraErrSrcAcc
+                      | (s_loraProbeDone     ? 0x40 : 0x00)
+                      | (s_loraProbeInConfig ? 0x80 : 0x00));
+  out[13] = sat8(s_loraRekicks);
+#else
+  out[8] = out[9] = out[10] = 0;
+  out[12] = out[13] = 0;
+#endif
+  out[11] = sat8(millis() / 4000UL);
+}
+
+static void updateStatusChar() {
+  uint8_t st[GW_STATUS_LEN];
+  buildStatus(st);
+  gwCharStatus.write(st, sizeof(st));
+  if (Bluefruit.connected()) gwCharStatus.notify(st, sizeof(st));
+}
+
+// ── BLE書き込みコールバック（最小限：保留フラグを立てるだけ）──
+static void cbWriteInterval(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
+  (void)conn_hdl; (void)chr;
+  if (len < 2) return;
+  uint16_t minutes = (uint16_t)(data[0] | (data[1] << 8));
+  if (minutes == 0) return;  // 0は無視
+  s_pendingIntervalMs     = (uint32_t)minutes * 60000UL;
+  s_pendingIntervalChange = true;
+}
+
+static void cbWriteCommand(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
+  (void)conn_hdl; (void)chr;
+  if (len < 1) return;
+  s_pendingCommand = data[0];
+}
+
+// コントローラー連携用BLEペリフェラルを初期化して広告開始する
+static void bleControllerBegin() {
+  Bluefruit.begin(1, 0);  // peripheral=1, central=0（LoRaビルドはBLEスキャンしない）
+  Bluefruit.setName("MonitaGateway");
+  Bluefruit.setTxPower(4);
+
+  gwCfgService.begin();
+
+  gwCharInterval.setProperties(CHR_PROPS_WRITE);
+  gwCharInterval.setPermission(SECMODE_OPEN, SECMODE_OPEN);  // ★動作確認優先で無認証
+  gwCharInterval.setFixedLen(2);
+  gwCharInterval.setWriteCallback(cbWriteInterval);
+  gwCharInterval.begin();
+
+  gwCharCommand.setProperties(CHR_PROPS_WRITE);
+  gwCharCommand.setPermission(SECMODE_OPEN, SECMODE_OPEN);
+  gwCharCommand.setFixedLen(1);
+  gwCharCommand.setWriteCallback(cbWriteCommand);
+  gwCharCommand.begin();
+
+  gwCharStatus.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
+  gwCharStatus.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  gwCharStatus.setFixedLen(GW_STATUS_LEN);
+  gwCharStatus.begin();
+  updateStatusChar();
+
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addService(gwCfgService);
+  Bluefruit.Advertising.addName();
+  Bluefruit.Advertising.restartOnDisconnect(true);
+  Bluefruit.Advertising.setInterval(32, 244);  // 20ms / 152.5ms
+  Bluefruit.Advertising.setFastTimeout(30);
+  Bluefruit.Advertising.start(0);  // 0=タイムアウトなし（常時コネクタブル広告）
+  Serial.println(F("✓ コントローラー連携BLE（GATTサーバ）広告開始"));
+}
+
+// loop()先頭で呼ぶ。BLEコールバックが立てた保留要求を安全なタイミングで実行する。
+static void handlePendingBleCommands() {
+  if (s_pendingIntervalChange) {
+    s_pendingIntervalChange = false;
+    sendIntervalMs = s_pendingIntervalMs;
+    saveConfig();
+    Serial.print(F("[BLE] 送信間隔を変更: ")); Serial.print(sendIntervalMs / 60000UL); Serial.println(F("分"));
+    updateStatusChar();
+  }
+
+  uint8_t cmd = s_pendingCommand;
+  if (cmd != 0) {
+    s_pendingCommand = 0;
+    switch (cmd) {
+      case 0x01:  // 即時送信
+        Serial.println(F("[BLE] コマンド: 即時送信"));
+        flushRecords();
+        lastSend = millis();
+        break;
+      case 0x02:  // ネットワーク再登録
+        Serial.println(F("[BLE] コマンド: ネットワーク再登録"));
+        s_lastNetOk = initNetwork();
+        break;
+      case 0x03:  // 起動確認送信
+        Serial.println(F("[BLE] コマンド: 起動確認送信"));
+        postBootInfoRow();
+        break;
+      case 0xFF:  // フルリセット（NVIC_SystemReset → setup() から再初期化）
+        Serial.println(F("[BLE] コマンド: フルリセット"));
+        delay(100);  // ログ送出とBLE応答の猶予
+        NVIC_SystemReset();
+        break;
+      default:
+        Serial.print(F("[BLE] 未知コマンド: 0x")); Serial.println(cmd, HEX);
+        break;
+    }
+    updateStatusChar();
+  }
+}
+#endif  // COMM_MODE_LORA
+
+// ══════════════════════════════════════════════
+// setup
+// ══════════════════════════════════════════════
+void setup() {
+  // ★2026-07-25追加: リセット原因（RESETREAS）の診断ログ。
+  // 現場で説明のつかない短間隔の再起動が発生しており、WDT満了・ソフトリセット・
+  // 電源瞬断（ブラウンアウト）のどれが原因か切り分けられなかった。
+  // 他コードがRESETREASに触れる前、setup()の最初に読み取ってすぐクリアする。
+  uint32_t resetReason = NRF_POWER->RESETREAS;
+  NRF_POWER->RESETREAS = 0xFFFFFFFFUL;  // 読み取り後すぐクリア（次回リセット時に前回分と混ざらないように）
+
+  // ★2026-08-28: GW_DEVICE_ID はXIAO固有IDから生成する。checkRemoteCmd()が最初に
+  //   呼ばれるより前（=ここ）で必ず初期化すること。未初期化のままGASへ問い合わせると
+  //   全Gatewayが同じIDで予約を取り合ってしまう。
+  initGwDeviceId();
+
+  wdtInit(WDT_TIMEOUT_MS);  // 無人運用の安全網。以降 120 秒キックが無ければ自動リセット
+  lastGasSuccessMs = millis();  // アプリ層WDTの起点。以降computeAppWdtMs(sendIntervalMs)以内に送信成功が無ければ再起動
+
+  i2cBusRecovery();  // Wire.begin()より前に必ず実行（詳細は関数コメント参照）
+  Wire.begin();
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);  // SDカード非選択で起動
+#ifdef COMM_MODE_LORA
+  pinMode(LORA_M0M1_PIN, OUTPUT);
+  digitalWrite(LORA_M0M1_PIN, LOW);  // Normalモードで起動
+#endif
+
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000) yield();
+
+  Serial.println(F("\n===================================="));
+  Serial.println(F("  Monita Gateway v1"));
+  Serial.println(F("===================================="));
+  Serial.print(F("SIM: ")); Serial.println(SIM_NAME);
+  Serial.print(F("APN: ")); Serial.println(APN);
+
+  // ★2026-08-28: 個体識別・群の焼き間違いを現場で切り分けるための起動ログ。
+  Serial.print(F("GW_DEVICE_ID: ")); Serial.println(GW_DEVICE_ID);
+  Serial.print(F("XIAO固有ID: ")); Serial.println(&GW_DEVICE_ID[3]);  // "gw_"を除いた16桁
+  Serial.print(F("Gateway群: ")); Serial.print(GATEWAY_GROUP_ID);
+  Serial.print(F("（受信する子機DeviceID: 0x"));
+  Serial.print(GATEWAY_GROUP_ID * 0x20 + 0x01, HEX);
+  Serial.print(F("〜0x")); Serial.print(GATEWAY_GROUP_ID * 0x20 + 0x1F, HEX);
+  Serial.println(F("）"));
+  Serial.print(F("Gateway FW: ")); Serial.println(GATEWAY_FW_VERSION);
+#ifdef COMM_MODE_LORA
+  Serial.print(F("群")); Serial.print(GATEWAY_GROUP_ID);
+  Serial.println(F("・ダウンリンク有効"));
+#endif
+
+  Serial.print(F("[RESETREAS] 0x")); Serial.println(resetReason, HEX);
+  if (resetReason == 0) {
+    Serial.println(F("  - (フラグなし。パワーオン起動、または電源瞬断/ブラウンアウトの可能性)"));
+  }
+  if (resetReason & POWER_RESETREAS_RESETPIN_Msk) Serial.println(F("  - RESETPIN: 外部リセットピン"));
+  if (resetReason & POWER_RESETREAS_DOG_Msk)      Serial.println(F("  - DOG: ウォッチドッグタイマー満了"));
+  if (resetReason & POWER_RESETREAS_SREQ_Msk)     Serial.println(F("  - SREQ: ソフトウェアリセット（NVIC_SystemReset。アプリ層WDT等）"));
+  if (resetReason & POWER_RESETREAS_LOCKUP_Msk)   Serial.println(F("  - LOCKUP: CPUロックアップ"));
+  if (resetReason & POWER_RESETREAS_OFF_Msk)      Serial.println(F("  - OFF: GPIOによるOFF状態からの復帰"));
+  if (resetReason & POWER_RESETREAS_LPCOMP_Msk)   Serial.println(F("  - LPCOMP"));
+  if (resetReason & POWER_RESETREAS_DIF_Msk)      Serial.println(F("  - DIF: デバッグ割り込み"));
+  if (resetReason & POWER_RESETREAS_NFC_Msk)      Serial.println(F("  - NFC"));
+  if (resetReason & POWER_RESETREAS_VBUS_Msk)     Serial.println(F("  - VBUS: USB接続によるリセット"));
+
+  // RTC 初期化
+  if (rtc.begin()) {
+    rtcAvailable = true;
+    if (rtc.lostPower()) {
+      Serial.println(F("△ RTC が電源喪失 → ネットワーク接続後に網時刻(AT+CCLK)で自動設定します"));
+      s_rtcNeedsTimeSet = true;
+    }
+    Serial.println(F("✓ DS3231 初期化完了"));
+    Serial.print(F("  現在時刻: ")); Serial.println(getTimestamp());
+  } else {
+    Serial.println(F("✗ DS3231 が見つかりません（タイムスタンプは millis 基準）"));
+  }
+
+  // SD カード初期化（CS直結）
+  if (SD.begin(SD_CS_PIN)) {
+    sdAvailable = true;
+
+    // シリアルログのミラー先を開く（データCSVとは別ファイル）。以降のSerial.print/println
+    // は全てここにも複製される。追記モードなので前回起動分のログの後ろに継ぎ足される。
+    // ★ファイル名は8.3形式（拡張子除き8文字以内）に収めること。Arduino SDライブラリは
+    // 長いファイル名(LFN)に対応していないため、超えるとSD.open()が黙って失敗する。
+    gLogFile = SD.open("gwlog.csv", FILE_WRITE);
+    gLogAvailable = (bool)gLogFile;
+    if (!gLogAvailable) {
+      Serial.println(F("✗ gwlog.csv を開けませんでした（シリアルログのSD保存は無効）"));
+    }
+
+    Serial.println(F("✓ SD カード初期化完了"));
+
+    // ★2026-08-30 切り分け用: [RESETREAS]はSDログのオープンより前に出力されるため、
+    // gwlog.csvには一度も記録されていなかった（20起動分のログを確認済み）。
+    // 自然リセット直後はUSB CDCが落ちていてシリアルでも取り逃がすので、
+    // リセット原因を残せる場所がどこにも無い状態だった。ここで再掲する。
+    Serial.print(F("[RESETREAS/SD] 0x")); Serial.print(resetReason, HEX);
+    Serial.print(F(" 起動時刻=")); Serial.println(getTimestamp());
+
+    // ヘッダ行がなければ書く
+    if (!SD.exists("gateway.csv")) {
+      File f = SD.open("gateway.csv", FILE_WRITE);
+      if (f) { f.println("timestamp,mac,payload_hex,rssi"); f.close(); }
+    }
+  } else {
+    Serial.println(F("✗ SD カード初期化失敗（SD なしで続行）"));
+  }
+
+  recordMutex = xSemaphoreCreateMutex();
+
+#if TEST_INJECT_FAKE_DEVICE_COUNT > 0
+  // ★2026-07-24追加、2026-07-25更新: バッチ分割の動作確認用ダミーデータ注入。
+  // 実機を並べなくても、512バイトの動的分割ロジック（buildBatchQuery()）が
+  // 正しく複数バッチに割り振るかを検証できる。
+  {
+    int fakeN = TEST_INJECT_FAKE_DEVICE_COUNT;
+    if (fakeN > MAX_DEVICES) fakeN = MAX_DEVICES;
+    for (int i = 0; i < fakeN; i++) {
+      records[i].mac[0] = 0xFE; records[i].mac[1] = 0xFE; records[i].mac[2] = 0xFE;
+      records[i].mac[3] = 0xFE; records[i].mac[4] = 0xFE; records[i].mac[5] = (uint8_t)(0x80 + i);  // 疑似MAC（実デバイスと衝突しない0xFE系）
+      uint8_t fakePayload[19] = {0x04, (uint8_t)(0x80 + i), 1, 0,0, 0,0, 0,0, 0,0, 0,0, 0,0, 0,0,0,0};
+      memcpy(records[i].payload, fakePayload, sizeof(fakePayload));
+      records[i].payloadLen = sizeof(fakePayload);
+      records[i].rssi = -50 - i;
+      records[i].lastSeen = millis();
+    }
+    recordCount = fakeN;
+    Serial.print(F("[TEST] ダミー子機データを ")); Serial.print(fakeN); Serial.println(F(" 件注入しました"));
+  }
+#endif
+
+#ifdef COMM_MODE_BLE
+  // BLE 初期化
+  Bluefruit.begin(0, 1);  // 0 peripheral, 1 central
+  Bluefruit.setName("MonitaGateway");
+  Bluefruit.Scanner.setRxCallback(scanCallback);
+  Bluefruit.Scanner.useActiveScan(false);
+  Bluefruit.Scanner.setInterval(
+    (uint16_t)(SCAN_INTERVAL_MS * 1000 / 625),
+    (uint16_t)(SCAN_WINDOW_MS   * 1000 / 625)
+  );
+  Serial.println(F("✓ BLE 初期化完了"));
+#endif
+
+#ifdef COMM_MODE_LORA
+  // 保存済み送信間隔を内蔵フラッシュから復元（コントローラーで変更した値の永続化）
+  loadConfig();
+
+  // コントローラー連携BLE（GATTサーバ）初期化・広告開始
+  bleControllerBegin();
+
+  // LoRa（E220）初期化
+  loraSerial.begin(9600);  // E220-900T22S(JP) デフォルト（要データシート確認）
+  delay(500);              // E220 起動待ち（暫定値、要実測）
+  loraModeNormal();
+  s_loraConfigOk = loraCheckAndConfigure();  // 結果はBLEステータスからも確認できる（PC非接続時の診断用）
+  loraKickTx();               // 受信不能ラッチの解除（詳細はloraKickTx()のコメント参照）
+  s_loraLastRxMs = millis();  // ストール監視の起点（config中のバイトは数えないのでここで初期化）
+  if (!s_loraConfigOk) {
+    Serial.println(F("✗ LoRa設定確認に失敗（配線・電源を確認してください）"));
+  }
+  Serial.println(F("✓ LoRa 初期化完了"));
+#endif
+
+#if !LTEM_SEND_ENABLED
+  // ★2026-07-23: LTE-M送信無効（SD記録のみモード）。SIM7080Gの初期化・ネットワーク接続は
+  // 一切行わず、BLE（またはLoRa）受信データを updateRecordFromPayload() 内で直接SDへ記録する。
+  Serial.println(F("\n△ LTEM_SEND_ENABLED=false: SIM7080G初期化・LTE-M送信をスキップ（SD記録のみモード）"));
+#ifdef COMM_MODE_BLE
+  Bluefruit.Scanner.start(0);
+  Serial.println(F("✓ BLE スキャン開始（SD記録のみモード）"));
+#endif
+#else
+  // ── SIM7080G 初期化シーケンス ──────────────────
+  // SIM7080GはXIAOの5Vに常時直結（AC電源、v1.0と同じ方式）のため、
+  // ソフトウェアでの電源投入シーケンスは不要。
+  Serial.println(F("\n========== SIM7080G 初期化 =========="));
+
+  // [STAGE 1] UART 設定
+  Serial1.setPins(7, 6);  // RX=D7, TX=D6
+  Serial1.begin(115200);
+  simStage("STAGE1: UART 設定 (D6=TX, D7=RX, 115200bps)", true);
+
+  // [STAGE 2] 起動待ち
+  for (int i = 0; i < 15; i++) {
+    delay(1000);
+    while (Serial1.available()) Serial1.read();  // 起動中の不定バイトは読み捨てる
+  }
+  simStage("STAGE2: SIM7080G 起動待ち (15秒) 完了", true);
+
+#ifdef COMM_MODE_BLE
+  // SIM7080G 起動待ちが終わった時点で BLE スキャンを開始する。
+  // UART（Serial1, SIM7080G通信）と BLE 無線はハードウェア的に独立しているため、
+  // STAGE3〜6（AT疎通確認〜ネットワーク接続）の間もスキャンを継続してよい。
+  // これにより起動確認送信までに子機データがより多く貯まる。
+  Bluefruit.Scanner.start(0);
+  Serial.println(F("✓ BLE スキャン開始"));
+#endif
+
+  // [STAGE 3] AT 疎通確認
+  bool atOk = false;
+  Serial.print(F("[   ] STAGE3: AT 疎通確認"));
+  for (int t = 0; t < 20; t++) {
+    Serial.print('.');
+    Serial1.print("AT\r\n"); delay(500);
+    String r = "";
+    unsigned long s = millis();
+    while (millis() - s < 500) { while (Serial1.available()) r += (char)Serial1.read(); yield(); }
+    if (r.indexOf("OK") >= 0) { atOk = true; break; }
+    while (Serial1.available()) Serial1.read();
+  }
+  Serial.println();
+  simStage("STAGE3: AT 疎通", atOk);
+  if (!atOk) {
+    Serial.println(F("  → 配線・電源を確認してください"));
+    Serial.println(F("  → D6(TX)→SIM RX / D7(RX)←SIM TX / 5V 供給 OK?"));
+    return;
+  }
+
+  // [STAGE 4] 工場出荷設定にリセット（デバッグ等で変更された NVM 設定を初期化）
+  Serial.println(F("[   ] STAGE4: モデム設定をリセット中..."));
+  sendAT("AT&F", 3000);        // 工場出荷設定に戻す
+  delay(500);
+  sendAT("AT+CFUN=1,1", 3000); // ソフトリセット（SIM 再初期化）
+  delay(5000);                  // リセット完了待ち
+
+  // リセット後の AT 疎通再確認
+  bool atOk2 = false;
+  for (int t = 0; t < 10; t++) {
+    Serial1.print("AT\r\n"); delay(500);
+    String r = "";
+    unsigned long s = millis();
+    while (millis() - s < 500) { while (Serial1.available()) r += (char)Serial1.read(); yield(); }
+    if (r.indexOf("OK") >= 0) { atOk2 = true; break; }
+    while (Serial1.available()) Serial1.read();
+  }
+  simStage("STAGE4: モデムリセット (AT&F + CFUN=1,1)", atOk2);
+  if (!atOk2) { Serial.println(F("  → リセット後に応答なし")); return; }
+
+  // [STAGE 5] エコーオフ・SIM 確認
+  // ★2026-08-10(v1.20): ATE0が実際に効いたかを応答の中身で検証する。
+  //   直前のAT+CFUN=1,1はモジュールを再起動させるため、待ち時間が足りないと
+  //   再起動中にATE0が送られて失われ、エコーが有効なまま残る。エコーが有効だと
+  //   長いコマンドを送っている最中に同じ量が返ってきて受信バッファを圧迫し、
+  //   以降の応答受信まで壊れる（実機で確認済み）。
+  bool echoOff = false;
+  for (int t = 0; t < 5 && !echoOff; t++) {
+    String r = sendAT("ATE0", 2000);
+    // エコーが切れていれば応答にコマンド文字列("ATE0")は含まれない
+    if (r.indexOf("OK") >= 0 && r.indexOf("ATE0") < 0) echoOff = true;
+    else delay(300);
+  }
+  simStage("STAGE5: エコー無効化 (ATE0)", echoOff);
+  String cpinRes = sendAT("AT+CPIN?", 3000);
+  bool simReady = cpinRes.indexOf("READY") >= 0;
+  simStage("STAGE5: SIM カード認識 (CPIN=READY)", simReady);
+  if (!simReady) {
+    Serial.print(F("  → CPIN 応答: ")); Serial.println(cpinRes);
+    Serial.println(F("  → SIM カードが刺さっているか確認してください"));
+  }
+
+  // [STAGE 6] ネットワーク初期化
+  Serial.println(F("[   ] STAGE6: ネットワーク初期化..."));
+  bool netOk = initNetwork();
+  s_lastNetOk = netOk;  // コントローラー向けステータス用にキャッシュ
+  simStage("STAGE6: ネットワーク接続", netOk);
+  if (!netOk) {
+    Serial.println(F("  → APN 設定・SIM 契約・電波状況を確認してください"));
+    Serial.println(F("  → BLE スキャンは継続します（LTE-M なしで SD 保存のみ）"));
+  } else if (rtcAvailable) {
+    // ★2026-07-24: 従来は lostPower()（DS3231のバックアップ電源喪失＝OSFフラグ）が
+    // 立った時だけ網時刻補正していたが、これだと「電源は喪失していないが最初から
+    // 間違った時刻がセットされている」場合に一度も補正されない問題があった
+    // （実機でGatewayのRTCが実際の日付と9日以上ずれたまま動き続ける事象を確認）。
+    // 電源喪失の有無に関わらず、ネットワーク接続に成功するたびに毎回網時刻で補正する
+    // （起動のたびに1回AT+CCLKを叩くだけなのでコストは無視できる）。
+    if (syncRtcFromNetworkTime()) s_rtcNeedsTimeSet = false;
+    else Serial.println(F("△ 網時刻の取得に失敗（次回起動時に再試行）"));
+  }
+
+  Serial.println(F("=====================================\n"));
+
+// 起動直後にも一度コマンドを確認する（次の定期送信を待たずに動作確認できるようにするため）
+#if PROBE_CONTENT_LENGTH_URL
+  // ★切り分け用（2026-08-10）: Content-Lengthが付く固定URLをHTTPTOFSで取得してみる。
+  //   成功する → モデム・回線は本文を取得できる。GASのchunked応答が扱えないのが原因。
+  //   失敗する → モデムまたは回線が本文を取得できない状態。chunkedとは別の問題。
+  //   確認が済んだらPROBE_CONTENT_LENGTH_URLを0に戻すこと。
+  if (netOk) {
+    // ★対照実験（2026-08-10）。同一ホスト(www.google.com)で条件を1つずつ変えて比較する。
+    //   A: Content-Lengthあり・大(6624B)
+    //   B: Content-Lengthあり・小(286B)   ← 本文サイズの影響を切り分けるため
+    //   C: 本編のGAS取得（chunked・671B）  ← このあと実行される
+    //   AとBが成功してCだけ失敗するなら、ホスト・TLS・本文サイズは要因から外れ、
+    //   残る違いは応答形式（chunked）だけになる。
+    //   ※前回 example.com で試したときは status=601（Network Error）で、そもそも
+    //     到達できておらず対照にならなかった。同一ホストに揃えたのはそのため。
+    Serial.println(F("\n===== 応答形式の対照テスト ====="));
+
+    String probeA = httpGetViaFs("https://www.google.com/robots.txt", true);
+    int statusA = s_lastHttpStatus;
+    Serial.print(F("[PROBE] A: Content-Lengthあり(6624B) status=")); Serial.print(statusA);
+    Serial.print(F(" 取得=")); Serial.println(probeA.length());
+
+    String probeB = httpGetViaFs("https://www.google.com/humans.txt", true);
+    int statusB = s_lastHttpStatus;
+    Serial.print(F("[PROBE] B: Content-Lengthあり(286B)  status=")); Serial.print(statusB);
+    Serial.print(F(" 取得=")); Serial.println(probeB.length());
+
+    if (probeA.length() > 0 && probeB.length() > 0) {
+      Serial.println(F("[PROBE] Content-Length付きは大小とも取得できる"));
+      Serial.println(F("[PROBE] → このあとのGAS取得(chunked)が失敗するなら、応答形式が要因"));
+    } else {
+      Serial.println(F("[PROBE] Content-Length付きでも失敗 → 応答形式とは別の問題"));
+    }
+    Serial.println(F("=================================\n"));
+  }
+#endif
+
+  if (netOk) {
+#if DIAG_SKIP_BOOT_CMD_CHECK
+    Serial.println(F("[DIAG] 起動時のcheckRemoteCmd()をスキップします（切り分け用）"));
+#else
+    checkRemoteCmd();  // 起動直後に一度、コマンドとダウンリンク予約を取得する
+#endif
+#ifdef COMM_MODE_LORA
+    lastCmdCheck = millis();
+    nextCmdCheckIntervalMs = makeCmdCheckIntervalMs();  // 次回は固定周期にせず衝突時刻をずらす
+#endif
+  }
+
+#if BOOT_SCAN_SEND
+  if (netOk) {
+    Serial.println(F("===== 起動確認: 設定情報＋受信済み子機データを送信 ====="));
+    Serial.println(F("[起動確認 1/2] 設定情報を送信中..."));
+    postBootInfoRow();
+    Serial.println(F("[起動確認 2/2] 受信済み子機データを送信中..."));
+    flushRecords();
+    lastSend = millis();  // 次の定期送信サイクルはここから起算する
+    Serial.println(F("[起動確認] 完了"));
+    Serial.println(F("=======================================================\n"));
+  }
+#endif
+#endif  // LTEM_SEND_ENABLED
+}
+
+// ══════════════════════════════════════════════
+// loop
+//
+// AC電源（XIAO Type-C給電）での常時稼働モデル（v1.0と同じ）。
+// BLE常時スキャン（またはLoRa常時待ち受け）＋ SEND_INTERVAL_MS ごとに定期送信。
+// バッテリー駆動用のディープスリープ間欠動作は不要になったため未実装
+// （旧設計は gateway_v1.10_ARCHIVE_battery_TCA9534_design.md 参照）。
+// ══════════════════════════════════════════════
+static uint32_t lastHeartbeat = 0;
+
+void loop() {
+  wdtFeed();          // BLE スキャン/LoRa待ち受けのみで sendAT が呼ばれない期間もハング扱いされないよう給餌
+#if LTEM_SEND_ENABLED
+  appWatchdogCheck();  // 一定時間 GAS 送信成功が無ければ強制再起動（ソフトハング対策）
+#endif
+  uint32_t now = millis();
+
+#ifdef COMM_MODE_LORA
+  loraPoll();                 // 受信バッファを読み切り、フレームが完成していればレコードへ反映
+  handlePendingBleCommands(); // コントローラーからのBLE設定/コマンド要求を安全なタイミングで実行
+#endif
+
+  // デバッグ心拍: 10秒ごとに次回送信までの残り時間を表示
+  if (now - lastHeartbeat >= 10000) {
+    lastHeartbeat = now;
+    Serial.print(F("[HB] now=")); Serial.print(now);
+    Serial.print(F(" lastSend=")); Serial.print(lastSend);
+    Serial.print(F(" 残り=")); Serial.print((long)(sendIntervalMs - (now - lastSend)));
+    Serial.print(F("ms 受信台数=")); Serial.print(recordCount);
+    // HFCLK供給源（PC接続時とバッテリー駆動時で差が出るかの確認用。readHfclkStatus()のコメント参照）
+    Serial.print(F(" HFCLK="));
+    Serial.print((NRF_CLOCK->HFCLKSTAT & CLOCK_HFCLKSTAT_SRC_Msk) ? F("XTAL(HFXO)") : F("RC(HFINT)"));
+#ifdef COMM_MODE_LORA
+    // BLEステータス[8][9][10]と同じ値。PC接続時の基準値を取るために出す
+    Serial.print(F(" LoRa[rxB=")); Serial.print(s_loraRxBytes);
+    Serial.print(F(" cksumNG=")); Serial.print(s_loraCksumNg);
+    Serial.print(F(" 棄却=")); Serial.print(s_loraRejected);
+    Serial.print(F("(type=")); Serial.print(s_loraRejPktType);
+    Serial.print(F(" 群=")); Serial.print(s_loraRejGroup);
+    Serial.print(F(" ID0=")); Serial.print(s_loraRejLocalNo);
+    Serial.print(F(" len=")); Serial.print(s_loraRejLen);
+    Serial.print(F(")"));
+    Serial.print(F(" frames=")); Serial.print(s_loraFramesOk);
+    Serial.print(F(" err=0x")); Serial.print(s_loraErrSrcAcc, HEX);
+    Serial.print(F(" rekick=")); Serial.print(s_loraRekicks);
+    Serial.print(F("]"));
+#endif
+    Serial.println();
+#ifdef COMM_MODE_LORA
+    updateStatusChar();  // コントローラーへ最新状態を反映（接続中はnotify）
+#endif
+    gLogPeriodicCommit();  // gwlog.csvのFATサイズ情報を10秒おきに確定させる
+  }
+
+#if LTEM_SEND_ENABLED
+#ifdef COMM_MODE_LORA
+  // ★v1.20: 溜まった報告があれば、予約確認の周期を待たずに送る。
+  if (hasQueuedReports() && (now - lastReportTry >= REPORT_RETRY_INTERVAL_MS)) {
+    lastReportTry = now;
+    if (ensureNetworkReady()) processReportQueue();
+  }
+
+  // ★v1.20: テレメトリ送信サイクルとは別に、ダウンリンク予約を短い周期で確認する。
+  //   ここではデータ送信(flushRecords)は行わない。予約の取得と結果報告だけを行う。
+  //   ※この直後の送信ブロックが動く場合はそちらでも確認するが、lastCmdCheckを
+  //     更新し合うので二重に走ることはない。
+  if (now - lastCmdCheck >= nextCmdCheckIntervalMs) {
+    Serial.print(F("\n=== ダウンリンク予約の確認（本文取得の累計 "));
+    Serial.print(s_gasFetchOk); Serial.print(F("/")); Serial.print(s_gasFetchTry);
+    Serial.println(F(" 成功） ==="));
+    if (ensureNetworkReady()) {
+      checkRemoteCmd();
+      processReportQueue();
+    } else {
+      Serial.println(F("[CACHE] ネットワーク未接続のため確認をスキップします"));
+    }
+    lastCmdCheck = millis();
+    nextCmdCheckIntervalMs = makeCmdCheckIntervalMs();  // 今回の確認完了後、次周期も乱数でずらす
+  }
+#endif
+
+  if (now - lastSend >= sendIntervalMs) {
+    lastSend = now;
+    Serial.println(F("\n=== 定期送信 ==="));
+    Serial.print(F("時刻: ")); Serial.println(getTimestamp());
+
+#if TEST_PERIODIC_FAKE_DATA
+    // ★2026-08-04追加: スプレッドシート側の動作確認用に、送信サイクルごとに
+    // ダミーCH値（時刻に応じて変化）を1台分注入する。実機のFlex子機がなくても
+    // 定期的にデータが増えていくのを確認できる。既存のupdateRecordFromPayload()
+    // （BLE/LoRa受信時と同じ、ミューテックス保護済みの反映処理）をそのまま使う。
+    {
+      static int s_fakeSeq = 0;
+      s_fakeSeq++;
+      uint8_t fakeMac[6] = {0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0x90};
+      int16_t ch1 = 100 + (s_fakeSeq % 20);
+      int16_t ch2 = 200 + (s_fakeSeq % 30);
+      int16_t ch3 = 300 - (s_fakeSeq % 15);
+      int16_t ch4 = 400 + (s_fakeSeq % 10);
+      uint8_t fakePayload[19] = {
+        0x04, 0x90, 1,
+        (uint8_t)(ch1 & 0xFF), (uint8_t)((ch1 >> 8) & 0xFF),
+        (uint8_t)(ch2 & 0xFF), (uint8_t)((ch2 >> 8) & 0xFF),
+        (uint8_t)(ch3 & 0xFF), (uint8_t)((ch3 >> 8) & 0xFF),
+        (uint8_t)(ch4 & 0xFF), (uint8_t)((ch4 >> 8) & 0xFF),
+        0, 0, 0, 0, 0, 0, 0, 0
+      };
+      updateRecordFromPayload(fakeMac, fakePayload, sizeof(fakePayload), -50);
+      Serial.print(F("[TEST] ダミーデータ注入 seq=")); Serial.print(s_fakeSeq);
+      Serial.print(F(" CH1=")); Serial.print(ch1);
+      Serial.print(F(" CH2=")); Serial.print(ch2);
+      Serial.print(F(" CH3=")); Serial.print(ch3);
+      Serial.print(F(" CH4=")); Serial.println(ch4);
+    }
+#endif
+
+    Serial.print(F("受信済み Flex 台数: ")); Serial.println(recordCount);
+
+#ifdef COMM_MODE_BLE
+    // 送信中は BLE スキャンを停止（LTE-M 通信中の割り込み負荷を減らす）
+    Bluefruit.Scanner.stop();
+#endif
+    // ★2026-08-04: 子機データの有無に関わらず、送信サイクルごとに必ずリモートコマンドを
+    // 確認する（flushRecords()内は子機データ0件だと早期returnするため、ここで独立して呼ぶ）。
+    if (ensureNetworkReady()) {
+      checkRemoteCmd();
+#ifdef COMM_MODE_LORA
+      lastCmdCheck = millis();
+      nextCmdCheckIntervalMs = makeCmdCheckIntervalMs();  // 定期送信内の確認後も次周期をずらす
+      // ★v1.20: ダウンリンクの送信・確認応答の報告をGASへ流す。
+      //   loraPoll()の中（＝AT通信の待機ループ内）から送るとAT通信が入れ子になって
+      //   破綻するため、キューに積んでおいたものをここで安全にまとめて送る。
+      processReportQueue();
+#endif
+    }
+    // ★2026-08-04: stopコマンドで一時停止中はGASへの送信をスキップする（BLE/LoRa受信・
+    // check_cmdの確認は上で既に実行済みなので、再開/送信コマンドはこの後も受け取れる）。
+    // send_nowコマンドを受けていれば、一時停止中でも今回だけ強制的に送信する。
+    if (!s_gasSendPaused || s_forceSendOnce) {
+      s_forceSendOnce = false;
+      flushRecords();
+    } else {
+      Serial.println(F("[STOP] データ送信を一時停止中のためスキップします"));
+    }
+#ifdef COMM_MODE_BLE
+    Bluefruit.Scanner.start(0);
+#endif
+  }
+
+  // 手動 AT コマンドモード（シリアルから入力）
+  if (Serial.available()) {
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) sendAT(line);
+  }
+  while (Serial1.available()) Serial.write(Serial1.read());
+#endif  // LTEM_SEND_ENABLED
+}

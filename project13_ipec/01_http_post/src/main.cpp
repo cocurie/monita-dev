@@ -1,5 +1,5 @@
 /**
- * case_other/ipec/01_http_post — LoRa受信値 → iPECサーバー HTTPS POST 実機テスト
+ * project13_ipec/01_http_post — LoRa受信値 → iPECサーバー HTTPS POST 実機テスト
  *
  * 【目的】
  *   実運用に近い構成での疎通テスト:
