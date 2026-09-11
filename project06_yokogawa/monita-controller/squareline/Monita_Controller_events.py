@@ -22,3 +22,23 @@ def on_tare_clicked(event_struct):
 def on_disconnect_clicked(event_struct):
     return
 
+
+def on_dump_clicked(event_struct):
+    return
+
+
+def on_back_clicked(event_struct):
+    return
+
+
+def on_start_clicked(event_struct):
+    return
+
+
+def on_stop_clicked(event_struct):
+    return
+
+
+def on_settings_clicked(event_struct):
+    return
+

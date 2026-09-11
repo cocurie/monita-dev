@@ -374,6 +374,33 @@ static void set_label_async(lv_obj_t* label, const String& text) {
     lv_async_call(apply_label_update, u);
 }
 
+struct SpinboxUpdate { lv_obj_t* spinbox; int32_t value; };
+
+static void apply_spinbox_update(void* p) {
+    SpinboxUpdate* u = (SpinboxUpdate*)p;
+    if (u->spinbox != nullptr && lv_obj_is_valid(u->spinbox)) {
+        lv_spinbox_set_value(u->spinbox, u->value);
+    }
+    delete u;
+}
+
+static void set_spinbox_value_async(lv_obj_t* spinbox, int32_t value) {
+    SpinboxUpdate* u = new SpinboxUpdate();
+    u->spinbox = spinbox;
+    u->value = value;
+    lv_async_call(apply_spinbox_update, u);
+}
+
+// msgの中から "KEY=" を探し、次の ';' または末尾までの値を返す。見つからなければ isFound=false。
+static String extractField(const String& msg, const char* key, bool& isFound) {
+    int idx = msg.indexOf(key);
+    if (idx < 0) { isFound = false; return String(); }
+    int start = idx + strlen(key);
+    int end = msg.indexOf(';', start);
+    isFound = true;
+    return (end >= 0) ? msg.substring(start, end) : msg.substring(start);
+}
+
 class MonitaClientCallbacks : public NimBLEClientCallbacks {
     void onConnect(NimBLEClient* pClient) override {
         bleConnected = true;
@@ -472,15 +499,49 @@ static void bleNotifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData,
         return;
     }
 
-    // GET/OK:INTERVAL 応答例: "INTERVAL=1;N=5;M=5;RUN=1;DEVID=1;TIME=..."（INTERVALは分単位）
-    int idx = msg.indexOf("INTERVAL=");
-    if (idx >= 0) {
-        int start = idx + 9;
-        int end = msg.indexOf(';', start);
-        String interval = (end >= 0) ? msg.substring(start, end) : msg.substring(start);
-        set_label_async(ui_sleepDisplay, "Interval: " + interval + " min.");
+    // GET応答例: "INTERVAL=1;N=5;M=5;RUN=1;DEVID=1;TIME=..."（INTERVALは分単位）。
+    // GET応答時は、Setting画面のラベルとスピンボックスの現在値の両方を実機の設定に同期する
+    // （「現在設定→編集→保存」の流れにするため。GET応答以外ではスピンボックス値は書き換えない
+    //   ＝ユーザーが今まさに編集中の値を横から上書きしないようにする）。
+    bool hasInterval, hasN, hasM;
+    String intervalVal = extractField(msg, "INTERVAL=", hasInterval);
+    String nVal        = extractField(msg, "N=", hasN);
+    String mVal        = extractField(msg, "M=", hasM);
+
+    if (hasInterval) {
+        set_label_async(ui_sleepDisplay, "Interval: " + intervalVal + " min.");
+        if (hasN && hasM) {
+            // 3つ揃っているのはGET応答のときだけ＝実機の現在値をスピンボックスへ反映してよい
+            set_spinbox_value_async(ui_Spinbox1, intervalVal.toInt());
+            set_spinbox_value_async(ui_Spinbox2, nVal.toInt());
+            set_spinbox_value_async(ui_Spinbox3, mVal.toInt());
+        }
     } else if (msg.startsWith("OK:INTERVAL=")) {
         set_label_async(ui_sleepDisplay, "Interval: " + msg.substring(12) + " min.");
+    } else if (msg == "ERR:INTERVAL") {
+        Serial.println("[BLE] Interval設定エラー（5〜1440分の範囲外）");
+    }
+
+    if (hasN) {
+        set_label_async(ui_Interval, "Average:" + nVal + "times");
+    } else if (msg.startsWith("OK:AVGN=")) {
+        set_label_async(ui_Interval, "Average:" + msg.substring(8) + "times");
+    } else if (msg == "ERR:AVGN") {
+        Serial.println("[BLE] Average回数設定エラー（1〜50の範囲外）");
+    }
+
+    if (hasM) {
+        set_label_async(ui_Interval1, "Median:" + mVal + "times");
+    } else if (msg.startsWith("OK:AVGM=")) {
+        set_label_async(ui_Interval1, "Median:" + msg.substring(8) + "times");
+    } else if (msg == "ERR:AVGM") {
+        Serial.println("[BLE] Median回数設定エラー（1〜25の範囲外）");
+    }
+
+    if (msg == "OK:TARE") {
+        Serial.println("[BLE] Tare完了（CH1-5すべて成功）");
+    } else if (msg == "ERR:TARE_PARTIAL") {
+        Serial.println("[BLE] Tare一部失敗（CH1-5のいずれかでエラー）");
     }
 
     // GET応答("RUN=1;...")・START/STOP応答("OK:RUN=1"/"OK:RUN=0")のいずれにも対応
@@ -910,6 +971,20 @@ void setup()
     Serial.println("Setup done");
 }
 
+// ★ESP32/NimBLEの既知の問題対策: 連続スキャンを長時間続けると新規デバイスの発見や
+// 既存デバイスの検出が劣化していく現象があるため、接続していない間は定期的にスキャンを
+// 再起動して回避する（2026-09-10、実機で長時間安定動作を確認済み）。
+static void bleScanAutoRestart() {
+    static uint32_t lastRestart = 0;
+    static const uint32_t SCAN_RESTART_INTERVAL_MS = 10000;
+    uint32_t now = millis();
+    if (now - lastRestart < SCAN_RESTART_INTERVAL_MS) return;
+    lastRestart = now;
+    if (pBleClient != nullptr && pBleClient->isConnected()) return;
+    pBleScan->stop();
+    pBleScan->start(0, nullptr, false);
+}
+
 void loop()
 {
     lv_timer_handler();
@@ -917,5 +992,6 @@ void loop()
     deviceListAutoRefresh();
     measureScreenAutoRefresh();
     dumpWriteIfReady();
+    bleScanAutoRestart();
     delay(5);
 }
