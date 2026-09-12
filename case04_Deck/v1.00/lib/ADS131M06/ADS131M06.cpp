@@ -127,6 +127,10 @@ bool ADS131M06::begin(SPIClass& spi, uint8_t csPin, uint8_t drdyPin,
   settings_ = SPISettings(spiHz, MSBFIRST, SPI_MODE1);
   crcFallback_ = false;
 
+  // 取りこぼし検出の時間基準。★GC の有無を見て正しい式で求める
+  const double sps = dataRateSps(cfg);
+  samplePeriodUs_  = (sps > 0.0) ? (uint32_t)(1000000.0 / sps + 0.5) : 0;
+
   if (beginOnce(cfg)) return true;
 
   // ★入力CRCを有効にしたまま初期化に失敗したときは、CRCを切って一度だけ再試行する。
@@ -151,6 +155,8 @@ bool ADS131M06::beginOnce(const Config& cfg) {
   rxCrcEn_ = false;   // UNLOCK/RESET を送る間はまだ入力CRCを使わない
   seq_     = 0;
   stats_   = Stats();
+  haveLastRead_     = false;   // 初期化中のレジスタ操作を欠測と誤判定しないため
+  pendingFifoClear_ = false;
 
   pinMode(csPin_, OUTPUT);
   digitalWrite(csPin_, HIGH);
@@ -303,6 +309,38 @@ bool ADS131M06::verifyRegisters(const Config& cfg, Stream* log) {
 // データ読み出し
 // ─────────────────────────────────────────────────────────────
 bool ADS131M06::readFrame(Frame& out) {
+  // ── 中断からの復帰処理（データシート §8.5.1.9.1）──
+  // 出力FIFOはCHあたり2段ある。**1つでも読み落とすと両方埋まり、以後DRDYの挙動が
+  // 不定になる。**「SYNC/RESET を叩く」か「2フレームを素早く読む」のどちらかが要る。
+  // 本機の SYNC/RESET は I²Cエキスパンダの先にあり ISR から叩けないので、後者を使う。
+  // ここで古い方を1つ捨て、直後の本読み出しが2つ目になる。
+  if (pendingFifoClear_) {
+    uint8_t dump[FRAME_BYTES];
+    transferFrame(CMD_NULL, nullptr, 0, dump);
+    stats_.fifoClears++;
+    pendingFifoClear_ = false;
+  }
+
+  // ── 取りこぼしの検出（F-5）──
+  // ★STATUS の DRDY ビットでは検出できない。データシート §8.5.1.9.1 のとおり
+  //   DRDY フラグは「2つとも読むまで」立ったままなので、1つ落としても 0x3F のままである。
+  //   （2026-09-12 の実装は `drdy != 0x3F` を欠測として数えていた。機能していない）
+  //   実際に効くのは**読み出し間隔**である。1周期を大きく超えていれば、その差分が欠測。
+  out.gapBefore = 0;
+  const uint32_t nowUs = micros();
+  if (haveLastRead_ && samplePeriodUs_ > 0) {
+    const uint32_t dt = nowUs - lastReadUs_;           // オーバーフローしても差は正しい
+    if (dt > samplePeriodUs_ + samplePeriodUs_ / 2) {  // 1.5周期を超えたら取りこぼし
+      const uint32_t slots = (dt + samplePeriodUs_ / 2) / samplePeriodUs_;
+      out.gapBefore = (slots > 0) ? (slots - 1) : 0;
+      stats_.dropped += out.gapBefore;
+      stats_.gaps++;
+      pendingFifoClear_ = true;   // 次の読み出しの前にFIFOを空にする
+    }
+  }
+  lastReadUs_   = nowUs;
+  haveLastRead_ = true;
+
   uint8_t rx[FRAME_BYTES];
   transferFrame(CMD_NULL, nullptr, 0, rx);
 
@@ -324,15 +362,7 @@ bool ADS131M06::readFrame(Frame& out) {
   if (out.status & (ST_CRC_ERR | ST_REG_MAP)) stats_.statusErr++;
   if (out.status & ST_F_RESYNC) stats_.resyncs++;
 
-  // ── DRDY 取りこぼしの検出（F-5）──
-  // STATUS の DRDY0〜5 は「前回の読み出し以降に新しい変換結果が出たCH」を示す。
-  // 全CH同時変換なので、正常なら毎フレーム 0x3F が立つ。立っていないCHがあれば
-  // 読むのが速すぎた（＝まだ変換前）、逆に前回のフレームを読み落とすと
-  // 変換結果が上書きされる。ここでは「立っていないビットがある」ことを異常として数える。
-  const uint16_t drdy = out.status & ST_DRDY_MASK;
-  const uint16_t enabled = 0x3F;
-  if (drdy != enabled) stats_.dropped++;
-  lastDrdyBits_ = drdy;
+  lastDrdyBits_ = (uint16_t)(out.status & ST_DRDY_MASK);
 
   return out.crcOk;
 }

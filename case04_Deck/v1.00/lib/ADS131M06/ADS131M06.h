@@ -140,12 +140,17 @@ public:
     uint16_t crcCalc = 0;        // 計算したCRC
     bool     crcOk = false;
     uint32_t seq = 0;            // サンプル連番（F-5）
+    // ★このサンプルの「直前」に取りこぼした数。呼び出し側はこのぶん
+    //   リングの番号を進めること（SampleRing::pushGap）。進めないと番号が時刻を表さなくなる。
+    uint32_t gapBefore = 0;
   };
 
   struct Stats {
     uint32_t frames    = 0;  // 読んだフレーム総数（欠測率の母数・M-7/M-8）
     uint32_t crcErrors = 0;  // 出力CRC不一致（F-2）
-    uint32_t dropped   = 0;  // DRDY取りこぼし推定数（F-5）
+    uint32_t dropped   = 0;  // 取りこぼしたサンプル数の推定（F-5）。★読み出し間隔から求める
+    uint32_t gaps      = 0;  // 取りこぼしが起きた「回数」（連続欠測は1回と数える）
+    uint32_t fifoClears= 0;  // 中断復帰時にFIFOを吐き出させた回数（§8.5.1.9.1）
     uint32_t statusErr = 0;  // STATUS に CRC_ERR / REG_MAP が立った回数
     uint32_t resyncs   = 0;  // F_RESYNC 検出回数
   };
@@ -180,6 +185,15 @@ public:
    * CRC 不一致でも Frame は埋め、crcOk=false を返す（捨てるかどうかは呼び出し側の判断）。
    */
   bool readFrame(Frame& out);
+
+  /** 1サンプルの想定周期 [µs]（設定から算出）。0 なら未初期化 */
+  uint32_t samplePeriodUs() const { return samplePeriodUs_; }
+
+  /**
+   * 中断が起きたことを外から知らせる（SD書込みなどで読み出しを飛ばしたとき）。
+   * 次の readFrame() の先頭でFIFOを吐き出させる。**呼ばないとDRDYの挙動が不定になる。**
+   */
+  void notifyPaused() { pendingFifoClear_ = true; haveLastRead_ = false; }
 
   /**
    * 入力CRCを切って初期化し直したか。
@@ -253,6 +267,12 @@ private:
   bool     crcFallback_ = false;   // 入力CRCを切って初期化し直したか（診断用）
   uint32_t seq_     = 0;
   uint16_t lastDrdyBits_ = 0;
+  // ★取りこぼし検出の時間基準。begin() で dataRateSps() から求める。
+  //   STATUS の DRDY ビットでは検出できないため（§8.5.1.9.1）、間隔で見るしかない。
+  uint32_t samplePeriodUs_ = 0;
+  uint32_t lastReadUs_     = 0;
+  bool     haveLastRead_   = false;
+  bool     pendingFifoClear_ = false;  // 次の読み出し前にFIFOを吐き出させるか
   Stats    stats_;
 
   /** 1フレーム送受信する。txWord0 が先頭語（コマンド）。rx が null なら読み捨て */

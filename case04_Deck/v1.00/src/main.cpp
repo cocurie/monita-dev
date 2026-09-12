@@ -188,15 +188,24 @@ static ADS131M06::Frame  s_lastFrame;
 
 static void onDrdyFalling() {
   // F-4：割込みコンテキストで完結させる。8 MHz・24バイトで約 24 µs。
-  // 以下の処理はすべて整数演算 6CH 分で、976 Hz に対して十分軽い。
+  // 以下の処理はすべて整数演算 6CH 分で、1295 Hz に対して十分軽い。
   ADS131M06::Frame f;
   const bool ok = adc.readFrame(f);
   s_isrFrames++;
   if (!ok) s_isrCrcErrors++;
 
-  // ★CRC 不一致のサンプルはリングにもパイプラインにも入れない。
-  //   欠測として数えるだけにする（M-7/M-8 の母数は adc.stats() 側で持つ）
-  if (!ok) { s_lastFrame = f; s_haveSample = true; return; }
+  // ★取りこぼしたぶん、先に番号を進めておく。
+  //   詰めて格納すると**サンプル番号が時刻を表さなくなり**、継続時間・プリ/ポスト長・
+  //   変化率の判定が実時間より伸びる（Codexレビュー指摘）。欠測は欠測として残す。
+  if (f.gapBefore) ring.pushGap(f.gapBefore);
+
+  // ★CRC 不一致のサンプルはパイプラインに入れない。ただし**番号は進める。**
+  //   ここで進めないと、上と同じ理由で時間軸がずれる。
+  if (!ok) {
+    ring.pushGap(1);
+    s_lastFrame = f; s_haveSample = true;
+    return;
+  }
 
   const uint32_t idx = ring.count();   // このサンプルの絶対番号（push 前に取る）
   ring.push(f.ch);
@@ -426,10 +435,16 @@ void loop() {
   prevFrames = frames;
 
   const ADS131M06::Stats& st = adc.stats();
-  Serial.printf("%.1f SPS  総 %lu  CRC異常 %lu  取りこぼし %lu  STATUS異常 %lu  "
-                "リング %lu  検出 %u/収録 %u  EVQ溢れ %u\n",
-                (double)rate, (unsigned long)frames, (unsigned long)crcErr,
-                (unsigned long)st.dropped, (unsigned long)st.statusErr,
+  // ★「SPS」は実際に読めたフレーム数。設計値 F_DATA_SPS と乖離していれば、
+  //   その差が取りこぼしである。欠測はリングにも欠測として記録されているので、
+  //   リング番号(count) は実経過時間に比例して進む（詰められない）。
+  Serial.printf("%.1f SPS（設計 %.1f）  総 %lu  CRC異常 %lu\n",
+                (double)rate, deck::F_DATA_SPS,
+                (unsigned long)frames, (unsigned long)crcErr);
+  Serial.printf("  欠測 %lu サンプル / 中断 %lu 回 / FIFO吐き出し %lu 回  STATUS異常 %lu\n",
+                (unsigned long)st.dropped, (unsigned long)st.gaps,
+                (unsigned long)st.fifoClears, (unsigned long)st.statusErr);
+  Serial.printf("  リング番号 %lu  検出 %u/収録 %u  EVQ溢れ %u\n",
                 (unsigned long)ring.count(),
                 detector.detectedThisHour(), detector.recordedThisHour(),
                 s_evOverflow);

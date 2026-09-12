@@ -68,14 +68,37 @@ class SampleRing {
 public:
   /** ISR から呼ぶ。3バイト packed で格納する（ADCのワイヤ形式と同じ MSB first） */
   void push(const int32_t ch[NUM_CH]) {
-    uint8_t* p = &buf_[(size_t)(count_ % RING_SAMPLES) * SAMPLE_BYTES];
+    const uint32_t slot = count_ % RING_SAMPLES;
+    uint8_t* p = &buf_[(size_t)slot * SAMPLE_BYTES];
     for (uint8_t c = 0; c < NUM_CH; ++c) {
       const uint32_t v = (uint32_t)ch[c];
       *p++ = (uint8_t)(v >> 16);
       *p++ = (uint8_t)(v >> 8);
       *p++ = (uint8_t)v;
     }
+    setValid(slot, true);
     count_++;   // volatile。ISR 側だけが書く
+  }
+
+  /**
+   * 欠測を n サンプルぶん「欠測として」記録し、番号を進める。
+   *
+   * ★これが無いと**サンプル番号が時刻を表さなくなる。**CRC異常やSD書込み中の
+   *   取りこぼしを詰めて格納すると、継続時間・プリ/ポスト長・変化率の判定が
+   *   実時間より伸び、保存波形にも欠測位置が残らない（Codexレビュー指摘）。
+   *   番号は必ず実経過ぶん進め、中身は「無効」と印を付ける。
+   */
+  void pushGap(uint32_t n) {
+    for (uint32_t i = 0; i < n; ++i) {
+      setValid(count_ % RING_SAMPLES, false);
+      count_++;
+    }
+  }
+
+  /** 絶対番号 idx のサンプルが有効か（欠測でないか） */
+  bool valid(uint32_t idx) const {
+    const uint32_t slot = idx % RING_SAMPLES;
+    return ((valid_[slot >> 3] >> (slot & 7)) & 1) != 0;
   }
 
   /** これまでに書き込んだ総サンプル数（＝次に書く絶対番号） */
@@ -87,9 +110,9 @@ public:
     return idx < n && (n - idx) <= RING_SAMPLES;
   }
 
-  /** 1サンプル取り出す。上書き済みなら false */
+  /** 1サンプル取り出す。上書き済み・欠測なら false */
   bool get(uint32_t idx, int32_t out[NUM_CH]) const {
-    if (!resident(idx)) return false;
+    if (!resident(idx) || !valid(idx)) return false;
     const uint8_t* p = &buf_[(size_t)(idx % RING_SAMPLES) * SAMPLE_BYTES];
     for (uint8_t c = 0; c < NUM_CH; ++c) {
       uint32_t raw = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
@@ -104,7 +127,7 @@ public:
    * 1サンプル = 18バイト。out は 18 バイト以上であること。
    */
   bool getRaw(uint32_t idx, uint8_t* out18) const {
-    if (!resident(idx)) return false;
+    if (!resident(idx) || !valid(idx)) return false;
     memcpy(out18, &buf_[(size_t)(idx % RING_SAMPLES) * SAMPLE_BYTES], SAMPLE_BYTES);
     return true;
   }
@@ -112,8 +135,17 @@ public:
   static constexpr uint8_t SAMPLE_BYTES = NUM_CH * 3;   // 18
 
 private:
+  void setValid(uint32_t slot, bool v) {
+    uint8_t& b = valid_[slot >> 3];
+    const uint8_t m = (uint8_t)(1u << (slot & 7));
+    if (v) b |= m; else b = (uint8_t)(b & ~m);
+  }
+
   // 平坦な配列にする。多次元だとポインタ型が uint8_t(*)[3] になって扱いにくい
   uint8_t buf_[(size_t)RING_SAMPLES * SAMPLE_BYTES];
+  // 有効/欠測のビットマップ。1サンプル1ビットなので 972 B しか要らない。
+  // センチネル値（0x800000 等）で表すと実データと区別できないため、別に持つ。
+  uint8_t valid_[(RING_SAMPLES + 7) / 8] = {0};
   volatile uint32_t count_ = 0;
 };
 
