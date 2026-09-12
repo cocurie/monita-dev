@@ -122,18 +122,13 @@ public:
     uint8_t gcDelay    = 0x03;   // CFG.GC_DLY[3:0]。既定 0011b
     bool    extRef     = true;   // ★REFIN = VEX/2 を使う。false にすると内蔵1.2Vになる
     bool    disableXtal= true;   // ★CLKIN 外部供給のため内蔵発振器を止める
-    // ★入力CRC（F-2）。**既定は false。基板が届いたら順序立てて有効化すること。**
+    // 入力CRC（F-2）。**既定 true。**フレーム構成はデータシートで確認済み
+    //   （通常コマンドは語1、単一WREGは語2。transferFrame() のコメント参照）。
     //
-    //   【なぜ既定で切ってあるか】入力フレームのどの語にCRCを置くかが、データシートで
-    //   未確認のまま実装されている（本ドライバは最終語＝語7に置いている）。
-    //   ここが違っていると、RX_CRC_EN を立てた瞬間から**コマンドが一切実行されなくなる**。
-    //   しかも WREG だけは誤ったCRCでも書き込まれる仕様なので、
-    //   「書けているのに読めない」という切り分けの難しい壊れ方をする。
-    //
-    //   【ブリングアップ手順】まず false のまま ID 読み出し・レジスタ照合を通す。
-    //   通信が確立してから true にして、もう一度レジスタ照合が通るかを見る。
-    //   通らなければCRCの語位置を疑うこと（送信バッファのどこに置くかだけの問題）。
-    bool    rxCrcEn    = false;
+    //   ★初期化に失敗した場合、begin() が自動でCRCを切って一度だけ再試行する。
+    //     それで通れば crcFallback() が true になる。**原因が入力CRCだと特定できる。**
+    //     起動ログに大きく出るので、現場では見逃さない。
+    bool    rxCrcEn    = true;
     bool    regCrcEn   = true;   // レジスタマップCRC（F-2）
     bool    drdyFmt    = false;  // false = レベル出力（Low保持）。true = 負パルス
   };
@@ -185,6 +180,13 @@ public:
    * CRC 不一致でも Frame は埋め、crcOk=false を返す（捨てるかどうかは呼び出し側の判断）。
    */
   bool readFrame(Frame& out);
+
+  /**
+   * 入力CRCを切って初期化し直したか。
+   * **true なら F-2（入力CRC）を満たしていない状態で動いている。**
+   * 起動ログへ必ず出すこと。原因は配線でも CLKIN でもなく入力CRCの形式である。
+   */
+  bool crcFallback() const { return crcFallback_; }
 
   /** レジスタ1本読む。**連続変換中に呼ぶとそのフレームのデータを失う** */
   bool readReg(uint8_t addr, uint16_t& value);
@@ -248,12 +250,38 @@ private:
   uint8_t  csPin_   = 0xFF;
   uint8_t  drdyPin_ = 0xFF;
   bool     rxCrcEn_ = false;
+  bool     crcFallback_ = false;   // 入力CRCを切って初期化し直したか（診断用）
   uint32_t seq_     = 0;
   uint16_t lastDrdyBits_ = 0;
   Stats    stats_;
 
   /** 1フレーム送受信する。txWord0 が先頭語（コマンド）。rx が null なら読み捨て */
-  void transferFrame(uint16_t txWord0, const uint16_t* txData, uint8_t* rx);
+  /**
+   * 1フレーム送受信する。
+   *
+   * 【入力フレームの構成】（SBAS949A §8.5.1.7 / §8.5.1.10.8）
+   *   通常コマンド : [語0]コマンド [語1]入力CRC [語2〜7]ゼロ
+   *   WREG(n本)    : [語0]コマンド [語1..n]書く値 [語n+1]入力CRC [以降]ゼロ
+   *
+   *   入力CRC は**書いた語の直後**に置き、**それ以前の語だけ**を対象に計算する。
+   *   ★フレーム末尾（語7）ではない。2026-09-12 の実装は語7に置き、先頭21バイトを
+   *     対象にしていた。RX_CRC_EN を立てると RREG 等が一切実行されなくなる誤りで、
+   *     しかも WREG だけは誤CRCでも書き込まれるため（データシート明記）
+   *     「書けているのに読めない」という切り分けの難しい壊れ方をする。
+   *
+   * @param nData 語1以降に載せるデータ語数。通常コマンドは 0、単一WREG は 1。
+   */
+  void transferFrame(uint16_t txWord0, const uint16_t* txData, uint8_t nData, uint8_t* rx);
+
+  /**
+   * MODE レジスタを書く。**入力CRCの有効/無効が切り替わる特別なフレーム。**
+   * WREG フレーム自体は「切替前」の設定で送り、応答を読む次のフレームからは
+   * 「切替後」の設定で送る必要がある（レジスタは DIN へシフトされた時点で書かれるため）。
+   */
+  bool writeModeWithCrcSwitch(uint16_t mode, bool rxCrcEnAfter);
+
+  /** 1回分の初期化本体。begin() から入力CRC有り/無しで最大2回呼ばれる */
+  bool beginOnce(const Config& cfg);
   /** コマンドを送り、次フレームの先頭語を応答として取り出す */
   uint16_t command(uint16_t cmd);
 

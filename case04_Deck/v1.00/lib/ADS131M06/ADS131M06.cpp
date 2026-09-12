@@ -26,24 +26,31 @@ uint16_t ADS131M06::crc16(const uint8_t* data, size_t len, uint16_t seed) {
 // ─────────────────────────────────────────────────────────────
 // フレーム送受信
 // ─────────────────────────────────────────────────────────────
-void ADS131M06::transferFrame(uint16_t txWord0, const uint16_t* txData, uint8_t* rx) {
+void ADS131M06::transferFrame(uint16_t txWord0, const uint16_t* txData,
+                              uint8_t nData, uint8_t* rx) {
   uint8_t tx[FRAME_BYTES];
   memset(tx, 0, sizeof(tx));
 
   // 語0＝コマンド。16bit の値を 24bit 語の上位へ左詰めする
   put24(&tx[0], (uint32_t)txWord0 << 8);
 
-  // 語1〜6＝WREG のデータ。無ければゼロのまま
-  if (txData) {
-    for (uint8_t i = 0; i < NUM_CH; ++i) {
+  // 語1以降＝WREG で書く値。通常コマンドでは nData=0
+  if (txData != nullptr && nData > 0) {
+    for (uint8_t i = 0; i < nData; ++i) {
       put24(&tx[(i + 1) * WORD_BYTES], (uint32_t)txData[i] << 8);
     }
   }
 
-  // 語7＝入力CRC。RX_CRC_EN が有効なときだけ意味を持つ。
-  // 対象は「CRC語を除く全語」＝先頭21バイト（データシート §8.3.12）
+  // ★入力CRC は「コマンド＋データ語」の直後に置き、それ以前の語だけを対象に計算する。
+  //   通常コマンドなら語1（対象は語0の3バイト）、単一WREG なら語2（対象は語0+語1の6バイト）。
+  //   データシート §8.5.1.7「the command, the command CRC ... and six additional words of zeros」
+  //   および §8.5.1.10.8「write this CRC after the register data」。
   if (rxCrcEn_) {
-    put24(&tx[7 * WORD_BYTES], (uint32_t)crc16(tx, 7 * WORD_BYTES) << 8);
+    const uint8_t crcWord    = (uint8_t)(1 + nData);
+    const size_t  coveredLen = (size_t)crcWord * WORD_BYTES;
+    if (crcWord < FRAME_WORDS) {
+      put24(&tx[crcWord * WORD_BYTES], (uint32_t)crc16(tx, coveredLen) << 8);
+    }
   }
 
   uint8_t scratch[FRAME_BYTES];
@@ -62,10 +69,10 @@ void ADS131M06::transferFrame(uint16_t txWord0, const uint16_t* txData, uint8_t*
 
 uint16_t ADS131M06::command(uint16_t cmd) {
   // コマンドを投げる。この時点の応答は「1つ前のフレーム」に対するものなので捨てる
-  transferFrame(cmd, nullptr, nullptr);
+  transferFrame(cmd, nullptr, 0, nullptr);
   // 次のフレームでコマンドの応答が返る
   uint8_t rx[FRAME_BYTES];
-  transferFrame(CMD_NULL, nullptr, rx);
+  transferFrame(CMD_NULL, nullptr, 0, rx);
   return (uint16_t)(get24(&rx[0]) >> 8);
 }
 
@@ -82,15 +89,28 @@ bool ADS131M06::readReg(uint8_t addr, uint16_t& value) {
 bool ADS131M06::writeReg(uint8_t addr, uint16_t value) {
   // WREG: 011a aaaa annn nnnn（nnn nnnn = 書く本数-1 = 0）
   const uint16_t cmd = (uint16_t)(0x6000 | ((uint16_t)(addr & 0x3F) << 7));
-  uint16_t data[NUM_CH] = {0};
-  data[0] = value;                       // 語1 に書き込む値を載せる
-  transferFrame(cmd, data, nullptr);
+  uint16_t data[1] = { value };          // 語1 に書き込む値を載せる（入力CRCは語2）
+  transferFrame(cmd, data, 1, nullptr);
 
   // 応答 010a aaaa ammm mmmm を確認する。mmm mmmm は実際に書けた本数-1
   uint8_t rx[FRAME_BYTES];
-  transferFrame(CMD_NULL, nullptr, rx);
+  transferFrame(CMD_NULL, nullptr, 0, rx);
   const uint16_t ack = (uint16_t)(get24(&rx[0]) >> 8);
   const uint16_t expect = (uint16_t)(0x4000 | ((uint16_t)(addr & 0x3F) << 7));
+  return (ack & 0xFF80) == (expect & 0xFF80);
+}
+
+bool ADS131M06::writeModeWithCrcSwitch(uint16_t mode, bool rxCrcEnAfter) {
+  const uint16_t cmd = (uint16_t)(0x6000 | ((uint16_t)(REG_MODE & 0x3F) << 7));
+  uint16_t data[1] = { mode };
+
+  transferFrame(cmd, data, 1, nullptr);   // このフレームは「切替前」の設定で送る
+  rxCrcEn_ = rxCrcEnAfter;                // ★次のフレームからは「切替後」が効く
+
+  uint8_t rx[FRAME_BYTES];
+  transferFrame(CMD_NULL, nullptr, 0, rx);
+  const uint16_t ack = (uint16_t)(get24(&rx[0]) >> 8);
+  const uint16_t expect = (uint16_t)(0x4000 | ((uint16_t)(REG_MODE & 0x3F) << 7));
   return (ack & 0xFF80) == (expect & 0xFF80);
 }
 
@@ -105,9 +125,32 @@ bool ADS131M06::begin(SPIClass& spi, uint8_t csPin, uint8_t drdyPin,
   // ★モード1（CPOL=0 / CPHA=1）。SD カード（モード0）と共有するため、
   //   バスを切り替えるたびに SPISettings を渡し直す（要件 F-28）
   settings_ = SPISettings(spiHz, MSBFIRST, SPI_MODE1);
-  rxCrcEn_  = false;   // UNLOCK/RESET を送る間はまだ入力CRCを使わない
-  seq_      = 0;
-  stats_    = Stats();
+  crcFallback_ = false;
+
+  if (beginOnce(cfg)) return true;
+
+  // ★入力CRCを有効にしたまま初期化に失敗したときは、CRCを切って一度だけ再試行する。
+  //
+  //   【なぜこうするか】無人運用の現場で「初期化できないので何も測れない」が一番困る。
+  //   一方、CRCを黙って切って動き続けるのも F-2 違反を隠すことになる。
+  //   そこで **動く状態にしたうえで、切り分け結果を crcFallback() で外に出す。**
+  //   呼び出し側は起動ログへ大きく出すこと（main.cpp）。
+  //   これが true なら、原因は配線でも CLKIN でもなく**入力CRCの形式**だと特定できる。
+  if (!cfg.rxCrcEn) return false;
+
+  Config alt = cfg;
+  alt.rxCrcEn = false;
+  if (!beginOnce(alt)) return false;
+
+  crcFallback_ = true;
+  return true;
+}
+
+// 1回分の初期化。begin() から、入力CRC有り/無しで最大2回呼ばれる。
+bool ADS131M06::beginOnce(const Config& cfg) {
+  rxCrcEn_ = false;   // UNLOCK/RESET を送る間はまだ入力CRCを使わない
+  seq_     = 0;
+  stats_   = Stats();
 
   pinMode(csPin_, OUTPUT);
   digitalWrite(csPin_, HIGH);
@@ -133,7 +176,7 @@ bool ADS131M06::resetByCommand() {
   //   （データシート §8.4.1.3）。command() は RESET フレームの直後に応答取得用の
   //   NULL フレームを続けて出してしまうため、禁止区間に通信することになる。
   //   2026-09-12 の実装は delay() が応答取得の「後」にあり、順序が逆だった。
-  transferFrame(CMD_RESET, nullptr, nullptr);
+  transferFrame(CMD_RESET, nullptr, 0, nullptr);
 
   // ★RESET でレジスタは既定値へ戻る＝入力CRCも無効になる。
   //   ドライバ側の状態を合わせておかないと、次のフレームに不要なCRC語を載せてしまう。
@@ -142,7 +185,7 @@ bool ADS131M06::resetByCommand() {
   delay(T_REGACQ_MS);   // ここで待つ。応答を取りに行く前
 
   uint8_t rx[FRAME_BYTES];
-  transferFrame(CMD_NULL, nullptr, rx);
+  transferFrame(CMD_NULL, nullptr, 0, rx);
   const uint16_t ack = (uint16_t)(get24(&rx[0]) >> 8);
   // 0xFF26 = リセット完了。0x0011 が返る場合はフレームが完結せずリセットされていない
   return ack == RESET_ACK;
@@ -161,9 +204,10 @@ bool ADS131M06::applyConfig(const Config& cfg) {
   mode |= (1u << 4);                // TIMEOUT 有効（フレーム途中の停止を検出できる）
   if (cfg.drdyFmt) mode |= (1u << 0);
   // DRDY_SEL = 00b：全CHの変換が終わったときに DRDY を出す（本機は全CH使用）
-  ok &= writeReg(REG_MODE, mode);
-  // 以降のフレームから入力CRCが必要になる。ドライバの状態を合わせる
-  rxCrcEn_ = cfg.rxCrcEn;
+  // ★MODE の書き込みは入力CRCの有効/無効が切り替わる特別なフレーム。
+  //   レジスタは DIN へシフトされた時点で書かれるので、応答を読む「次のフレーム」には
+  //   もう新しい設定が効いている。writeReg() のままだと切替が1フレーム遅れる。
+  ok &= writeModeWithCrcSwitch(mode, cfg.rxCrcEn);
 
   // ── CLOCK ──
   // bit13:8 CHn_EN / bit7 XTAL_DIS / bit6 EXTREF_EN / bit4:2 OSR / bit1:0 PWR
@@ -260,7 +304,7 @@ bool ADS131M06::verifyRegisters(const Config& cfg, Stream* log) {
 // ─────────────────────────────────────────────────────────────
 bool ADS131M06::readFrame(Frame& out) {
   uint8_t rx[FRAME_BYTES];
-  transferFrame(CMD_NULL, nullptr, rx);
+  transferFrame(CMD_NULL, nullptr, 0, rx);
 
   out.status = (uint16_t)(get24(&rx[0]) >> 8);
 

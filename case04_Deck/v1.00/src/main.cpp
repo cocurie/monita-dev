@@ -336,6 +336,17 @@ void setup() {
   // ── 2〜4. ADC 起動 ──
   if (adcStartup()) {
     Serial.println(F("[OK ] ADS131M06 起動・レジスタ照合一致"));
+    // ★入力CRCを切って初期化し直していたら、動いてはいるが F-2 を満たしていない。
+    //   黙って動かすと「CRC が効いているつもり」で運用してしまうため、大きく出す。
+    if (adc.crcFallback()) {
+      Serial.println(F("  ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★"));
+      Serial.println(F("  ★ 警告: 入力CRC(RX_CRC_EN)を無効にして起動しました"));
+      Serial.println(F("  ★ 有効のままでは初期化できませんでした。計測は可能ですが"));
+      Serial.println(F("  ★ 要件 F-2（入力CRC）を満たしていません。"));
+      Serial.println(F("  ★ 原因は配線でも CLKIN でもなく、入力CRCのフレーム形式です。"));
+      Serial.println(F("  ★ ADS131M06::transferFrame() のCRC語位置を確認すること。"));
+      Serial.println(F("  ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★"));
+    }
   } else {
     Serial.println(F("[NG ] ADS131M06 の起動に失敗"));
     Serial.println(F("       確認: CLKIN(D2) に 8MHz が出ているか / SYNC-RESET(P3) が High か"));
