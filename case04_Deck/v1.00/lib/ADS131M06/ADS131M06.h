@@ -115,7 +115,18 @@ public:
     uint8_t gcDelay    = 0x03;   // CFG.GC_DLY[3:0]。既定 0011b
     bool    extRef     = true;   // ★REFIN = VEX/2 を使う。false にすると内蔵1.2Vになる
     bool    disableXtal= true;   // ★CLKIN 外部供給のため内蔵発振器を止める
-    bool    rxCrcEn    = true;   // 入力CRC（F-2）
+    // ★入力CRC（F-2）。**既定は false。基板が届いたら順序立てて有効化すること。**
+    //
+    //   【なぜ既定で切ってあるか】入力フレームのどの語にCRCを置くかが、データシートで
+    //   未確認のまま実装されている（本ドライバは最終語＝語7に置いている）。
+    //   ここが違っていると、RX_CRC_EN を立てた瞬間から**コマンドが一切実行されなくなる**。
+    //   しかも WREG だけは誤ったCRCでも書き込まれる仕様なので、
+    //   「書けているのに読めない」という切り分けの難しい壊れ方をする。
+    //
+    //   【ブリングアップ手順】まず false のまま ID 読み出し・レジスタ照合を通す。
+    //   通信が確立してから true にして、もう一度レジスタ照合が通るかを見る。
+    //   通らなければCRCの語位置を疑うこと（送信バッファのどこに置くかだけの問題）。
+    bool    rxCrcEn    = false;
     bool    regCrcEn   = true;   // レジスタマップCRC（F-2）
     bool    drdyFmt    = false;  // false = レベル出力（Low保持）。true = 負パルス
   };

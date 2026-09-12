@@ -128,8 +128,22 @@ bool ADS131M06::begin(SPIClass& spi, uint8_t csPin, uint8_t drdyPin,
 }
 
 bool ADS131M06::resetByCommand() {
-  const uint16_t ack = command(CMD_RESET);
-  delay(T_REGACQ_MS);
+  // ★RESET だけは汎用の command() を使わない。
+  //   RESET はフレームの末尾で成立し、**その直後 tREGACQ の間は通信してはいけない**
+  //   （データシート §8.4.1.3）。command() は RESET フレームの直後に応答取得用の
+  //   NULL フレームを続けて出してしまうため、禁止区間に通信することになる。
+  //   2026-09-12 の実装は delay() が応答取得の「後」にあり、順序が逆だった。
+  transferFrame(CMD_RESET, nullptr, nullptr);
+
+  // ★RESET でレジスタは既定値へ戻る＝入力CRCも無効になる。
+  //   ドライバ側の状態を合わせておかないと、次のフレームに不要なCRC語を載せてしまう。
+  rxCrcEn_ = false;
+
+  delay(T_REGACQ_MS);   // ここで待つ。応答を取りに行く前
+
+  uint8_t rx[FRAME_BYTES];
+  transferFrame(CMD_NULL, nullptr, rx);
+  const uint16_t ack = (uint16_t)(get24(&rx[0]) >> 8);
   // 0xFF26 = リセット完了。0x0011 が返る場合はフレームが完結せずリセットされていない
   return ack == RESET_ACK;
 }

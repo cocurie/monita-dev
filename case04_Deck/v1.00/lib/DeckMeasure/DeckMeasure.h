@@ -294,7 +294,15 @@ private:
   uint16_t detected_ = 0;
   uint16_t recorded_ = 0;
 
-  bool chOverThreshold(uint8_t c, const int32_t ch[NUM_CH]) const;
+  /**
+   * 1CH分の閾値判定。
+   * ★prev / havePrev は**呼び出し側が退避した前サンプル**を渡すこと。メンバの prev_ を
+   *   見てはいけない。update() は早期 return が多く、前値の更新を先頭でまとめて行う都合上、
+   *   判定時点の prev_ は既に「今のサンプル」に書き換わっている（＝差分が常に 0 になる）。
+   *   2026-09-12 の実装はこれで Rate モードが一度も発火しなかった。
+   */
+  bool chOverThreshold(uint8_t c, const int32_t ch[NUM_CH],
+                       const int32_t prev[NUM_CH], bool havePrev) const;
 };
 
 }  // namespace deck

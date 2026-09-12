@@ -73,7 +73,8 @@ void TriggerConfig::toBytes(uint8_t b[13]) const {
 // ─────────────────────────────────────────────────────────────
 // EventDetector
 // ─────────────────────────────────────────────────────────────
-bool EventDetector::chOverThreshold(uint8_t c, const int32_t ch[NUM_CH]) const {
+bool EventDetector::chOverThreshold(uint8_t c, const int32_t ch[NUM_CH],
+                                    const int32_t prev[NUM_CH], bool havePrev) const {
   switch (cfg_.threshMode) {
     case ThreshMode::Absolute:
       return (uint32_t)abs(ch[c]) >= cfg_.threshold;
@@ -86,20 +87,23 @@ bool EventDetector::chOverThreshold(uint8_t c, const int32_t ch[NUM_CH]) const {
 
     case ThreshMode::Rate:
       // 1サンプル間の変化量。ノイズに弱いので durationMs と併用する前提
-      if (!havePrev_) return false;
-      return (uint32_t)abs((int64_t)ch[c] - prev_[c]) >= cfg_.threshold;
+      // ★引数の prev を使う。メンバの prev_ は既に今のサンプルで上書き済み
+      if (!havePrev) return false;
+      return (uint32_t)abs((int64_t)ch[c] - prev[c]) >= cfg_.threshold;
   }
   return false;
 }
 
 bool EventDetector::update(uint32_t idx, const int32_t ch[NUM_CH], EventWindow& win) {
-  // 前値は Rate 判定に使うので、早期 return の前に必ず更新する
+  // ★前値は「判定より前」に退避し、メンバは先に更新しておく。
+  //   update() は条件不成立・不感時間中など早期 return が多く、どの経路を通っても
+  //   prev_ が確実に進むようにするため、更新は先頭でまとめて行う。
+  //   そのぶん、判定に使う前値は必ずこの prevSnapshot を渡すこと。
   int32_t prevSnapshot[NUM_CH];
   memcpy(prevSnapshot, prev_, sizeof(prevSnapshot));
   const bool hadPrev = havePrev_;
   memcpy(prev_, ch, sizeof(prev_));
   havePrev_ = true;
-  (void)prevSnapshot; (void)hadPrev;
 
   if (!cfg_.enabled) { over_ = false; return false; }
   if (idx < deadUntil_) { over_ = false; return false; }
@@ -110,7 +114,7 @@ bool EventDetector::update(uint32_t idx, const int32_t ch[NUM_CH], EventWindow& 
   for (uint8_t c = 0; c < NUM_CH; ++c) {
     if (!(cfg_.chMask & (1u << c))) continue;
     nWatched++;
-    if (chOverThreshold(c, ch)) { firedMask |= (uint8_t)(1u << c); nOver++; }
+    if (chOverThreshold(c, ch, prevSnapshot, hadPrev)) { firedMask |= (uint8_t)(1u << c); nOver++; }
   }
 
   bool cond = false;
