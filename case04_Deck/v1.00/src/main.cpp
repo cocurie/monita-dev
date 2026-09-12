@@ -176,8 +176,18 @@ static deck::EventDetector     detector;
 // ISR → loop の受け渡し。単一生産者・単一消費者なのでフラグとスロットで足りる
 static volatile bool     s_blockReady = false;
 static int32_t           s_blockValue[deck::NUM_CH];
+// loop が1秒以上止まって、前の1秒平均を受け取る前に次ができた回数。
+// 0 でなければ静的系列の1分値が60個より少ない平均から作られている
+static volatile uint32_t s_blockDropped = 0;
 
-static constexpr uint8_t EVQ_LEN = 4;         // 発火が連続したときの取りこぼし防止
+// ★リングキューは「1スロット空けて満杯を判定する」方式なので、**実容量は EVQ_LEN − 1。**
+//   以前は EVQ_LEN = 4（実容量3）で、コメントの意図より1件少なかった（Codexレビュー指摘）。
+//
+//   必要な容量の見積もり：イベントはポスト長（最大 4.5 秒）が溜まるまでキューに残る。
+//   不感時間 0.5 秒・継続 20 ms なら最短 0.52 秒ごとに発火しうるので、4.5 / 0.52 ≒ 9 件。
+//   余裕を見て実容量 16 とする（EventWindow 32 B × 17 = 544 B）。
+//   ★不感時間を 0.3 秒未満にすると、渋滞時にこれでも溢れうる。溢れは EVQ溢れ として数える。
+static constexpr uint8_t EVQ_LEN = 17;        // 実容量 16
 static volatile uint8_t  s_evHead = 0, s_evTail = 0;
 static deck::EventWindow s_evQueue[EVQ_LEN];
 static volatile uint16_t s_evOverflow = 0;    // キューが溢れた回数
@@ -221,14 +231,18 @@ static void onDrdyFalling() {
     return;
   }
 
-  const uint32_t idx = ring.count();   // このサンプルの絶対番号（push 前に取る）
+  const uint64_t idx = ring.count();   // このサンプルの絶対番号（push 前に取る）
   ring.push(f.ch);
 
   // ① 静的系列
   int32_t avg[deck::NUM_CH];
-  if (blockAvg.push(f.ch, avg) && !s_blockReady) {
-    memcpy(s_blockValue, avg, sizeof(s_blockValue));
-    s_blockReady = true;
+  if (blockAvg.push(f.ch, avg)) {
+    if (!s_blockReady) {
+      memcpy(s_blockValue, avg, sizeof(s_blockValue));
+      s_blockReady = true;
+    } else {
+      s_blockDropped++;   // 黙って捨てない
+    }
   }
 
   // ② イベント検出
@@ -242,6 +256,18 @@ static void onDrdyFalling() {
   s_lastFrame  = f;
   s_haveSample = true;
 }
+
+// uint64_t を10進文字列にする。newlib-nano の printf は %llu を扱えないため。
+// 一時オブジェクトの寿命は式の終わりまでなので、printf の引数に直接 `U64Str(x).s` と書いてよい。
+struct U64Str {
+  char s[21];
+  explicit U64Str(uint64_t v) {
+    char tmp[21]; int n = 0;
+    do { tmp[n++] = (char)('0' + (v % 10)); v /= 10; } while (v != 0);
+    for (int i = 0; i < n; ++i) s[i] = tmp[n - 1 - i];
+    s[n] = '\0';
+  }
+};
 
 /**
  * 発火したイベントをリングから取り出す。
@@ -262,9 +288,9 @@ static void serviceEvents() {
     if (!haveStart) {
       // リングを追い越された。SD書込みが遅いか、発火が密すぎる
       Serial.printf("[EVENT %lu] 切出し失敗：プリ側がリングから溢れた "
-                    "(start=%lu now=%lu)\n",
-                    (unsigned long)win.seq, (unsigned long)win.startIdx,
-                    (unsigned long)ring.count());
+                    "(start=%s now=%s)\n",
+                    (unsigned long)win.seq, U64Str(win.startIdx).s,
+                    U64Str(ring.count()).s);
     } else if (limited) {
       // R-2：上限に達したら**波形保存のみ停止し、検出カウントは継続する**
       Serial.printf("[EVENT %lu] レート制限により波形は保存しない "
@@ -272,7 +298,7 @@ static void serviceEvents() {
                     (unsigned long)win.seq, detector.recordedThisHour(),
                     detector.config().maxPerHour);
     } else {
-      const uint32_t n = win.endIdx - win.startIdx;
+      const uint32_t n = (uint32_t)(win.endIdx - win.startIdx);   // 最大でリング長未満
       Serial.printf("[EVENT %lu] 切出し可 CH mask 0x%02X  %lu サンプル "
                     "(%.2f 秒 / %lu バイト)  ※SD書込みは S6 で実装\n",
                     (unsigned long)win.seq, win.firedMask, (unsigned long)n,
@@ -403,6 +429,8 @@ void loop() {
   static uint32_t nextReport = 0;
   static uint32_t prevFrames = 0;
   static uint32_t nextHourRoll = 3600000UL;
+  static uint8_t  blocksInMinute = 0;       // 今の1分に入った1秒平均の数
+  static uint8_t  minutesSinceStatic = 0;   // 前回の静的値出力から何分経ったか
 
   // ── ①静的系列：1秒平均が出たらメジアン窓へ入れる ──
   if (s_blockReady) {
@@ -410,15 +438,25 @@ void loop() {
     noInterrupts(); memcpy(avg, s_blockValue, sizeof(avg)); s_blockReady = false; interrupts();
     minuteMedian.push(avg);
 
-    // 60個そろったら1分値。これが静的変位であり、イベント判定の基線にもなる
-    if (minuteMedian.full()) {
+    // ★1分値は**1分に1回**。要件 §7.3.3「[1分ごと] 直近60個のブロック平均のメジアン」。
+    //   以前は窓が満杯になった後、1秒ごとに1分値を出して基線も毎秒書き換えていた
+    //   （Codexレビュー指摘）。これだと S8 で「1分値」を送るときに60倍の件数になる。
+    if (++blocksInMinute >= 60 && minuteMedian.full()) {
+      blocksInMinute = 0;
       int32_t med[deck::NUM_CH];
       if (minuteMedian.median(med)) {
-        detector.setBaseline(med);              // ThreshMode::FromBase の基準
-        const double lsb = ADS131M06::lsbVolts(ADS131M06::GAIN_32);
-        Serial.print(F("[1分値] uV:"));
-        for (uint8_t c = 0; c < deck::NUM_CH; ++c) Serial.printf(" %8.3f", med[c] * lsb * 1e6);
-        Serial.println();
+        // ★ISR が基線を読んでいる最中に書き換えないよう、割込み禁止で囲む（DeckMeasure.h）
+        noInterrupts(); detector.setBaseline(med); interrupts();   // ThreshMode::FromBase の基準
+
+        // 静的値の出力は「静的計測の周期」ごと（トリガ設定 [12]。既定1分）
+        const uint8_t period = detector.config().staticMin ? detector.config().staticMin : 1;
+        if (++minutesSinceStatic >= period) {
+          minutesSinceStatic = 0;
+          const double lsb = ADS131M06::lsbVolts(ADS131M06::GAIN_32);
+          Serial.print(F("[1分値] uV:"));
+          for (uint8_t c = 0; c < deck::NUM_CH; ++c) Serial.printf(" %8.3f", med[c] * lsb * 1e6);
+          Serial.println();
+        }
       }
     }
   }
@@ -429,9 +467,14 @@ void loop() {
   // ── レート制限のカウンタを1時間ごとに戻す（R-1〜R-3）──
   // ★本番では DS3231 の時刻で区切る（S7）。ここでは起動からの経過時間で代用
   if (millis() >= nextHourRoll) {
-    Serial.printf("[時間集計] 検出 %u 件 / 収録 %u 件\n",
-                  detector.detectedThisHour(), detector.recordedThisHour());
+    // ★読み取りとリセットを1つの割込み禁止区間で行う。間に ISR の検出が入ると、
+    //   その1件がどちらの時間にも数えられずに消える
+    noInterrupts();
+    const uint16_t det = detector.detectedThisHour();
+    const uint16_t rec = detector.recordedThisHour();
     detector.rollHour();
+    interrupts();
+    Serial.printf("[時間集計] 検出 %u 件 / 収録 %u 件\n", det, rec);
     nextHourRoll += 3600000UL;
   }
 
@@ -464,10 +507,10 @@ void loop() {
                 (unsigned long)s_busSkips, (unsigned long)spibus::claims(),
                 (unsigned long)spibus::maxHoldUs(),
                 (unsigned long)adc.samplePeriodUs());
-  Serial.printf("  リング番号 %lu  検出 %u/収録 %u  EVQ溢れ %u\n",
-                (unsigned long)ring.count(),
+  Serial.printf("  リング番号 %s  検出 %u/収録 %u  EVQ溢れ %u  1秒平均の取りこぼし %lu\n",
+                U64Str(ring.count()).s,
                 detector.detectedThisHour(), detector.recordedThisHour(),
-                s_evOverflow);
+                s_evOverflow, (unsigned long)s_blockDropped);
 
   if (have) {
     // 生コードと入力換算電圧を並べる。まだ変位へは換算しない（校正係数は F-17 で個体ごと）

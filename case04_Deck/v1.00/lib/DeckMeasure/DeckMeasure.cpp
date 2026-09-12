@@ -23,6 +23,12 @@ namespace deck {
 //   [12] 静的計測の周期 [分]
 // ─────────────────────────────────────────────────────────────
 bool TriggerConfig::fromBytes(const uint8_t b[13]) {
+  // ★未定義のビットが立っていたら丸めずに拒否する。0/1 以外の「有効」や
+  //   CHマスクの上位2bitを黙って読み替えると、GAS の送信値と子機の解釈が
+  //   ずれたまま「完了」になる（Codexレビュー指摘）。GAS 側も同じ検査をしている。
+  if (b[0] > 1) return false;
+  if (b[4] & 0xC0) return false;
+
   TriggerConfig t;
   t.enabled      = (b[0] != 0);
   t.threshold    = (uint16_t)((uint16_t)b[1] << 8 | b[2]);
@@ -43,8 +49,10 @@ bool TriggerConfig::fromBytes(const uint8_t b[13]) {
   // ── 受理前の妥当性検査 ──
   if (t.chMask == 0) return false;                       // 監視CHが無い
   if (t.staticMin == 0) return false;
+  // ★N は「監視しているCHの数」以下でなければならない。CH2本しか見ていないのに
+  //   N=3 だと**一度も発火しない設定**を受理してしまい、現場では「車が来ない」と区別できない
   if (t.decision == DecisionMode::NofM &&
-      (t.nRequired == 0 || t.nRequired > NUM_CH)) return false;
+      (t.nRequired == 0 || t.nRequired > __builtin_popcount(t.chMask))) return false;
   // ★プリ＋ポストがリングに収まらない設定は受理しない（要件 §7.3.3）
   if (!t.fitsInRing()) return false;
   if (t.preTenth < 5 || t.preTenth > 30) return false;   // 0.5〜3.0 秒
@@ -94,7 +102,7 @@ bool EventDetector::chOverThreshold(uint8_t c, const int32_t ch[NUM_CH],
   return false;
 }
 
-bool EventDetector::update(uint32_t idx, const int32_t ch[NUM_CH], EventWindow& win) {
+bool EventDetector::update(uint64_t idx, const int32_t ch[NUM_CH], EventWindow& win) {
   // ★前値は「判定より前」に退避し、メンバは先に更新しておく。
   //   update() は条件不成立・不感時間中など早期 return が多く、どの経路を通っても
   //   prev_ が確実に進むようにするため、更新は先頭でまとめて行う。
@@ -134,8 +142,8 @@ bool EventDetector::update(uint32_t idx, const int32_t ch[NUM_CH], EventWindow& 
   // ★発火時点ではイベントの始まりはすでに過去にある。閾値を超えたと分かるのは
   //   床版が沈み始めた後であり、そこから記録を始めても基線が撮れない。
   //   だから overSince_（超え始め）を基準にプリトリガを遡る。
-  const uint32_t trig = overSince_;
-  const uint32_t pre  = cfg_.preSamples();
+  const uint64_t trig = overSince_;
+  const uint64_t pre  = cfg_.preSamples();
 
   win.triggerIdx = trig;
   win.startIdx   = (trig > pre) ? (trig - pre) : 0;
