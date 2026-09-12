@@ -1,0 +1,221 @@
+/**
+ * ADS131M06 — 6CH 同時サンプリング 24bit ΔΣ ADC ドライバ
+ *
+ * 【対象】
+ *   TI ADS131M06IRSNR（WQFN-32 4×4）／ Monita Deck 基板 ver1.00 の U2
+ *   データシート: SBAS949A（2020-02 / 2021-02改訂）
+ *
+ * 【本機での構成】要件定義 §3〜§4
+ *   - CLKIN = MCU の PWM で 8.000 MHz を供給（水晶なし）。fMOD = 4.000 MHz
+ *   - OSR 4096 → fDATA = fCLKIN / (2 × OSR) = **976.56 SPS**（1 kSPS ではない）
+ *   - PGA ゲイン 32（ノイズはゲイン32以上で頭打ち。選択はFSR余裕だけの問題）
+ *   - **外部リファレンス REFIN = VEX/2 = 1.25 V**（レシオメトリック測定）
+ *     → CLOCK レジスタの **EXTREF_EN を必ず 1 にする**。これを忘れると内蔵1.2Vが使われ、
+ *       VEX のドリフトが相殺されなくなる（設計の根幹が失われる）
+ *   - 内蔵水晶発振器は使わないので **XTAL_DIS = 1**（データシート §8.3.5「使わないときは止める」）
+ *   - グローバルチョップ有効（オフセットドリフト除去）
+ *
+ * 【SPI】データシート §7.6
+ *   - **モード1（CPOL=0 / CPHA=1）**。「CS の遷移は SCLK が Low の間に行うこと」
+ *   - SCLK 上限 25 MHz（DVDD 2.7〜3.6V）。本機は SD と同一バスのため 8 MHz を使う
+ *   - 語長 24bit（WLENGTH=01b・既定）。1フレーム = STATUS 1語 + データ6語 + CRC 1語 = **8語 24バイト**
+ *   - **コマンドの応答は「次のフレーム」に出る。** RREG は 2フレームかかる（本ドライバが吸収する）
+ *
+ * 【CRC】データシート §8.3.12
+ *   - CCITT（x^16+x^12+x^5+1 = 0x1021）、シード 0xFFFF
+ *   - 対象は「CRC語を除くフレーム内の全語」＝ 先頭21バイト
+ *   - 出力CRCは常時付与され無効化できない。入力CRCは RX_CRC_EN で任意
+ *
+ * 【要件との対応】要件定義 §7.1
+ *   F-1 フレーム単位の読み書き / 語長設定           → readFrame(), Config::wordLength
+ *   F-2 入出力CRC・レジスタマップCRC / エラー計数    → Stats::crcErrors ほか
+ *   F-3 PWR・OSR・CHごとPGA・グローバルチョップ等   → Config
+ *   F-4 DRDY割込みコンテキストで完結                → readFrame() は ISR から呼べる（8MHzで約24µs）
+ *   F-5 サンプル連番と欠測検出                      → Frame::seq, Stats::dropped
+ *   F-6 起動時レジスタリードバック照合              → verifyRegisters()
+ *   F-7 24bit 2の補数 → int32_t 変換                 → readFrame() 内で符号拡張
+ *   F-8 **ADCのOCAL/GCALは使わない**（生コード保存） → 本ドライバは校正レジスタを書かない
+ */
+
+#pragma once
+
+#include <Arduino.h>
+#include <SPI.h>
+
+class ADS131M06 {
+public:
+  static constexpr uint8_t  NUM_CH      = 6;
+  static constexpr uint8_t  FRAME_WORDS = 8;   // STATUS + 6CH + CRC
+  static constexpr uint8_t  WORD_BYTES  = 3;   // WLENGTH = 24bit
+  static constexpr uint8_t  FRAME_BYTES = FRAME_WORDS * WORD_BYTES;  // 24
+
+  // ── レジスタアドレス（データシート 表8-14）──
+  enum Reg : uint8_t {
+    REG_ID          = 0x00,  // 読み出し専用。上位バイトは 0x26
+    REG_STATUS      = 0x01,
+    REG_MODE        = 0x02,
+    REG_CLOCK       = 0x03,
+    REG_GAIN1       = 0x04,  // CH0〜CH3
+    REG_GAIN2       = 0x05,  // CH4〜CH5
+    REG_CFG         = 0x06,  // グローバルチョップ・電流検出
+    REG_THRSHLD_MSB = 0x07,
+    REG_THRSHLD_LSB = 0x08,
+    REG_CH0_CFG     = 0x09,  // 以降 CH あたり 5 レジスタ（CFG/OCAL_MSB/OCAL_LSB/GCAL_MSB/GCAL_LSB）
+    REG_REGMAP_CRC  = 0x3E,
+  };
+  static constexpr uint8_t CH_REG_STRIDE = 5;
+
+  // ── コマンド（データシート 表8-11）──
+  enum Cmd : uint16_t {
+    CMD_NULL    = 0x0000,
+    CMD_RESET   = 0x0011,  // 応答 0xFF26
+    CMD_STANDBY = 0x0022,
+    CMD_WAKEUP  = 0x0033,
+    CMD_LOCK    = 0x0555,
+    CMD_UNLOCK  = 0x0655,
+  };
+  static constexpr uint16_t RESET_ACK = 0xFF26;
+
+  // ── CLOCK.OSR[2:0]（fDATA = fCLKIN / (2 × OSR)）──
+  enum Osr : uint8_t {
+    OSR_128 = 0, OSR_256, OSR_512, OSR_1024 /*既定*/, OSR_2048,
+    OSR_4096 /*本機採用: 8.000MHz で 976.56 SPS*/, OSR_8192, OSR_16256,
+  };
+  // ── CLOCK.PWR[1:0] ──
+  enum Pwr : uint8_t { PWR_VLP = 0, PWR_LP = 1, PWR_HR = 2 /*既定・本機採用*/ };
+  // ── GAINn.PGAGAINx[2:0] ──
+  enum Gain : uint8_t {
+    GAIN_1 = 0, GAIN_2, GAIN_4, GAIN_8, GAIN_16,
+    GAIN_32 /*本機採用*/, GAIN_64, GAIN_128,
+  };
+  // ── CHx_CFG.MUXx[1:0]。自己診断に使う ──
+  enum Mux : uint8_t {
+    MUX_AIN    = 0,  // 通常（AINxP / AINxN）
+    MUX_SHORT  = 1,  // 入力短絡。オフセット測定用
+    MUX_DC_POS = 2,  // 正のDCテスト信号
+    MUX_DC_NEG = 3,  // 負のDCテスト信号
+  };
+
+  // ── STATUS レジスタのビット ──
+  static constexpr uint16_t ST_LOCK      = 1u << 15;
+  static constexpr uint16_t ST_F_RESYNC  = 1u << 14;
+  static constexpr uint16_t ST_REG_MAP   = 1u << 13;
+  static constexpr uint16_t ST_CRC_ERR   = 1u << 12;
+  static constexpr uint16_t ST_CRC_TYPE  = 1u << 11;
+  static constexpr uint16_t ST_RESET     = 1u << 10;
+  static constexpr uint16_t ST_DRDY_MASK = 0x003F;  // DRDY0〜DRDY5
+
+  struct Config {
+    uint8_t osr        = OSR_4096;
+    uint8_t pwr        = PWR_HR;
+    uint8_t gain[NUM_CH] = { GAIN_32, GAIN_32, GAIN_32, GAIN_32, GAIN_32, GAIN_32 };
+    uint8_t mux[NUM_CH]  = { MUX_AIN, MUX_AIN, MUX_AIN, MUX_AIN, MUX_AIN, MUX_AIN };
+    uint8_t chEnMask   = 0x3F;   // CH0〜CH5 すべて有効
+    bool    globalChop = true;   // オフセットドリフト除去（要件 §7.2）
+    uint8_t gcDelay    = 0x03;   // CFG.GC_DLY[3:0]。既定 0011b
+    bool    extRef     = true;   // ★REFIN = VEX/2 を使う。false にすると内蔵1.2Vになる
+    bool    disableXtal= true;   // ★CLKIN 外部供給のため内蔵発振器を止める
+    bool    rxCrcEn    = true;   // 入力CRC（F-2）
+    bool    regCrcEn   = true;   // レジスタマップCRC（F-2）
+    bool    drdyFmt    = false;  // false = レベル出力（Low保持）。true = 負パルス
+  };
+
+  struct Frame {
+    uint16_t status = 0;
+    int32_t  ch[NUM_CH] = {0};   // 24bit 2の補数を符号拡張した値（F-7）
+    uint16_t crcRx = 0;          // 受信したCRC語
+    uint16_t crcCalc = 0;        // 計算したCRC
+    bool     crcOk = false;
+    uint32_t seq = 0;            // サンプル連番（F-5）
+  };
+
+  struct Stats {
+    uint32_t frames    = 0;  // 読んだフレーム総数（欠測率の母数・M-7/M-8）
+    uint32_t crcErrors = 0;  // 出力CRC不一致（F-2）
+    uint32_t dropped   = 0;  // DRDY取りこぼし推定数（F-5）
+    uint32_t statusErr = 0;  // STATUS に CRC_ERR / REG_MAP が立った回数
+    uint32_t resyncs   = 0;  // F_RESYNC 検出回数
+  };
+
+  ADS131M06() = default;
+
+  /**
+   * 初期化。**呼ぶ前に CLKIN が発振しており、SYNC/RESET が High であること。**
+   * ADS131M06 は有効な CLKIN が無いと POR が完了しない（要件 F-26）。
+   *
+   * @param spi     SD カードと共有する SPI インスタンス
+   * @param csPin   CS_ADC（XIAO D0）
+   * @param drdyPin DRDY（XIAO D1）。入力プルアップなしで設定される
+   * @param spiHz   SCLK 周波数。本機は 8 MHz
+   * @return レジスタ照合まで通れば true
+   */
+  bool begin(SPIClass& spi, uint8_t csPin, uint8_t drdyPin, const Config& cfg,
+             uint32_t spiHz = 8000000UL);
+
+  /** RESET コマンドを送る。応答 0xFF26 を確認する。tREGACQ 待ちも含む */
+  bool resetByCommand();
+
+  /** Config の内容をレジスタへ書く（校正レジスタ OCAL/GCAL には触れない＝F-8） */
+  bool applyConfig(const Config& cfg);
+
+  /** 書いた設定をリードバックして照合する（F-6）。不一致のレジスタ名を Serial へ出す */
+  bool verifyRegisters(const Config& cfg, Stream* log = nullptr);
+
+  /**
+   * 1フレーム読む（NULL コマンドを送りつつ STATUS + 6CH + CRC を受け取る）。
+   * **DRDY 立下り割込みから直接呼べる。** 8 MHz・24バイトで約 24 µs。
+   * CRC 不一致でも Frame は埋め、crcOk=false を返す（捨てるかどうかは呼び出し側の判断）。
+   */
+  bool readFrame(Frame& out);
+
+  /** レジスタ1本読む。**連続変換中に呼ぶとそのフレームのデータを失う** */
+  bool readReg(uint8_t addr, uint16_t& value);
+  /** レジスタ1本書く */
+  bool writeReg(uint8_t addr, uint16_t value);
+
+  /** STANDBY / WAKEUP */
+  bool standby();
+  bool wakeup();
+
+  const Stats& stats() const { return stats_; }
+  void resetStats() { stats_ = Stats(); }
+
+  /** DRDY が Low（データあり）か。ポーリング用だが常用しないこと（要件 §4.2） */
+  bool dataReady() const { return digitalRead(drdyPin_) == LOW; }
+
+  /**
+   * 1 LSB あたりの入力換算電圧 [V]。
+   * FSR = ±VREF / Gain なので LSB = (2 × VREF / Gain) / 2^24。
+   * **外部リファレンス使用時 VREF = 1.25 V**（内蔵は 1.2 V）。
+   * 要件定義 F-7 の「LSB = (2.4/Gain)/2^24」は内蔵基準の式であり、
+   * 本機は外部基準なので **2.5/Gain** が正しい。
+   */
+  static double lsbVolts(uint8_t gainCode, double vref = 1.25) {
+    return (2.0 * vref / (double)(1u << gainCode)) / 16777216.0;
+  }
+
+  /** CCITT CRC-16（多項式 0x1021 / シード 0xFFFF）。データシート 表8-7 */
+  static uint16_t crc16(const uint8_t* data, size_t len, uint16_t seed = 0xFFFF);
+
+private:
+  SPIClass* spi_ = nullptr;
+  SPISettings settings_;
+  uint8_t  csPin_   = 0xFF;
+  uint8_t  drdyPin_ = 0xFF;
+  bool     rxCrcEn_ = false;
+  uint32_t seq_     = 0;
+  uint16_t lastDrdyBits_ = 0;
+  Stats    stats_;
+
+  /** 1フレーム送受信する。txWord0 が先頭語（コマンド）。rx が null なら読み捨て */
+  void transferFrame(uint16_t txWord0, const uint16_t* txData, uint8_t* rx);
+  /** コマンドを送り、次フレームの先頭語を応答として取り出す */
+  uint16_t command(uint16_t cmd);
+
+  static inline void put24(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 16); p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)v;
+  }
+  static inline uint32_t get24(const uint8_t* p) {
+    return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+  }
+};
