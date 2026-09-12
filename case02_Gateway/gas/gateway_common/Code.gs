@@ -131,6 +131,12 @@ function writeDownlinkFile_(group, nonce, body) {
 //     - v9: Gatewayの旧13B/新14Bレコードを自動判別し、電池電圧・Gateway epoch・
 //       DEVICE_ID台帳による製品別の列名/単位/スケール/アラート定義へ対応（2026-08-16）
 //     - v10: check_cmdの群別ダウンリンク配信と、送信・結果報告のACK所有権検証に対応（2026-08-28）
+//     - v11: MONITA Deck 子機に対応（2026-09-12）。Gateway FW99 と組で使う。
+//            ・受信: &pt=06（静的6CH変位・48hex）/ &pt=07（イベント統計・50hex）を
+//              deck_<HEX> / deck_<HEX>_event シートへ振り分ける
+//            ・送信: トリガ設定13B を予約行の8番目のフィールド（16進26文字）で運ぶ
+//            ・deck_trigger シートと［Deck操作］メニューを追加
+//            ★&pt= が無いリクエストは従来と1行も変わらない挙動になる（既存Flex現場は無影響）
 //
 //   対応する子機ファーム:
 //     - project07_NEXCO/firmware/src/main.cpp（COMM_MODE_BLE、本番項目用）
@@ -309,7 +315,13 @@ function dlSet_(childHex, obj) {
 }
 
 // 未完了（queued / sent）の予約を、Gatewayが解釈する1行1件の形式で組み立てる。
-// 形式: HEX2:sleepMin:avg:median:attempts:seq:mode
+// 形式（Flex）: HEX2:sleepMin:avg:median:attempts:seq:mode          … 7フィールド
+// 形式（Deck）: HEX2:0:0:0:attempts:seq:0:TRIG26                    … 8フィールド
+//   ★8番目（トリガ設定の16進26文字）の有無だけで Gateway が Flex / Deck を振り分ける。
+//     Deck では sleep/avg/median を使わないので 0 を入れる（Gateway 側もこの3欄の
+//     値域検査を飛ばす）。この形にしたのは、**予約キャッシュ・再送・報告の仕組みを
+//     Flex と共有するため**である。Deck 専用の経路をもう1本作ると、再送や seq の
+//     取り違えといった実機で潰した不具合を2度踏むことになる。
 //   ★attemptsもseqもGAS側を正とする。Gateway側で数えると、再取得のたびにリセットされたり、
 //     予約を入れ直しても古い試行回数を引き継いだりするため。
 //   ★mode: 0=通常の設定変更 / 1=ステータス確認のみ（設定変更フラグを立てずに送る）
@@ -327,9 +339,13 @@ function buildDownlinkLines_(group) {
     if (group !== undefined && (parseInt(hex, 16) >> 5) !== group) continue;
     var d = dlGet_(hex);
     if (d && (d.state === 'queued' || d.state === 'sent')) {
-      lines.push(hex + ':' + d.sleep + ':' + d.avg + ':' + d.median +
-                 ':' + (d.attempts || 0) + ':' + (d.seq || 0) +
-                 ':' + (d.mode === 'status' ? 1 : 0));
+      if (d.kind === 'deck') {
+        lines.push(hex + ':0:0:0:' + (d.attempts || 0) + ':' + (d.seq || 0) + ':0:' + d.trigHex);
+      } else {
+        lines.push(hex + ':' + d.sleep + ':' + d.avg + ':' + d.median +
+                   ':' + (d.attempts || 0) + ':' + (d.seq || 0) +
+                   ':' + (d.mode === 'status' ? 1 : 0));
+      }
     }
   }
   return lines;
@@ -346,6 +362,14 @@ function dlStatusLabel_(d) {
   if (!d) return '';
   if (d.state === 'queued') return '';
   if (d.state === 'sent')   return '送信済み（確認待ち）';
+  // ★Deck は sleep/avg/median を持たない。適用後のトリガ設定で表示する。
+  if (d.kind === 'deck') {
+    if (d.status === DL_STATUS_OK)          return '完了: ' + deckTrigHexToText_(d.appliedTrigHex || '');
+    if (d.status === DL_STATUS_CLAMPED)     return '完了（子機が値を丸めた）: ' + deckTrigHexToText_(d.appliedTrigHex || '');
+    if (d.status === DL_STATUS_RANGE_ERROR) return '失敗（子機が値域エラーで拒否）';
+    if (d.status === DL_STATUS_NO_ACK)      return '失敗（未達。' + (d.attempts || 0) + '回試行しても確認が返らず）';
+    return '失敗（不明なステータス: ' + d.status + '）';
+  }
   if (d.status === DL_STATUS_OK)          return '完了' + dlWdtSuffix_(d);
   if (d.status === DL_STATUS_CLAMPED)     return '完了（値を丸めた: 間隔=' + d.appliedSleep + '分, 平均=' + d.appliedAvg + ', メジアン=' + d.appliedMedian + '）' + dlWdtSuffix_(d);
   if (d.status === DL_STATUS_RANGE_ERROR) return '失敗（子機が値域エラーで拒否）';
@@ -657,13 +681,18 @@ function refreshCmdStatusSheet() {
   //   （"00-00-00-00-00-<HEX2>"）。ここが表示専用の別形式だと紛らわしいため。
   CMD_STATUS_CHILD_IDS.forEach(function (childHex) {
     var mac = '00-00-00-00-00-' + childHex;
-    var productLabel = getProductProfile_(parseInt(childHex, 16)).productType + '子機';
+    // ★DECK_CHILD_IDS に載っていれば Deck。載っていなければ従来どおり製品プロファイルで判定する
+    var productLabel = (DECK_CHILD_IDS.indexOf(childHex) >= 0)
+      ? 'Deck子機'
+      : (getProductProfile_(parseInt(childHex, 16)).productType + '子機');
     var d = dlGet_(childHex);
     if (!d) {
       rows.push(['0x' + childHex, productLabel, mac, 'none', '—', '', '', now]);
       return;
     }
-    var req = '間隔=' + d.sleep + '分, 平均=' + d.avg + ', メジアン=' + d.median;
+    var req = (d.kind === 'deck')
+      ? ('トリガ設定: ' + deckTrigHexToText_(d.trigHex || ''))
+      : ('間隔=' + d.sleep + '分, 平均=' + d.avg + ', メジアン=' + d.median);
     var stateLabel = { queued: '予約中', sent: '送信済み（確認待ち）', done: '完了', failed: '失敗' }[d.state] || d.state;
     rows.push([
       '0x' + childHex, productLabel, mac, req, stateLabel, dlStatusLabel_(d),
@@ -705,6 +734,16 @@ function onOpen() {
     .addItem('ステータス確認', 'triggerFlexStatusCheck')
     .addSeparator()
     .addItem('予約を取り消す', 'triggerCancelFlexReservation')
+    .addToUi();
+
+  // ★2026-09-12追加: Deck 子機（6CH計測ユニット）の操作。
+  //   Flex とは設定項目が全く違う（送信間隔ではなくトリガ条件）ため、メニューを分けた。
+  SpreadsheetApp.getUi()
+    .createMenu('Deck操作')
+    .addItem('トリガ設定シートを準備', 'setupDeckTriggerSheet')
+    .addItem('トリガ設定を送信', 'triggerDeckSendTrigger')
+    .addSeparator()
+    .addItem('予約を取り消す', 'triggerCancelDeckReservation')
     .addToUi();
 
   refreshCmdStatusSheet();
@@ -998,6 +1037,502 @@ function parseGatewayV11Record(hex) {
   return parseGatewayRecord(hex);
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ★【設定D】MONITA Deck 子機（6CH計測ユニット）— 2026-09-12 追加
+//
+//   **Deck を1台でも置く現場では、下の DECK_CHILD_IDS に DeviceID を書くこと。**
+//   ここが空のままだとデータは届いても行き先が無く、databox に落ちる。
+//
+//   ■ Deck と Flex の違い（ここを取り違えると原因が分からなくなる）
+//     | | Flex | Deck |
+//     |---|---|---|
+//     | CH数        | 4      | 6 |
+//     | 送信周期    | 可変   | **60分固定**（Gatewayのflush周期と合わせてある） |
+//     | 1回の送信   | 1種類  | **2種類**（静的0x06 ＋ イベント統計0x07） |
+//     | バイト順    | リトルエンディアン | **ビッグエンディアン** |
+//     | シート      | child_XX | **deck_XX（静的）と deck_XX_event（イベント）** |
+//     | 遠隔設定    | 送信間隔・平均・メジアン | **トリガ設定13項目**（deck_trigger シート） |
+//
+//     ★バイト順が Flex と逆である。Deck 側は ADC も無線の設定値もすべて
+//       ビッグエンディアンで揃えてあるため、レコードもそれに合わせた。
+//       **Flex のパーサをコピーして流用しないこと。**
+//
+//   ■ データが来ない / 値がおかしいときの見どころ
+//     1. Gateway のシリアルに `&pt=06` が出ているか（出ていなければ Gateway 側の問題）
+//     2. DECK_CHILD_IDS に DeviceID があるか
+//     3. invalid_payload_log シートに記録が出ていないか
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ★Deck 子機の DeviceID（16進2桁・大文字）。現場に合わせてここへ足す。
+//   Flex と同じ採番規則（上位3bit=群 / 下位5bit=機器番号1〜31）。
+const DECK_CHILD_IDS = [
+  // 例: '0A',
+];
+
+const DECK_PT_STATIC = '06';   // Gateway が付けてくる &pt= の値（静的レコード）
+const DECK_PT_EVENT  = '07';   // 同（イベント統計レコード）
+
+// 1レコードの16進文字数 = (Gateway epoch 4B + ペイロードのpktTypeを除いた分) × 2
+const DECK_STATIC_HEX_LEN = 48;   // 4B + 20B
+const DECK_EVENT_HEX_LEN  = 50;   // 4B + 21B
+
+const DECK_TRIG_BYTES = 13;
+
+// 変位の分解能。子機は int16・0.1 µm/LSB で送る（要件 §7.3.8）
+const DECK_DISP_MM_PER_LSB = 0.0001;
+
+function deckHexToBytes_(hex) {
+  var b = [];
+  for (var i = 0; i < hex.length; i += 2) b.push(parseInt(hex.substr(i, 2), 16));
+  return b;
+}
+function deckU16be_(b, i) { return (b[i] << 8) | b[i + 1]; }
+function deckI16be_(b, i) { var v = deckU16be_(b, i); return v > 32767 ? v - 65536 : v; }
+function deckI8_(v)       { return v > 127 ? v - 256 : v; }
+function deckEpochLe_(b)  { return ((b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)) >>> 0); }
+
+// ── 静的レコード（pt=06 / 48 hex）────────────────────────────────
+// Gateway が送る中身: epoch(4B LE) + 子機ペイロードの pktType を除いた 20B
+//   [0]     DeviceID
+//   [1]     子機FWバージョン
+//   [2..13] CH1〜CH6 変位（int16 BE・0.1 µm/LSB）
+//   [14]    基板温度（int8・℃）
+//   [15]    外気温（int8・℃）
+//   [16]    Hour  [17] Min（子機のRTC。Gateway epoch とずれていれば時刻同期を疑う）
+//   [18]    CHステータス（bit0〜5 が CH1〜CH6。1=正常）
+//   [19]    連番（0〜255で巡回。抜けを見れば取りこぼしが分かる）
+function parseDeckStaticRecord(hex) {
+  if (hex.length !== DECK_STATIC_HEX_LEN) {
+    throw new Error('Deck静的レコード長が不正です: ' + hex.length + ' hex文字');
+  }
+  var b = deckHexToBytes_(hex);
+  var ch = [];
+  for (var c = 0; c < 6; c++) ch.push(deckI16be_(b, 4 + 2 + c * 2));
+  return {
+    epoch:    deckEpochLe_(b),
+    deviceId: b[4],
+    fwVer:    b[5],
+    chRaw:    ch,
+    chMm:     ch.map(function (v) { return Number((v * DECK_DISP_MM_PER_LSB).toFixed(4)); }),
+    tempBoard: deckI8_(b[18]),
+    tempAir:   deckI8_(b[19]),
+    childHour: b[20],
+    childMin:  b[21],
+    chStatus:  b[22],
+    seqNo:     b[23],
+  };
+}
+
+// ── イベント統計レコード（pt=07 / 50 hex）───────────────────────
+//   [0]     DeviceID
+//   [1]     子機FWバージョン
+//   [2]     集約Hour（この統計が何時台のものか）
+//   [3..4]  検出件数（uint16 BE。R-3：上限に達しても数え続ける）
+//   [5..6]  有効件数（uint16 BE。実際にSDへ収録できた件数）
+//   [7..8]  振幅p50  [9..10] p90  [11..12] p99（uint16 BE・0.1 µm/LSB）
+//   [13..18] 正規化たわみ形状 6点（uint8。0〜255 を 0〜1 に正規化した値のメジアン）
+//   [19]    品質（0〜100）
+//   [20]    連番
+function parseDeckEventRecord(hex) {
+  if (hex.length !== DECK_EVENT_HEX_LEN) {
+    throw new Error('Deckイベントレコード長が不正です: ' + hex.length + ' hex文字');
+  }
+  var b = deckHexToBytes_(hex);
+  var shape = [];
+  for (var i = 0; i < 6; i++) shape.push(Number((b[17 + i] / 255).toFixed(3)));
+  return {
+    epoch:     deckEpochLe_(b),
+    deviceId:  b[4],
+    fwVer:     b[5],
+    aggHour:   b[6],
+    detected:  deckU16be_(b, 7),
+    recorded:  deckU16be_(b, 9),
+    p50Mm:     Number((deckU16be_(b, 11) * DECK_DISP_MM_PER_LSB).toFixed(4)),
+    p90Mm:     Number((deckU16be_(b, 13) * DECK_DISP_MM_PER_LSB).toFixed(4)),
+    p99Mm:     Number((deckU16be_(b, 15) * DECK_DISP_MM_PER_LSB).toFixed(4)),
+    shape:     shape,
+    quality:   b[23],
+    seqNo:     b[24],
+  };
+}
+
+// ── シート ──────────────────────────────────────────────
+const DECK_STATIC_HEADER = [
+  '計測日時', 'DeviceID', 'FW',
+  'CH1(mm)', 'CH2(mm)', 'CH3(mm)', 'CH4(mm)', 'CH5(mm)', 'CH6(mm)',
+  '基板温度(℃)', '外気温(℃)', '子機時刻(hh:mm)', 'CHステータス', '連番', 'LTE-M RSSI(CSQ)',
+];
+const DECK_EVENT_HEADER = [
+  '計測日時', 'DeviceID', 'FW', '集約Hour', '検出件数', '有効件数',
+  '振幅p50(mm)', '振幅p90(mm)', '振幅p99(mm)',
+  '形状1', '形状2', '形状3', '形状4', '形状5', '形状6',
+  '品質', '連番', 'LTE-M RSSI(CSQ)',
+];
+
+function getDeckSheet_(ss, name, header) {
+  var sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+    sheet.appendRow(header);
+    sheet.setFrozenRows(1);
+    console.log('Deckシートを新規作成しました: ' + name);
+  }
+  return sheet;
+}
+
+// ── 受信処理（doGet から呼ぶ）──────────────────────────────
+// dBlob を n 件に切り分けてシートへ追記する。戻り値は文字列（doGet の応答）。
+function handleDeckBatch_(ss, pt, dBlob, n, csq) {
+  var perLen = (pt === DECK_PT_STATIC) ? DECK_STATIC_HEX_LEN : DECK_EVENT_HEX_LEN;
+  if (dBlob.length !== perLen * n) {
+    logInvalidPayload_(ss, 'Deck(pt=' + pt + ')の1件が' + perLen + ' hexではありません: ' +
+                       (n ? dBlob.length / n : '?'), n, dBlob);
+    return 'ERROR: unsupported deck record length';
+  }
+  if (!/^[0-9A-Fa-f]+$/.test(dBlob)) {
+    logInvalidPayload_(ss, 'Deck(pt=' + pt + ')のdにhex以外の文字が含まれます', n, dBlob);
+    return 'ERROR: non-hex payload';
+  }
+
+  var lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    for (var i = 0; i < n; i++) {
+      var chunk = dBlob.substr(i * perLen, perLen);
+      if (pt === DECK_PT_STATIC) appendDeckStaticRow_(ss, chunk, csq);
+      else                       appendDeckEventRow_(ss, chunk, csq);
+    }
+  } catch (err) {
+    console.log('Deck append error: ' + err);
+  } finally {
+    try { lock.releaseLock(); } catch (e2) {}
+  }
+  return 'OK';
+}
+
+function appendDeckStaticRow_(ss, chunk, csq) {
+  var d = parseDeckStaticRecord(chunk);
+  var hex = deviceIdHex_(d.deviceId);
+  var sheet = getDeckSheet_(ss, 'deck_' + hex, DECK_STATIC_HEADER);
+  var childClock = ('0' + d.childHour).slice(-2) + ':' + ('0' + d.childMin).slice(-2);
+  // CHステータスは16進1桁だと読み違えるので、正常CHを列挙した文字列にする
+  var okList = [];
+  for (var c = 0; c < 6; c++) if (d.chStatus & (1 << c)) okList.push('CH' + (c + 1));
+  var statusText = (okList.length === 6) ? '正常' :
+                   (okList.length === 0) ? '★全CH異常' : ('正常: ' + okList.join(' '));
+  sheet.appendRow([
+    new Date(d.epoch * 1000), d.deviceId, d.fwVer,
+    d.chMm[0], d.chMm[1], d.chMm[2], d.chMm[3], d.chMm[4], d.chMm[5],
+    d.tempBoard, d.tempAir, childClock, statusText, d.seqNo, csq,
+  ]);
+}
+
+function appendDeckEventRow_(ss, chunk, csq) {
+  var d = parseDeckEventRecord(chunk);
+  var hex = deviceIdHex_(d.deviceId);
+  var sheet = getDeckSheet_(ss, 'deck_' + hex + '_event', DECK_EVENT_HEADER);
+  sheet.appendRow([
+    new Date(d.epoch * 1000), d.deviceId, d.fwVer, d.aggHour, d.detected, d.recorded,
+    d.p50Mm, d.p90Mm, d.p99Mm,
+    d.shape[0], d.shape[1], d.shape[2], d.shape[3], d.shape[4], d.shape[5],
+    d.quality, d.seqNo, csq,
+  ]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Deck のトリガ設定（遠隔変更）— 要件 §7.3.7 / Gateway改修範囲 A-2
+//
+//   **設定は「deck_trigger」シートに書く。プロンプトで13項目も聞かない。**
+//   メニュー［Deck操作］→［トリガ設定シートを準備］でシートを作り、行を埋めてから
+//   ［トリガ設定を送信］を押す。値の意味と範囲はシートのヘッダーにコメントで入る。
+//
+//   ■ 届くまでの流れ
+//     deck_trigger シート
+//       → queueDeckDownlink_()（Script Properties に予約。Flexと同じ downlink_child_<HEX>）
+//       → check_cmd の応答2行目以降（8番目のフィールドに16進26文字で相乗り）
+//       → Gateway の applyDownlinkCache()
+//       → 子機が起きた瞬間に LoRa 0x82／24B で送信
+//       → 子機が 0x83／17B で「実際に適用した13バイト」を返す
+//       → downlink_result で戻り、シートのO列に結果が入る
+//
+//   ★13バイトの並びは子機の TriggerConfig::fromBytes()
+//     （case04_Deck/v1.00/lib/DeckMeasure/DeckMeasure.cpp）と**必ず一致させること。**
+//     片方だけ直しても誰もエラーを出さない。静かにずれる。
+//
+//   ★ここでの値域検査は子機側の検査と同じにしてある。**GAS で弾いておかないと、
+//     子機に拒否されるまで3回ダウンリンクを撃つことになり、原因も分かりにくい。**
+// ═══════════════════════════════════════════════════════════════════════════
+
+const DECK_TRIGGER_SHEET = 'deck_trigger';
+
+// 列の定義。label はヘッダー、note はセルに付ける説明（現場の人が読む）。
+const DECK_TRIGGER_COLUMNS = [
+  { key: 'deviceId',  label: 'DeviceID',        note: '16進2桁（例 0A）。DECK_CHILD_IDS にも同じ値を登録すること' },
+  { key: 'enabled',   label: '収録有効',        note: '1=収録する / 0=一時停止（検出も収録もしない）' },
+  { key: 'threshold', label: '閾値',            note: 'ADCコード。0〜65535。「閾値の定義」と組で意味が決まる' },
+  { key: 'threshMode',label: '閾値の定義',      note: '0=絶対値 / 1=基線からの変化量（★既定。温度で基線が動いても発火数が変わらない） / 2=変化率' },
+  { key: 'chMask',    label: '対象CHマスク',    note: '監視するCHのビット和。CH1=1 CH2=2 CH3=4 CH4=8 CH5=16 CH6=32。全CH=63。0は不可' },
+  { key: 'decision',  label: '判定方式',        note: '0=いずれか1CH(OR) / 1=対象CH全部(AND) / 2=N個以上' },
+  { key: 'nRequired', label: 'N',               note: '判定方式=2 のときだけ使う。1〜6' },
+  { key: 'durationMs',label: '継続時間(ms)',    note: '何ms超え続けたら発火するか。0〜255。スパイク除去用' },
+  { key: 'deadTimeMs',label: '不感時間(ms)',    note: '発火後この時間は再発火しない。0〜2550。10ms単位に丸める' },
+  { key: 'preSec',    label: 'プリトリガ(秒)',  note: '発火の何秒前から記録するか。0.5〜3.0。0.1秒単位' },
+  { key: 'postSec',   label: 'ポストトリガ(秒)',note: '発火の何秒後まで記録するか。1.0以上。0.1秒単位。★プリ+ポストは5.1秒以下（リングバッファ6秒の制約）' },
+  { key: 'maxPerHour',label: '最大収録件数(件/時)', note: '1時間に波形を保存する上限。超えたら件数だけ数える。0〜65535' },
+  { key: 'staticMin', label: '静的計測の周期(分)', note: '1分値を出す周期。1〜255。LoRa送信は60分周期で固定' },
+  { key: 'sentAt',    label: '最終送信',        note: '（自動）予約を入れた日時' },
+  { key: 'result',    label: '状態',            note: '（自動）子機からの応答結果' },
+];
+
+function getDeckTriggerSheet_(ss) {
+  return (ss || getSpreadsheet()).getSheetByName(DECK_TRIGGER_SHEET);
+}
+
+// 列番号（1始まり）を key から引く。★列を足したときに番号を直し忘れないようにするため、
+//   14・15 のような数字をコードへ直接書かない。
+function deckTriggerCol_(key) {
+  for (var i = 0; i < DECK_TRIGGER_COLUMNS.length; i++) {
+    if (DECK_TRIGGER_COLUMNS[i].key === key) return i + 1;
+  }
+  throw new Error('deck_trigger に列 ' + key + ' がありません');
+}
+
+// メニュー［トリガ設定シートを準備］。無ければ作り、有ればヘッダーと説明を貼り直す。
+// ★列を増やしたときも、この関数をもう一度実行すれば既存シートが追随する。
+function setupDeckTriggerSheet() {
+  var ss = getSpreadsheet();
+  var sheet = ss.getSheetByName(DECK_TRIGGER_SHEET) || ss.insertSheet(DECK_TRIGGER_SHEET);
+  var labels = DECK_TRIGGER_COLUMNS.map(function (c) { return c.label; });
+  sheet.getRange(1, 1, 1, labels.length).setValues([labels]).setFontWeight('bold');
+  for (var i = 0; i < DECK_TRIGGER_COLUMNS.length; i++) {
+    sheet.getRange(1, i + 1).setNote(DECK_TRIGGER_COLUMNS[i].note);
+  }
+  sheet.setFrozenRows(1);
+
+  // 既定値の行を1行だけ用意する（要件 §7.3.7 の既定値・子機ファームの初期値と同じ）
+  if (sheet.getLastRow() < 2) {
+    sheet.appendRow([
+      DECK_CHILD_IDS.length ? DECK_CHILD_IDS[0] : '0A',
+      1, 200, 1, 63, 0, 2, 20, 500, 1.5, 3.5, 200, 1, '', '',
+    ]);
+  }
+  sheet.autoResizeColumns(1, labels.length);
+  SpreadsheetApp.getUi().alert(
+    'deck_trigger シートを準備しました。\n\n' +
+    '各列のヘッダーにマウスを乗せると、値の意味と範囲が出ます。\n' +
+    '行を埋めたら［Deck操作］→［トリガ設定を送信］を押してください。');
+}
+
+// シート1行 → 13バイト配列。エラーは文字列の配列で返す（1件ずつ直せるように全部返す）。
+function deckRowToTrigBytes_(row) {
+  var errs = [];
+  // ★空欄を Number('') = 0 として通してはいけない。「閾値を書き忘れた」が
+  //   「閾値0＝常に発火」になってしまう。空欄は明確にエラーとして返す。
+  function num(key, v) {
+    if (v === '' || v === null || v === undefined) { errs.push(key + ' が空欄です'); return 0; }
+    var x = Number(v);
+    if (isNaN(x)) { errs.push(key + ' が数値ではありません（' + v + '）'); return 0; }
+    return x;
+  }
+
+  var enabled    = num('収録有効', row.enabled) ? 1 : 0;
+  var threshold  = Math.round(num('閾値', row.threshold));
+  var threshMode = Math.round(num('閾値の定義', row.threshMode));
+  var chMask     = Math.round(num('対象CHマスク', row.chMask));
+  var decision   = Math.round(num('判定方式', row.decision));
+  var nRequired  = Math.round(num('N', row.nRequired));
+  var durationMs = Math.round(num('継続時間(ms)', row.durationMs));
+  var deadTen    = Math.round(num('不感時間(ms)', row.deadTimeMs) / 10);   // ×10ms 単位へ
+  var preTenth   = Math.round(num('プリトリガ(秒)', row.preSec) * 10);     // ×0.1秒 単位へ
+  var postTenth  = Math.round(num('ポストトリガ(秒)', row.postSec) * 10);
+  var maxPerHour = Math.round(num('最大収録件数(件/時)', row.maxPerHour));
+  var staticMin  = Math.round(num('静的計測の周期(分)', row.staticMin));
+
+  if (threshold < 0 || threshold > 65535)   errs.push('閾値は 0〜65535');
+  if (threshMode < 0 || threshMode > 2)     errs.push('閾値の定義は 0〜2');
+  if (chMask < 1 || chMask > 63)            errs.push('対象CHマスクは 1〜63（0は不可）');
+  if (decision < 0 || decision > 2)         errs.push('判定方式は 0〜2');
+  if (decision === 2 && (nRequired < 1 || nRequired > 6)) errs.push('判定方式=2 のとき N は 1〜6');
+  if (durationMs < 0 || durationMs > 255)   errs.push('継続時間は 0〜255 ms');
+  if (deadTen < 0 || deadTen > 255)         errs.push('不感時間は 0〜2550 ms');
+  if (preTenth < 5 || preTenth > 30)        errs.push('プリトリガは 0.5〜3.0 秒');
+  if (postTenth < 10)                       errs.push('ポストトリガは 1.0 秒以上');
+  if (maxPerHour < 0 || maxPerHour > 65535) errs.push('最大収録件数は 0〜65535');
+  if (staticMin < 1 || staticMin > 255)     errs.push('静的計測の周期は 1〜255 分');
+
+  // ★リングバッファに収まるか。子機の TriggerConfig::fitsInRing() と同じ計算にしてある。
+  //   6000サンプル − SD書込みの余裕977サンプル ＝ 5023 サンプルまで。
+  var need = Math.floor((preTenth + postTenth) * 977 / 10);
+  if (need + 977 > 6000) {
+    errs.push('プリ+ポストが長すぎます（' + ((preTenth + postTenth) / 10) +
+              '秒）。リングバッファ6秒に収まりません。合計5.1秒以下にしてください');
+  }
+
+  if (errs.length) return { errors: errs };
+
+  var b = [
+    enabled,
+    (threshold >> 8) & 0xFF, threshold & 0xFF,
+    threshMode,
+    chMask & 0x3F,
+    ((nRequired & 0x0F) << 4) | (decision & 0x0F),
+    durationMs,
+    deadTen,
+    preTenth,
+    postTenth,
+    (maxPerHour >> 8) & 0xFF, maxPerHour & 0xFF,
+    staticMin,
+  ];
+  if (b.length !== DECK_TRIG_BYTES) return { errors: ['内部エラー: バイト数が ' + b.length] };
+  return { bytes: b };
+}
+
+function deckBytesToHex_(bytes) {
+  return bytes.map(function (v) { return ('0' + (v & 0xFF).toString(16)).slice(-2).toUpperCase(); }).join('');
+}
+
+// 16進26文字 → 人が読める1行。子機が返してきた「実際に適用した値」の確認に使う。
+function deckTrigHexToText_(hex) {
+  if (!/^[0-9A-Fa-f]{26}$/.test(String(hex || ''))) return String(hex || '');
+  var b = deckHexToBytes_(hex);
+  var modeName = ['絶対値', '基線からの変化量', '変化率'][b[3]] || ('不明(' + b[3] + ')');
+  var decName  = ['OR', 'AND', 'N個以上'][b[5] & 0x0F] || ('不明(' + (b[5] & 0x0F) + ')');
+  return (b[0] ? '有効' : '停止') +
+         ' 閾値=' + ((b[1] << 8) | b[2]) + '(' + modeName + ')' +
+         ' CH=' + (b[4] & 0x3F) +
+         ' 判定=' + decName + (((b[5] & 0x0F) === 2) ? ('(N=' + (b[5] >> 4) + ')') : '') +
+         ' 継続=' + b[6] + 'ms' +
+         ' 不感=' + (b[7] * 10) + 'ms' +
+         ' プリ=' + (b[8] / 10) + 's ポスト=' + (b[9] / 10) + 's' +
+         ' 上限=' + ((b[10] << 8) | b[11]) + '件/h' +
+         ' 静的=' + b[12] + '分';
+}
+
+// Deck 用の予約を積む。Flex の queueDownlink_() と同じキー・同じ seq 採番規則を使う。
+// ★kind:'deck' が付いているかどうかだけで、buildDownlinkLines_ が形式を切り替える。
+function queueDeckDownlink_(childHex, trigBytes, sourceNote) {
+  var lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    var prevRec = dlGet_(childHex);
+    var nextSeq = (prevRec && prevRec.seq ? prevRec.seq : 0) + 1;
+    var trigHex = deckBytesToHex_(trigBytes);
+
+    dlSet_(childHex, {
+      kind: 'deck',
+      trigHex: trigHex,
+      // Flex 用の欄は Deck では使わないが、共通コードが参照しても落ちないよう 0 を入れる
+      sleep: 0, avg: 0, median: 0,
+      state: 'queued', attempts: 0, seq: nextSeq, mode: 'set',
+    });
+
+    dlLog_(childHex, nextSeq, 'Deck予約', deckTrigHexToText_(trigHex),
+           (prevRec && prevRec.state !== 'done' && prevRec.state !== 'failed')
+             ? '★未完了の予約(seq=' + prevRec.seq + ')を上書きしました'
+             : sourceNote);
+    return nextSeq;
+  } catch (err) {
+    console.log('Deck downlink reservation lock error: ' + err);
+    return null;
+  } finally {
+    try { lock.releaseLock(); } catch (e2) {}
+  }
+}
+
+// メニュー［トリガ設定を送信］。deck_trigger シートの行を読んで予約する。
+function triggerDeckSendTrigger() {
+  var ui = SpreadsheetApp.getUi();
+  var ss = getSpreadsheet();
+  var sheet = getDeckTriggerSheet_(ss);
+  if (!sheet) {
+    ui.alert('deck_trigger シートがありません。先に［トリガ設定シートを準備］を実行してください。');
+    return;
+  }
+  var last = sheet.getLastRow();
+  if (last < 2) { ui.alert('deck_trigger シートに行がありません。'); return; }
+
+  var values = sheet.getRange(2, 1, last - 1, DECK_TRIGGER_COLUMNS.length).getValues();
+  var choices = values.map(function (r, i) {
+    return (i + 1) + '. DeviceID=' + r[0] + '（閾値=' + r[2] + ' プリ=' + r[9] + 's ポスト=' + r[10] + 's）';
+  });
+  var r = ui.prompt('Deck トリガ設定の送信',
+                    'どの行を送信しますか。番号を入力してください。\n\n' + choices.join('\n'),
+                    ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return;
+  var idx = parseInt(r.getResponseText().trim(), 10);
+  if (!(idx >= 1 && idx <= values.length)) { ui.alert('番号が不正です。'); return; }
+
+  var v = values[idx - 1];
+  var row = {};
+  DECK_TRIGGER_COLUMNS.forEach(function (c, i) { row[c.key] = v[i]; });
+
+  var childHex = String(row.deviceId).trim().replace(/^0x/i, '').toUpperCase();
+  childHex = ('0' + childHex).slice(-2);
+  if (!/^[0-9A-F]{2}$/.test(childHex)) { ui.alert('DeviceIDは16進2桁で入力してください（例 0A）。'); return; }
+  if (DECK_CHILD_IDS.indexOf(childHex) < 0) {
+    ui.alert('DeviceID ' + childHex + ' が DECK_CHILD_IDS に登録されていません。\n' +
+             'Code.gs の DECK_CHILD_IDS に追加してから送信してください。' +
+             '（登録しないと、届いたデータの行き先が決まりません）');
+    return;
+  }
+
+  var enc = deckRowToTrigBytes_(row);
+  if (enc.errors) { ui.alert('設定値に誤りがあります:\n\n・' + enc.errors.join('\n・')); return; }
+
+  var trigHex = deckBytesToHex_(enc.bytes);
+  var confirm = ui.alert('この内容で送信しますか？',
+                         'DeviceID: ' + childHex + '\n\n' + deckTrigHexToText_(trigHex) +
+                         '\n\n（16進: ' + trigHex + '）\n\n' +
+                         '★子機が次に電波を出したときに届きます。Deck は60分周期なので、' +
+                         '最大で1時間ほどかかります。',
+                         ui.ButtonSet.OK_CANCEL);
+  if (confirm !== ui.Button.OK) return;
+
+  var seq = queueDeckDownlink_(childHex, enc.bytes, 'deck_trigger シート ' + idx + '行目から送信');
+  if (seq === null) { ui.alert('予約に失敗しました（ロックのタイムアウト）。もう一度試してください。'); return; }
+
+  sheet.getRange(idx + 1, deckTriggerCol_('sentAt')).setValue(new Date());
+  sheet.getRange(idx + 1, deckTriggerCol_('result')).setValue('送信待ち（seq=' + seq + '）');
+  ui.alert('予約しました（seq=' + seq + '）。\n子機の応答が返ると、この行の「状態」列が更新されます。');
+}
+
+// メニュー［予約を取り消す］。
+function triggerCancelDeckReservation() {
+  var ui = SpreadsheetApp.getUi();
+  var hex = promptChildHex_(ui, 'Deck 予約の取り消し', '取り消す Deck の DeviceID を16進2桁で入力してください（例 0A）。');
+  if (!hex) return;
+  var rec = dlGet_(hex);
+  if (!rec || (rec.state !== 'queued' && rec.state !== 'sent')) {
+    ui.alert('DeviceID ' + hex + ' に未完了の予約はありません。');
+    return;
+  }
+  PropertiesService.getScriptProperties().deleteProperty(dlKey_(hex));
+  dlLog_(hex, rec.seq, '取り消し', deckTrigHexToText_(rec.trigHex || ''), '手動で取り消しました');
+  ui.alert('DeviceID ' + hex + ' の予約(seq=' + rec.seq + ')を取り消しました。');
+}
+
+// deck_trigger シートの「状態」列を、子機からの応答結果で更新する。
+// ★DeviceID 列で行を探す。同じDeviceIDが複数行あるときは最初の行だけ更新する。
+function updateDeckTriggerResult_(childHex, text) {
+  try {
+    var sheet = getDeckTriggerSheet_();
+    if (!sheet) return;
+    var last = sheet.getLastRow();
+    if (last < 2) return;
+    var ids = sheet.getRange(2, 1, last - 1, 1).getValues();
+    for (var i = 0; i < ids.length; i++) {
+      var v = ('0' + String(ids[i][0]).trim().replace(/^0x/i, '')).slice(-2).toUpperCase();
+      if (v === childHex) { sheet.getRange(i + 2, deckTriggerCol_('result')).setValue(text); return; }
+    }
+  } catch (e) {
+    console.log('deck_trigger 状態列の更新に失敗: ' + e);
+  }
+}
+
+
+
+
 function deviceIdHex_(deviceId) {
   return ('0' + Number(deviceId).toString(16)).slice(-2).toUpperCase();
 }
@@ -1272,8 +1807,14 @@ function doGet(e) {
       return ContentService.createTextOutput('error: group mismatch');
     }
     var wdtMin = parseInt(p.wdt || '0', 10);
-    var applied = (p.sleep || '?') + ' / ' + (p.avg || '?') + ' / ' + (p.median || '?') +
-                  (wdtMin ? ('（WDT=' + wdtMin + '分）') : '');
+    // ★Deck かどうかは &trig= の有無で判別する。Gateway 側が Deck の報告にだけ付ける。
+    //   &sleep= 等は付いてこないので、従来の組み立てをそのまま使うと "?" だらけになる。
+    var deckTrigHex = String(p.trig || '').toUpperCase();
+    var isDeckResult = /^[0-9A-F]{26}$/.test(deckTrigHex);
+    var applied = isDeckResult
+      ? deckTrigHexToText_(deckTrigHex)
+      : ((p.sleep || '?') + ' / ' + (p.avg || '?') + ' / ' + (p.median || '?') +
+         (wdtMin ? ('（WDT=' + wdtMin + '分）') : ''));
     var statusNum = parseInt(p.status || '0', 10);
 
     // ★予約結果の照合・状態更新が新しい予約と競合しないようにする。
@@ -1295,16 +1836,27 @@ function doGet(e) {
 
       rec.status        = statusNum;
       rec.attempts      = parseInt(p.attempts || '0', 10);
-      rec.appliedSleep  = parseInt(p.sleep  || '0', 10);
-      rec.appliedAvg    = parseInt(p.avg    || '0', 10);
-      rec.appliedMedian = parseInt(p.median || '0', 10);
-      rec.appliedWdtMin = wdtMin;
       rec.state = (rec.status === DL_STATUS_OK || rec.status === DL_STATUS_CLAMPED) ? 'done' : 'failed';
-      dlSet_(childHex, rec);
 
-      dlLog_(childHex, p.seq, '結果',
-             '要求: ' + rec.sleep + ' / ' + rec.avg + ' / ' + rec.median + '　→　適用: ' + applied,
-             dlStatusLabel_(rec) + '（' + rec.attempts + '回目で確定）', reportGroup);
+      if (rec.kind === 'deck') {
+        rec.appliedTrigHex = isDeckResult ? deckTrigHex : '';
+        dlSet_(childHex, rec);
+        dlLog_(childHex, p.seq, '結果',
+               '要求: ' + deckTrigHexToText_(rec.trigHex || '') + '　→　適用: ' + applied,
+               dlStatusLabel_(rec) + '（' + rec.attempts + '回目で確定）', reportGroup);
+        // deck_trigger シートの「状態」列にも書き戻す（現場はこのシートしか見ない）
+        updateDeckTriggerResult_(childHex, dlStatusLabel_(rec) +
+                                 '　' + Utilities.formatDate(new Date(), 'Asia/Tokyo', 'MM/dd HH:mm'));
+      } else {
+        rec.appliedSleep  = parseInt(p.sleep  || '0', 10);
+        rec.appliedAvg    = parseInt(p.avg    || '0', 10);
+        rec.appliedMedian = parseInt(p.median || '0', 10);
+        rec.appliedWdtMin = wdtMin;
+        dlSet_(childHex, rec);
+        dlLog_(childHex, p.seq, '結果',
+               '要求: ' + rec.sleep + ' / ' + rec.avg + ' / ' + rec.median + '　→　適用: ' + applied,
+               dlStatusLabel_(rec) + '（' + rec.attempts + '回目で確定）', reportGroup);
+      }
     } catch (err) {
       console.log('Downlink result lock error: ' + err);
       return ContentService.createTextOutput('error: lock timeout');
@@ -1460,6 +2012,20 @@ function doGet(e) {
     logInvalidPayload_(ss, 'nが1以上の整数ではありません', n, dBlob);
     return ContentService.createTextOutput('ERROR: invalid n');
   }
+
+  // ★2026-09-12: Deck 子機（&pt=06 / 07）。Gateway FW98 以降が付けてくる。
+  //   **&pt= が無ければ従来の Flex 形式で、コードは1行も変わらない。**
+  //   Gateway 側は 1バッチに同じ pktType のレコードしか入れないので、
+  //   ここで pt を見れば1回のリクエスト全体の形式が決まる。
+  var pt = String(p.pt || '');
+  if (pt === DECK_PT_STATIC || pt === DECK_PT_EVENT) {
+    return ContentService.createTextOutput(handleDeckBatch_(ss, pt, dBlob, n, csq));
+  }
+  if (pt !== '') {
+    logInvalidPayload_(ss, '未知の pt=' + pt + '（Code.gs 側が Gateway に追随していない可能性）', n, dBlob);
+    return ContentService.createTextOutput('ERROR: unknown pt');
+  }
+
   if (dBlob.length % n !== 0) {
     logInvalidPayload_(ss, 'd.lengthがnで割り切れません', n, dBlob);
     return ContentService.createTextOutput('ERROR: invalid d length');

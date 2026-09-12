@@ -1,6 +1,6 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- *  Monita Gateway v1.20（FW 98）— 設定早見表
+ *  Monita Gateway v1.20（FW 99）— 設定早見表
  *  **ここを読めば、何をしたいときにどこを変えればよいか分かるようにしてある。**
  *  ソースを追う前に、まずこの表を見ること。
  * ═══════════════════════════════════════════════════════════════════════════
@@ -10,6 +10,7 @@
  *  | やりたいこと                     | 変える場所                                    |
  *  |----------------------------------|-----------------------------------------------|
  *  | Deck 子機を受けたい              | **何もしない。FW 98 で標準対応済み**        |
+ *  | Deck のトリガ設定を遠隔で変えたい| **何もしない。FW 99 で標準対応済み【設定8】**  |
  *  | 新しい子機の型を追加したい       | **【設定1】SENSOR_FRAME_TYPES[] に1行足すだけ**|
  *  | Gateway の群を分けたい           | **【設定2】ビルド時 -D GATEWAY_GROUP_ID=n**    |
  *  | クラウド（GAS）の宛先を変えたい  | **【設定3】GAS_SCRIPT_ID**                     |
@@ -25,7 +26,8 @@
  *    （群の焼き間違いを現場で何度か起こしているため、目視できるようにした）
  *
  *  ■ 触ってはいけないもの
- *    - pktType 0x05（ダウンリンクACK）、0x81（ダウンリンク）、0x82/0x83（Deck用・予約）
+ *    - pktType 0x05（Flex用ACK）、0x81（Flex用ダウンリンク）、
+ *      0x82（Deck用ダウンリンク）、0x83（Deck用ACK）― いずれも使用中
  *    - ピン割当（基板 ver1.10 の回路図で確定。D0=LoRa RX / D1=LoRa TX / D2=M0M1 / D3=SD CS）
  *
  *  ■ FW 97 との違い（FW 98 で追加したもの）
@@ -33,8 +35,14 @@
  *    **Flex しかいない現場では FW 97 と挙動が完全に同一**になるよう作ってある
  *    （&pt= を付けない・pseudoMac も従来どおり）。詳細は README.md を参照。
  *
+ *  ■ FW 98 との違い（FW 99 で追加したもの）
+ *    Deck 子機へのダウンリンク（トリガ設定13B＋時刻）と、その確認応答に対応した【設定8】。
+ *    あわせて Flex 用ACK(0x05)の長さ検証を「7以上」から「7または9の厳密一致」へ直した。
+ *    **Flex しかいない現場では FW 98 と挙動が同一**である（予約行が7フィールドのままなら
+ *    従来の 0x81／15B の経路をそのまま通る）。
+ *
  *    ★ディレクトリ名 v1.20 はハードウェアの系統を指す。ソフトの版は
- *      GATEWAY_FW_VERSION（88→…→97→98）で表す。**新機能ごとに
+ *      GATEWAY_FW_VERSION（88→…→98→99）で表す。**新機能ごとに
  *      ディレクトリを増やさないこと。**増やすと同じ修正を両方へ入れ続けることになり、
  *      実際 project06_yokogawa/gateway_v1.2 は FW 101、こちらは FW 97 まで乖離していた。
  * ═══════════════════════════════════════════════════════════════════════════
@@ -330,7 +338,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 98;
+static uint8_t  const GATEWAY_FW_VERSION = 99;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する（★BLE受信専用）
 // ★2026-08-28: LoRaは isAllowedLoRaPacket() を使う。BLEの群分離は第3段階まで後回しと
@@ -361,8 +369,10 @@ bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
 //   ■使えない値
 //     0x05 … ダウンリンクACK（子機→親機）として予約済み。onDownlinkAckReceived() が
 //             長さ検証より前に捌くため、センサ型に使うと data が消える
-//     0x81 … ダウンリンク（親機→子機）
-//     0x82 / 0x83 … Deck 用ダウンリンク／ACK（予約）
+//     0x81 … Flex 用ダウンリンク（親機→子機）
+//     0x82 … Deck 用ダウンリンク（親機→子機）。★FW99 で使用開始
+//     0x83 … Deck 用ACK（子機→親機）。★FW99 で使用開始。0x05 と同じく
+//             長さ検証より前に捌かれるため、センサ型に使うと data が消える
 // ═══════════════════════════════════════════════════════════════════════════
 struct SensorFrameType {
   uint8_t     pktType;
@@ -1436,6 +1446,46 @@ void sendLogDumpToGAS() {
 #define DL_STATUS_CLAMPED     2
 #define DL_STATUS_NO_ACK      99   // Gateway自身が付ける「未達」
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ★【設定8】Deck 子機へトリガ設定を送る（FW 99 / 改修範囲 G-5）
+//
+//   **Gateway 側で変える設定は無い。** スプレッドシートのメニューから予約を入れれば
+//   ここを通って子機へ届く。この節は「どこで何が起きているか」を追うための説明である。
+//
+//   ■ Flex(0x81) と Deck(0x82) の違い
+//     Flex : 送信間隔・平均回数・メジアン回数の3項目（15B）
+//     Deck : トリガ設定13項目（§7.3.7）をまとめた 13 バイト（24B）
+//     **どちらも同じ予約キャッシュ・同じ再送・同じ報告経路に乗る。**
+//     予約行の8番目のフィールド（トリガ設定の16進26文字）が有るか無いかだけで振り分ける。
+//
+//   ■ Deck のダウンリンクフレーム（親機→子機、24 バイト）
+//     [0..1]   CompanyID 0xC0DE
+//     [2]      PktType 0x82
+//     [3]      DeviceID（宛先）
+//     [4]      Flags（下の DownlinkFlag。DL_FLAG_TIME と DECK_FLAG_TRIG を使う）
+//     [5..10]  時刻 YY MM DD hh mm ss（GatewayのDS3231。JST）
+//     [11..23] トリガ設定 13B（子機の TriggerConfig::fromBytes() と同じ並び）
+//
+//     ★時刻を毎回載せるのは要件 F-23 のため。**Deck には RTC のバックアップ電池が無い**
+//       （§11.4 で BT1 を廃止）。停電から復帰すると子機は自分の時刻を失うので、
+//       親機が配り続けるしかない。Flex の 0x81 は時刻欄を持ちながら DL_FLAG_TIME を
+//       立てていないが、Deck では**必ず立てる。**
+//
+//   ■ Deck の確認応答（子機→親機、17 バイト）
+//     [0] 0x83  [1] DeviceID  [2] status(DL_STATUS_*)  [3] 子機FWバージョン
+//     [4..16] 適用後のトリガ設定 13B
+//     ★status だけでなく適用後の13Bを返させる。**送った値と返ってきた値が違えば
+//       スプレッドシート上で目に見える。**（Flex で「WDT=何分になったか」を返させて
+//       計算式の誤りを見つけたのと同じ考え方）
+//
+//   ■ 触るときの注意
+//     トリガ設定13バイトの並びは、子機側の
+//       case04_Deck/v1.00/lib/DeckMeasure/DeckMeasure.cpp の TriggerConfig::fromBytes()
+//     と**必ず一致させること。片方だけ直すと、エラーにならずに静かにずれる。**
+// ═══════════════════════════════════════════════════════════════════════════
+#define DECK_TRIG_BYTES     13          // トリガ設定のバイト数（要件 §7.3.7）
+#define DECK_TRIG_HEX_LEN   (DECK_TRIG_BYTES * 2)   // 予約行での16進表記の文字数（26）
+
 struct PendingDownlink {
   bool     active;
   uint8_t  childId;
@@ -1446,6 +1496,9 @@ struct PendingDownlink {
   uint32_t seq;         // 予約の通し番号。報告に含めてGAS側で新旧を判別させる
   bool     statusOnly;  // trueなら設定変更フラグを立てずに送る（ステータス確認）
   uint32_t lastSendMs;  // 最後にこの子機へ送信した時刻（連続送信の抑制用）
+  // ★Deck 用。isDeck=false のときは trig[] を見ないこと（未初期化ではなくゼロだが無意味）
+  bool     isDeck;
+  uint8_t  trig[DECK_TRIG_BYTES];
 };
 static PendingDownlink s_pending[MAX_PENDING_CHILDREN];
 
@@ -1464,49 +1517,68 @@ struct DownlinkReport {
   uint8_t  attempts;
   uint32_t seq;
   uint16_t wdtMin;  // 子機の確認応答に載る、適用後に有効になるWDTタイムアウト（分）
+  // ★Deck 用。true なら sleep/avg/median/wdt ではなく trig[] をGASへ送る
+  bool     isDeck;
+  uint8_t  trig[DECK_TRIG_BYTES];
 };
 #define MAX_REPORTS 32
 static DownlinkReport s_reports[MAX_REPORTS];
 
-static void queueReport(bool finalResult, uint8_t childId, uint8_t status,
-                        uint16_t sleepMin, uint8_t avg, uint8_t median,
-                        uint8_t attempts, uint32_t seq, uint16_t wdtMin = 0) {
-  int slot = -1;
+// 空きスロットを1つ返す。満杯なら nullptr。
+// ★LTE-M不調でキューが満杯でも、最終結果を失うとGASの予約が未完了のまま残り、
+//   子機への再送が続いてしまう。中間報告(downlink_sent)は失ってもよいため、
+//   最終結果だけは既存の中間報告を上書きして優先する。
+static DownlinkReport* allocReportSlot(bool finalResult) {
   for (int i = 0; i < MAX_REPORTS; i++) {
-    if (!s_reports[i].used) {
-      slot = i;
-      break;
-    }
+    if (!s_reports[i].used) return &s_reports[i];
   }
-
-  // ★LTE-M不調でキューが満杯でも、最終結果を失うとGASの予約が未完了のまま残り、
-  //   子機への再送が続いてしまう。中間報告(downlink_sent)は失ってもよいため、
-  //   最終結果だけは既存の中間報告を上書きして優先する。
-  if (slot < 0 && finalResult) {
+  if (finalResult) {
     for (int i = 0; i < MAX_REPORTS; i++) {
       if (!s_reports[i].finalResult) {
-        slot = i;
         Serial.println(F("[REPORT] キュー満杯のため中間報告を最終結果で上書きします"));
-        break;
+        return &s_reports[i];
       }
     }
   }
+  Serial.println(F("[REPORT] キューが満杯のため報告を破棄しました"));
+  return nullptr;
+}
 
-  if (slot < 0) {
-    Serial.println(F("[REPORT] キューが満杯のため報告を破棄しました"));
-    return;
-  }
+static void queueReport(bool finalResult, uint8_t childId, uint8_t status,
+                        uint16_t sleepMin, uint8_t avg, uint8_t median,
+                        uint8_t attempts, uint32_t seq, uint16_t wdtMin = 0) {
+  DownlinkReport* r = allocReportSlot(finalResult);
+  if (r == nullptr) return;
 
-  s_reports[slot].used        = true;
-  s_reports[slot].finalResult = finalResult;
-  s_reports[slot].childId     = childId;
-  s_reports[slot].status      = status;
-  s_reports[slot].sleepMin    = sleepMin;
-  s_reports[slot].avg         = avg;
-  s_reports[slot].median      = median;
-  s_reports[slot].attempts    = attempts;
-  s_reports[slot].seq         = seq;
-  s_reports[slot].wdtMin      = wdtMin;
+  memset(r, 0, sizeof(*r));
+  r->used        = true;
+  r->finalResult = finalResult;
+  r->childId     = childId;
+  r->status      = status;
+  r->sleepMin    = sleepMin;
+  r->avg         = avg;
+  r->median      = median;
+  r->attempts    = attempts;
+  r->seq         = seq;
+  r->wdtMin      = wdtMin;
+  r->isDeck      = false;
+}
+
+// Deck 用の報告。trig=nullptr なら13バイトはゼロで埋める（未達の報告など）。
+static void queueDeckReport(bool finalResult, uint8_t childId, uint8_t status,
+                            const uint8_t* trig, uint8_t attempts, uint32_t seq) {
+  DownlinkReport* r = allocReportSlot(finalResult);
+  if (r == nullptr) return;
+
+  memset(r, 0, sizeof(*r));
+  r->used        = true;
+  r->finalResult = finalResult;
+  r->childId     = childId;
+  r->status      = status;
+  r->attempts    = attempts;
+  r->seq         = seq;
+  r->isDeck      = true;
+  if (trig != nullptr) memcpy(r->trig, trig, DECK_TRIG_BYTES);
 }
 
 // ★「実際に送信したダウンリンク」の控え。
@@ -1552,8 +1624,38 @@ static PendingDownlink* findPending(uint8_t childId) {
   return nullptr;
 }
 
-// check_cmdの応答2行目以降（"HEX2:sleepMin:avg:median:attempts:seq:mode"）を
-// 予約キャッシュへ取り込む。bodyは応答全文（1行目のコマンドを含む）。
+// 16進1文字を0〜15へ。16進でなければ -1。
+static int hexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  return -1;
+}
+
+// 16進文字列をバイト列へ。長さ不一致・非16進なら false（outは書き換えない）。
+static bool hexToBytes(const String& hex, uint8_t* out, size_t outLen) {
+  if ((size_t)hex.length() != outLen * 2) return false;
+  for (size_t i = 0; i < outLen; i++) {
+    const int hi = hexNibble(hex.charAt((int)(i * 2)));
+    const int lo = hexNibble(hex.charAt((int)(i * 2 + 1)));
+    if (hi < 0 || lo < 0) return false;
+    out[i] = (uint8_t)((hi << 4) | lo);
+  }
+  return true;
+}
+
+// check_cmdの応答2行目以降を予約キャッシュへ取り込む。bodyは応答全文（1行目のコマンドを含む）。
+//
+// 【予約行の書式】
+//   Flex : HEX2:sleepMin:avg:median:attempts:seq:mode          … 7フィールド（従来どおり）
+//   Deck : HEX2:sleepMin:avg:median:attempts:seq:mode:TRIG26   … 8フィールド（★FW99 で追加）
+//
+//   ★8番目（トリガ設定の16進26文字）が有るか無いかだけで Flex / Deck を振り分ける。
+//     こうしておくと、GAS が古いまま（7フィールドしか返さない）でも Flex は従来どおり
+//     動き、Deck の予約が来たときだけ新しい経路に入る。**片側だけ更新しても壊れない。**
+//   ★Deck 行の sleepMin / avg / median は GAS が 0 を入れてくる（Deck では使わない）。
+//     したがって Deck 行にこれらの値域検証をかけてはいけない。
+//
 // ★キャッシュは毎回作り直す。GAS側が正なので、消えた予約はここで自動的に落ちる。
 static void applyDownlinkCache(const String& body) {
   for (int i = 0; i < MAX_PENDING_CHILDREN; i++) s_pending[i].active = false;
@@ -1573,10 +1675,10 @@ static void applyDownlinkCache(const String& body) {
     line.trim();
     if (line.length() == 0) continue;
 
-    // ':'の位置を6個探す（7フィールド）
-    int pos[6];
+    // ':'の位置を最大7個探す（Flex=7フィールド / Deck=8フィールド）
+    int pos[7];
     int found = 0, scan = 0;
-    while (found < 6) {
+    while (found < 7) {
       int c = line.indexOf(':', scan);
       if (c < 0) break;
       pos[found++] = c;
@@ -1599,7 +1701,31 @@ static void applyDownlinkCache(const String& body) {
     long          medianRaw   = line.substring(pos[2] + 1, pos[3]).toInt();
     long          attemptsRaw = line.substring(pos[3] + 1, pos[4]).toInt();
     long          seqRaw      = line.substring(pos[4] + 1, pos[5]).toInt();
-    bool          statusOnly  = line.substring(pos[5] + 1).toInt() != 0;
+    // ★7番目(mode)の終端は、8番目(trig)が有るかどうかで変わる。
+    //   ここを従来どおり「行末まで」にすると Deck 行では "0:AABB.." を toInt() することになり、
+    //   0 に化けて**エラーにならずに誤った値が入る**。必ず区切ってから解釈する。
+    String        modeField   = (found >= 7) ? line.substring(pos[5] + 1, pos[6])
+                                             : line.substring(pos[5] + 1);
+    String        trigField   = (found >= 7) ? line.substring(pos[6] + 1) : String("");
+    modeField.trim();
+    trigField.trim();
+    bool          statusOnly  = modeField.toInt() != 0;
+    const bool    isDeck      = (trigField.length() > 0);
+
+    uint8_t trigBytes[DECK_TRIG_BYTES] = {0};
+    if (isDeck && !hexToBytes(trigField, trigBytes, DECK_TRIG_BYTES)) {
+      Serial.print(F("[CACHE] トリガ設定が16進"));
+      Serial.print(DECK_TRIG_HEX_LEN);
+      Serial.print(F("文字ではないため無視: ")); Serial.println(line);
+      continue;
+    }
+    // Deck にはステータス確認だけを送る手段が無い（フレームに flags はあるが、GAS 側の
+    // メニューを用意していない）。取り違えを黙って通さないよう、ここで弾く。
+    if (isDeck && statusOnly) {
+      Serial.print(F("[CACHE] Deck予約に mode=1(ステータス確認)は未対応のため無視: "));
+      Serial.println(line);
+      continue;
+    }
 
     // ★群の検証。GAS側でも群別に配信するが、誤配信時の多重防御として必ず検証する。
     if (childIdRaw > 0xFF || (childIdRaw & 0x1F) == 0 ||
@@ -1616,7 +1742,10 @@ static void applyDownlinkCache(const String& body) {
       Serial.print(F("[CACHE] 値が範囲外のため無視: ")); Serial.println(line);
       continue;
     }
-    if (!statusOnly && (sleepMinRaw < 1 || sleepMinRaw > 1440 ||
+    // ★Deck 行の sleep/avg/median は使わない欄なので GAS は 0 を入れてくる。
+    //   ここで従来の値域（1以上）をかけると、Deck の予約が全部「範囲外」で捨てられる。
+    if (!statusOnly && !isDeck &&
+                       (sleepMinRaw < 1 || sleepMinRaw > 1440 ||
                         avgRaw < 1 || avgRaw > 255 ||
                         medianRaw < 1 || medianRaw > 255)) {
       Serial.print(F("[CACHE] 値が範囲外のため無視: ")); Serial.println(line);
@@ -1634,13 +1763,20 @@ static void applyDownlinkCache(const String& body) {
     s_pending[slot].seq        = (uint32_t)seqRaw;
     s_pending[slot].statusOnly = statusOnly;
     s_pending[slot].lastSendMs = 0;  // キャッシュ更新時は抑制をリセット（新しい予約として扱う）
+    s_pending[slot].isDeck     = isDeck;
+    memcpy(s_pending[slot].trig, trigBytes, DECK_TRIG_BYTES);
     slot++;
 
     Serial.print(F("[CACHE] 予約: 子機0x")); Serial.print(childId, HEX);
-    if (statusOnly) Serial.print(F(" ステータス確認のみ"));
-    Serial.print(F(" 間隔=")); Serial.print(sleepMinRaw);
-    Serial.print(F("分 平均=")); Serial.print(avgRaw);
-    Serial.print(F(" メジアン=")); Serial.print(medianRaw);
+    if (isDeck) {
+      Serial.print(F(" [Deck] トリガ設定="));
+      Serial.print(trigField);
+    } else {
+      if (statusOnly) Serial.print(F(" ステータス確認のみ"));
+      Serial.print(F(" 間隔=")); Serial.print(sleepMinRaw);
+      Serial.print(F("分 平均=")); Serial.print(avgRaw);
+      Serial.print(F(" メジアン=")); Serial.print(medianRaw);
+    }
     Serial.print(F(" 試行済=")); Serial.print(attemptsRaw);
     Serial.print(F(" seq=")); Serial.println(seqRaw);
   }
@@ -1658,7 +1794,20 @@ static void processReportQueue() {
     snprintf(childHex, sizeof(childHex), "%02X", s_reports[i].childId);
 
     String q;
-    if (s_reports[i].finalResult) {
+    if (s_reports[i].finalResult && s_reports[i].isDeck) {
+      // ★Deck は sleep/avg/median を持たない。代わりに「子機が実際に適用した
+      //   トリガ設定13バイト」を16進で返す。GAS 側は &trig= の有無で形式を判別する。
+      char trigHex[DECK_TRIG_HEX_LEN + 1];
+      for (int k = 0; k < DECK_TRIG_BYTES; k++) {
+        snprintf(&trigHex[k * 2], 3, "%02X", s_reports[i].trig[k]);
+      }
+      q  = "action=downlink_result&child="; q += childHex;
+      q += "&group=";    q += String(GATEWAY_GROUP_ID);
+      q += "&status=";   q += String(s_reports[i].status);
+      q += "&attempts="; q += String(s_reports[i].attempts);
+      q += "&seq=";      q += String(s_reports[i].seq);
+      q += "&trig=";     q += trigHex;
+    } else if (s_reports[i].finalResult) {
       q  = "action=downlink_result&child="; q += childHex;
       q += "&group=";    q += String(GATEWAY_GROUP_ID);
       q += "&status=";   q += String(s_reports[i].status);
@@ -2419,10 +2568,24 @@ static const uint16_t DOWNLINK_COMPANY_ID   = 0xC0DE;  // 要: 子機ファー�
 static const uint8_t  DOWNLINK_PKT_TYPE     = 0x81;
 static const uint8_t  DOWNLINK_ACK_PKT_TYPE = 0x05;
 
+// ★FW99: Deck 用（詳細は【設定8】のコメント）
+static const uint8_t  DECK_DOWNLINK_PKT_TYPE = 0x82;
+static const uint8_t  DECK_DL_ACK_PKT_TYPE   = 0x83;
+static const uint8_t  DECK_DOWNLINK_LEN      = 24;   // CompanyID2+Type1+ID1+Flags1+時刻6+トリガ13
+static const uint8_t  DECK_DL_ACK_LEN        = 17;   // Type1+ID1+status1+fwVer1+トリガ13
+
+// Flex の確認応答（0x05）として受理するフレーム長。
+// ★以前は len >= 7 しか見ていなかった。7バイト以上なら何でもACKとして解釈するため、
+//   混信や将来の型追加で誤動作しうる（改修範囲メモ §5.2）。厳密一致に変える。
+//   7 = 旧フレーム（WDT欄なし）／9 = 現行の Flex v3.20。
+static const uint8_t  DOWNLINK_ACK_LEN_OLD   = 7;
+static const uint8_t  DOWNLINK_ACK_LEN_CUR   = 9;
+
 enum DownlinkFlag {
   DL_FLAG_TIME       = 1u << 0,
   DL_FLAG_SLEEP_MIN  = 1u << 1,
   DL_FLAG_AVG_MEDIAN = 1u << 2,
+  DECK_FLAG_TRIG     = 1u << 3,   // ★Deck 専用。[11..23]のトリガ設定を適用させる
 };
 
 // ★アップリンクを検知してから応答するまでの待ち時間。
@@ -2488,7 +2651,57 @@ static void sendDownlinkCommand(uint8_t targetDeviceId, uint16_t sleepMinutes,
   NRF_UARTE1->TASKS_STARTRX = 1;
 }
 
+// Deck 子機へトリガ設定を送る（0x82 / 24バイト）。フレーム構成は【設定8】のコメント参照。
+// ★sendDownlinkCommand() と処理の骨格は同じだが、あえて分けてある。
+//   1つの関数に flags 分岐を足していくと、Flex 現場で動いている 15B の組み立てに
+//   手を入れることになる。**稼働中の経路は触らない**方針を優先した。
+static void sendDeckDownlinkCommand(uint8_t targetDeviceId, const uint8_t trig[DECK_TRIG_BYTES]) {
+  loraModeNormal();  // Configモードへ入らず、Normalモードのまま送信する（実機確認済みの方式）
+
+  // ★Deck では時刻フラグを必ず立てる。子機に RTC バックアップ電池が無く（§11.4 BT1廃止）、
+  //   停電復帰後に自力で時刻を取り戻せないため、親機が配り続けるのが唯一の手段（F-23）。
+  const uint8_t flags = (uint8_t)(DL_FLAG_TIME | DECK_FLAG_TRIG);
+
+  DateTime now = rtc.now();
+
+  uint8_t payload[DECK_DOWNLINK_LEN];
+  payload[0]  = (uint8_t)(DOWNLINK_COMPANY_ID >> 8);
+  payload[1]  = (uint8_t)(DOWNLINK_COMPANY_ID & 0xFF);
+  payload[2]  = DECK_DOWNLINK_PKT_TYPE;
+  payload[3]  = targetDeviceId;
+  payload[4]  = flags;
+  payload[5]  = (uint8_t)(now.year() % 100);
+  payload[6]  = now.month();
+  payload[7]  = now.day();
+  payload[8]  = now.hour();
+  payload[9]  = now.minute();
+  payload[10] = now.second();
+  memcpy(&payload[11], trig, DECK_TRIG_BYTES);
+
+  Serial.print(F("[DOWNLINK] Deck送信: 宛先=0x")); Serial.print(targetDeviceId, HEX);
+  Serial.print(F(" トリガ設定="));
+  for (uint8_t k = 0; k < DECK_TRIG_BYTES; k++) {
+    if (trig[k] < 0x10) Serial.print('0');
+    Serial.print(trig[k], HEX);
+  }
+  Serial.print(F(" 時刻=")); Serial.print(now.year()); Serial.print('/');
+  Serial.print(now.month()); Serial.print('/'); Serial.print(now.day()); Serial.print(' ');
+  Serial.print(now.hour()); Serial.print(':'); Serial.print(now.minute()); Serial.print(':');
+  Serial.println(now.second());
+
+  loraSendFrame(payload, sizeof(payload));
+  delay(300);  // 送信完了待ち（AUX未接続のため固定ディレイ）
+
+  // ★sendDownlinkCommand() と同じ理由でDMA受信を明示的に再武装する。
+  //   これが無いと、送信直後に返ってくる確認応答(0x83)を取りこぼして再試行が終わらない。
+  NRF_UARTE1->TASKS_STARTRX = 1;
+}
+
 // 子機のアップリンクを検知したときの処理。予約があればダウンリンクを送る。
+//
+// ★Deck は1回の起床（毎正時）で静的(0x06)とイベント統計(0x07)の2フレームを送る。
+//   この関数は**フレームごとに**呼ばれるが、DOWNLINK_DEDUP_MS（10秒）の抑制が働くため
+//   ダウンリンクは1回しか出ない。これは意図した動作である（改修範囲メモ §8 の確認項目）。
 static void onUplinkReceived(uint8_t childId) {
   PendingDownlink* p = findPending(childId);
   if (p == nullptr) return;
@@ -2517,7 +2730,8 @@ static void onUplinkReceived(uint8_t childId) {
     Serial.print(F("[DOWNLINK] 子機0x")); Serial.print(childId, HEX);
     Serial.print(F(" へ")); Serial.print(p->attempts);
     Serial.println(F("回送信しましたが確認が返りません。未達として打ち切ります"));
-    queueReport(true, childId, DL_STATUS_NO_ACK, 0, 0, 0, p->attempts, p->seq);
+    if (p->isDeck) queueDeckReport(true, childId, DL_STATUS_NO_ACK, nullptr, p->attempts, p->seq);
+    else           queueReport(true, childId, DL_STATUS_NO_ACK, 0, 0, 0, p->attempts, p->seq);
     p->active = false;
     return;
   }
@@ -2538,17 +2752,24 @@ static void onUplinkReceived(uint8_t childId) {
     uint32_t t0 = millis();
     while (millis() - t0 < DOWNLINK_RESPONSE_DELAY_MS) { wdtFeed(); yield(); }
   }
-  sendDownlinkCommand(childId, p->sleepMin, p->avg, p->median, p->statusOnly);
+  if (p->isDeck) sendDeckDownlinkCommand(childId, p->trig);
+  else           sendDownlinkCommand(childId, p->sleepMin, p->avg, p->median, p->statusOnly);
   p->lastSendMs = millis();
   recordSent(childId, p->attempts, p->seq);  // 確認応答をこの予約に紐付けるための控え
-  queueReport(false, childId, 0, p->sleepMin, p->avg, p->median, p->attempts, p->seq);
+  if (p->isDeck) queueDeckReport(false, childId, 0, p->trig, p->attempts, p->seq);
+  else           queueReport(false, childId, 0, p->sleepMin, p->avg, p->median, p->attempts, p->seq);
 }
 
 // 子機からの確認応答を受けた時の処理。予約を完了扱いにし、結果をGASへ報告する。
 //   ack: [0]0x05 [1]DeviceID [2]status [3-4]適用sleepMin(BE) [5]適用avg [6]適用median
 //        [7-8]適用後に有効になるWDTタイムアウト(分,BE)
 static void onDownlinkAckReceived(const uint8_t* ack, uint8_t len) {
-  if (len < 7) return;
+  // ★以前は len >= 7 だった。7バイト以上のフレームが 0x05 で来ると何でもACKとして
+  //   解釈してしまう（改修範囲メモ §5.2）。実害が出る前に厳密一致へ変える。
+  if (len != DOWNLINK_ACK_LEN_OLD && len != DOWNLINK_ACK_LEN_CUR) {
+    Serial.print(F("[DOWNLINK] ACKの長さが不正なため破棄: ")); Serial.println(len);
+    return;
+  }
   uint8_t  childId       = ack[1];
   uint8_t  status        = ack[2];
   uint16_t applied       = ((uint16_t)ack[3] << 8) | ack[4];
@@ -2586,6 +2807,47 @@ static void onDownlinkAckReceived(const uint8_t* ack, uint8_t len) {
   if (p != nullptr && p->seq == seq) p->active = false;
 }
 
+// Deck 子機からの確認応答（0x83 / 17バイト）。
+//   ack: [0]0x83 [1]DeviceID [2]status [3]子機FWバージョン [4..16]適用後のトリガ設定13B
+//
+// ★構造は onDownlinkAckReceived() と同じ（送信控えから seq を取る／今のキャッシュから
+//   取ってはいけない理由も同じ）。詳しい理由はそちらのコメントを参照。
+static void onDeckDownlinkAckReceived(const uint8_t* ack, uint8_t len) {
+  if (len != DECK_DL_ACK_LEN) {
+    Serial.print(F("[DOWNLINK] Deck ACKの長さが不正なため破棄: ")); Serial.println(len);
+    return;
+  }
+  const uint8_t childId  = ack[1];
+  const uint8_t status   = ack[2];
+  const uint8_t childFw  = ack[3];
+  const uint8_t* applied = &ack[4];
+
+  SentDownlink* sent = findLastSent(childId);
+  if (sent == nullptr) {
+    Serial.print(F("[DOWNLINK] 送信控えが無い子機0x")); Serial.print(childId, HEX);
+    Serial.println(F(" からのDeck応答のため無視します"));
+    return;
+  }
+  const uint8_t  attempts = sent->attempts;
+  const uint32_t seq      = sent->seq;
+
+  Serial.print(F("[DOWNLINK] ★Deck子機0x")); Serial.print(childId, HEX);
+  Serial.print(F(" から確認応答: status=")); Serial.print(status);
+  Serial.print(F(" 子機FW=")); Serial.print(childFw);
+  Serial.print(F(" 適用後のトリガ設定="));
+  for (uint8_t k = 0; k < DECK_TRIG_BYTES; k++) {
+    if (applied[k] < 0x10) Serial.print('0');
+    Serial.print(applied[k], HEX);
+  }
+  Serial.println();
+
+  queueDeckReport(true, childId, status, applied, attempts, seq);
+  sent->valid = false;  // この控えは消費した
+
+  PendingDownlink* dp = findPending(childId);
+  if (dp != nullptr && dp->seq == seq) dp->active = false;
+}
+
 // loop() から毎回呼ぶ。受信バッファを読み切り、完成したフレームがあればレコードへ反映する。
 static void loraPoll() {
   while (loraSerial.available()) {
@@ -2608,6 +2870,11 @@ static void loraPoll() {
       //   レコード更新には回さず、ここで処理を終える。
       if (pktType == DOWNLINK_ACK_PKT_TYPE) {
         onDownlinkAckReceived(s_loraBody, s_loraLen);
+        continue;
+      }
+      // ★FW99: Deck 子機の確認応答。上と同じくセンサデータではない。
+      if (pktType == DECK_DL_ACK_PKT_TYPE) {
+        onDeckDownlinkAckReceived(s_loraBody, s_loraLen);
         continue;
       }
 
@@ -3968,6 +4235,23 @@ static void printConfigSummary() {
     }
     Serial.println(t.name);
   }
+
+#ifdef COMM_MODE_LORA
+  Serial.println(F("[設定8] ダウンリンク:"));
+  Serial.print(F("          Flex 0x")); Serial.print(DOWNLINK_PKT_TYPE, HEX);
+  Serial.print(F(" / 15B  ACK 0x")); Serial.print(DOWNLINK_ACK_PKT_TYPE, HEX);
+  Serial.print(F(" / ")); Serial.print(DOWNLINK_ACK_LEN_OLD);
+  Serial.print(F("または")); Serial.print(DOWNLINK_ACK_LEN_CUR); Serial.println(F("B"));
+  Serial.print(F("          Deck 0x")); Serial.print(DECK_DOWNLINK_PKT_TYPE, HEX);
+  Serial.print(F(" / ")); Serial.print(DECK_DOWNLINK_LEN);
+  Serial.print(F("B（時刻6B＋トリガ設定")); Serial.print(DECK_TRIG_BYTES);
+  Serial.print(F("B）  ACK 0x")); Serial.print(DECK_DL_ACK_PKT_TYPE, HEX);
+  Serial.print(F(" / ")); Serial.print(DECK_DL_ACK_LEN); Serial.println(F("B"));
+  Serial.print(F("          最大試行 ")); Serial.print(DOWNLINK_MAX_ATTEMPTS);
+  Serial.print(F("回 / 重複抑制 ")); Serial.print(DOWNLINK_DEDUP_MS / 1000);
+  Serial.print(F("秒 / 応答待ち ")); Serial.print(DOWNLINK_RESPONSE_DELAY_MS);
+  Serial.println(F("ms"));
+#endif
 
 #ifndef COMM_MODE_LORA
   Serial.print(F("[設定6] BLE子機一覧: "));
