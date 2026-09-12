@@ -4,16 +4,16 @@
  * ①長期静的変位と②準静的イベント波形を、**同一の連続ストリームから振り分けて**取得する。
  * 車両通過は①にとってはノイズ、②にとっては信号であり、両者は排他ではない。
  *
- *   常時：ADS131M06 976.56 SPS × 6CH → SampleRing（6秒・3バイトpacked・105 kB）
+ *   常時：ADS131M06 1295.34 SPS × 6CH → SampleRing（6秒・3バイトpacked・140 kB）
  *     ├─→ BlockAverager  1秒ごとの平均 → MedianWindow 60個 → 1分値（静的変位）
  *     └─→ EventDetector  閾値判定 → 発火でリングから前1.5秒＋後3.5秒を切り出す
  *
  * 【設計上の要点】
  *
  * ★リングは 3 バイト packed でなければ入らない。
- *   `int32_t[6000][6]` は 144 kB。nRF52840 の 237 kB に対し、SDバッファ・
+ *   `int32_t[7770][6]` は 186 kB。nRF52840 の 237 kB に対し、SDバッファ・
  *   スタック・LoRaと合わせて破綻する（要件 §7.3.3・Codexレビュー指摘）。
- *   3バイト packed なら 108 kB に収まる。
+ *   3バイト packed なら 140 kB に収まる。
  *
  * ★イベント切出し用の複製バッファは持たない。
  *   リング6秒に対し切出しは5秒。発火後はリングから直接SDへ流し、
@@ -39,12 +39,21 @@ namespace deck {
 
 static constexpr uint8_t  NUM_CH = 6;
 
-// fDATA = fCLKIN / (2 × OSR) = 8.000 MHz / 8192 = 976.5625 SPS（要件 §4.1）
-static constexpr double   F_DATA_SPS      = 976.5625;
-static constexpr uint16_t SAMPLES_PER_SEC = 977;      // 1秒ブロックの丸め（1.0004秒）
+// ★実データレート。**グローバルチョップ有効なので fCLKIN/(2×OSR) ではない。**
+//   fDATA = 1 / (tGC_DLY + 3 × OSR × tMOD)          （SBAS949A 式8）
+//         = 4.000 MHz / (16 + 3 × 1024) = 1295.3368 SPS
+//   （fMOD = fCLKIN/2 = 4.000 MHz、GC_DLY = 0011b = 16 tMOD、OSR = 1024）
+//
+//   ★ここと ADS131M06::Config の OSR は必ず同時に直すこと。ドライバ側の
+//     ADS131M06::dataRateSps() が設定から同じ値を計算するので、起動時に
+//     この定数と一致するかを照合してログへ出している（main.cpp）。
+static constexpr double   F_DATA_SPS      = 1295.3368;
+static constexpr uint16_t SAMPLES_PER_SEC = 1295;     // 1秒ブロックの丸め（0.99974秒）
 
-// リング長。6秒 + 端数の余裕。6000 × 6CH × 3B = 108,000 B
-static constexpr uint16_t RING_SAMPLES = 6000;
+// リング長。ちょうど6秒ぶん。7770 × 6CH × 3B = 139,860 B
+// ★プリ+ポストの上限はここで決まる：(pre+post) ≦ (7770 − 1295) / 1295 = 5.0 秒
+//   （SD書込みが追い越さないよう 1 秒ぶんを必ず残す）
+static constexpr uint16_t RING_SAMPLES = 7770;
 static constexpr uint32_t RING_BYTES   = (uint32_t)RING_SAMPLES * NUM_CH * 3;
 
 // ─────────────────────────────────────────────────────────────

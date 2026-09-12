@@ -1079,6 +1079,12 @@ const DECK_EVENT_HEX_LEN  = 50;   // 4B + 21B
 
 const DECK_TRIG_BYTES = 13;
 
+// ★子機の計測定数。case04_Deck/v1.00/lib/DeckMeasure/DeckMeasure.h と必ず一致させること。
+//   グローバルチョップ有効・OSR 1024 で fDATA = 1295.34 SPS（SBAS949A 式8）。
+//   **fCLKIN/(2×OSR) ではない。**GC 有効時は約1/3になる。
+const DECK_SAMPLES_PER_SEC = 1295;   // DeckMeasure::SAMPLES_PER_SEC
+const DECK_RING_SAMPLES    = 7770;   // DeckMeasure::RING_SAMPLES（ちょうど6秒ぶん）
+
 // 変位の分解能。子機は int16・0.1 µm/LSB で送る（要件 §7.3.8）
 const DECK_DISP_MM_PER_LSB = 0.0001;
 
@@ -1278,7 +1284,7 @@ const DECK_TRIGGER_COLUMNS = [
   { key: 'durationMs',label: '継続時間(ms)',    note: '何ms超え続けたら発火するか。0〜255。スパイク除去用' },
   { key: 'deadTimeMs',label: '不感時間(ms)',    note: '発火後この時間は再発火しない。0〜2550。10ms単位に丸める' },
   { key: 'preSec',    label: 'プリトリガ(秒)',  note: '発火の何秒前から記録するか。0.5〜3.0。0.1秒単位' },
-  { key: 'postSec',   label: 'ポストトリガ(秒)',note: '発火の何秒後まで記録するか。1.0以上。0.1秒単位。★プリ+ポストは5.1秒以下（リングバッファ6秒の制約）' },
+  { key: 'postSec',   label: 'ポストトリガ(秒)',note: '発火の何秒後まで記録するか。1.0以上。0.1秒単位。★プリ+ポストは5.0秒以下（リングバッファ6秒の制約）' },
   { key: 'maxPerHour',label: '最大収録件数(件/時)', note: '1時間に波形を保存する上限。超えたら件数だけ数える。0〜65535' },
   { key: 'staticMin', label: '静的計測の周期(分)', note: '1分値を出す周期。1〜255。LoRa送信は60分周期で固定' },
   { key: 'sentAt',    label: '最終送信',        note: '（自動）予約を入れた日時' },
@@ -1362,11 +1368,13 @@ function deckRowToTrigBytes_(row) {
   if (staticMin < 1 || staticMin > 255)     errs.push('静的計測の周期は 1〜255 分');
 
   // ★リングバッファに収まるか。子機の TriggerConfig::fitsInRing() と同じ計算にしてある。
-  //   6000サンプル − SD書込みの余裕977サンプル ＝ 5023 サンプルまで。
-  var need = Math.floor((preTenth + postTenth) * 977 / 10);
-  if (need + 977 > 6000) {
+  //   RING_SAMPLES − SD書込みの余裕1秒ぶん が使える上限。
+  var need = Math.floor((preTenth + postTenth) * DECK_SAMPLES_PER_SEC / 10);
+  if (need + DECK_SAMPLES_PER_SEC > DECK_RING_SAMPLES) {
+    var maxSec = Math.floor((DECK_RING_SAMPLES - DECK_SAMPLES_PER_SEC) /
+                            DECK_SAMPLES_PER_SEC * 10) / 10;
     errs.push('プリ+ポストが長すぎます（' + ((preTenth + postTenth) / 10) +
-              '秒）。リングバッファ6秒に収まりません。合計5.1秒以下にしてください');
+              '秒）。リングバッファ6秒に収まりません。合計' + maxSec + '秒以下にしてください');
   }
 
   if (errs.length) return { errors: errs };

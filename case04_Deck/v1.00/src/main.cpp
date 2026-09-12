@@ -15,7 +15,7 @@
  *     2. CLKIN の 8.000 MHz が出ているか（オシロで確認）
  *     3. ADS131M06 が POR を完了し、ID = 0x26xx を返すか（F-26）
  *     4. 全レジスタのリードバックが一致するか（F-6）
- *     5. DRDY 割込みで 976.56 SPS のフレームが CRC エラーなく取れるか（F-2/F-4/F-5）
+ *     5. DRDY 割込みで 1295.34 SPS のフレームが CRC エラーなく取れるか（F-2/F-4/F-5）
  *
  * 【入っているもの】
  *   S1 ADCドライバ / S2 起動確認 / S3 リングバッファ / S4 1秒平均→1分メジアン /
@@ -116,13 +116,15 @@ static bool tcaBegin() {
 // PWM ペリフェラルのクロックは 16 MHz。PRESCALER=DIV_1・COUNTERTOP=2 で
 // 周期 2 tick ＝ 8.000 MHz、比較値 1 でデューティ 50% になる。
 //
-// ★8.192 MHz は 16 MHz 系から作れないため 8.000 MHz とし、
-//   fDATA = 8.000e6 / (2 × 4096) = **976.5625 SPS** となる。
-//   ノイズは OSR で決まるので 1 kSPS 相当と同一である。
+// ★8.192 MHz は 16 MHz 系から作れないため 8.000 MHz とする。
+//
+// ★データレートをここで計算しないこと。**グローバルチョップ有効なので
+//   `fCLKIN/(2×OSR)` は使えない**（それは GC 無効時の式で、約3倍ずれる）。
+//   正しい値は ADS131M06::dataRateSps(adcCfg) が設定から導く。
+//   以前ここに `F_DATA_SPS = F_CLKIN_HZ / (2 * 4096)` という独自の定数があり、
+//   DeckMeasure 側と二重定義になっていた。定数は1か所に集約する。
 // ─────────────────────────────────────────────────────────────
 static constexpr double F_CLKIN_HZ = 8000000.0;
-static constexpr uint16_t ADC_OSR_VALUE = 4096;
-static constexpr double F_DATA_SPS = F_CLKIN_HZ / (2.0 * ADC_OSR_VALUE);   // 976.5625
 
 static uint16_t s_pwmSeq[1] = { 1 };   // 比較値1（COUNTERTOP=2 の 50%）
 
@@ -292,8 +294,24 @@ static void printHeader() {
   Serial.println(F("========================================"));
   Serial.println(F(" Monita Deck v1.00  ブリングアップ"));
   Serial.println(F(" 基板 ver1.00 / ADS131M06 6CH"));
-  Serial.printf ("  CLKIN %.3f MHz  OSR %u  fDATA %.4f SPS\n",
-                 F_CLKIN_HZ / 1e6, ADC_OSR_VALUE, F_DATA_SPS);
+  const double fData = ADS131M06::dataRateSps(adcCfg, F_CLKIN_HZ);
+  Serial.printf ("  CLKIN %.3f MHz  OSR設定 %u  グローバルチョップ %s\n",
+                 F_CLKIN_HZ / 1e6, adcCfg.osr, adcCfg.globalChop ? "有効" : "無効");
+  Serial.printf ("  fDATA %.4f SPS（ドライバ設定から算出）\n", fData);
+
+  // ★ドライバの設定と DeckMeasure の定数がずれていないか、起動時に必ず突き合わせる。
+  //   ずれると 1秒ブロック・プリ/ポスト長・リング長が全部静かに狂う。
+  //   片方だけ直して気づかない事故を防ぐための保険である。
+  if (fabs(fData - deck::F_DATA_SPS) > 0.5) {
+    Serial.println(F("  ★★★ 警告: DeckMeasure::F_DATA_SPS と一致しません ★★★"));
+    Serial.printf ("     DeckMeasure 側 = %.4f SPS / ドライバ設定 = %.4f SPS\n",
+                   deck::F_DATA_SPS, fData);
+    Serial.println(F("     DeckMeasure.h の F_DATA_SPS・SAMPLES_PER_SEC・RING_SAMPLES と"));
+    Serial.println(F("     ADS131M06::Config の osr / globalChop / gcDelay を合わせること。"));
+  }
+  Serial.printf ("  リング %u サンプル = %.2f 秒 / %lu バイト\n",
+                 deck::RING_SAMPLES, deck::RING_SAMPLES / deck::F_DATA_SPS,
+                 (unsigned long)deck::RING_BYTES);
   Serial.printf ("  PGA gain 32  外部基準 REFIN=VEX/2=1.25V  1LSB=%.4f nV\n",
                  ADS131M06::lsbVolts(ADS131M06::GAIN_32) * 1e9);
   Serial.println(F("========================================"));

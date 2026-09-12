@@ -7,7 +7,10 @@
  *
  * 【本機での構成】要件定義 §3〜§4
  *   - CLKIN = MCU の PWM で 8.000 MHz を供給（水晶なし）。fMOD = 4.000 MHz
- *   - OSR 4096 → fDATA = fCLKIN / (2 × OSR) = **976.56 SPS**（1 kSPS ではない）
+ *   - **グローバルチョップ有効。OSR 1024 → fDATA = 1295.34 SPS**
+ *     ★`fCLKIN/(2×OSR)` はグローバルチョップ**無効時**の式である。有効時は
+ *       `tGC = tGC_DLY + 3 × OSR × tMOD`（SBAS949A 式8）で、およそ 1/3 になる。
+ *       この取り違えで一度 976.56 SPS 前提の定数を組んだ（実際は 325 SPS だった）。
  *   - PGA ゲイン 32（ノイズはゲイン32以上で頭打ち。選択はFSR余裕だけの問題）
  *   - **外部リファレンス REFIN = VEX/2 = 1.25 V**（レシオメトリック測定）
  *     → CLOCK レジスタの **EXTREF_EN を必ず 1 にする**。これを忘れると内蔵1.2Vが使われ、
@@ -79,7 +82,7 @@ public:
   // ── CLOCK.OSR[2:0]（fDATA = fCLKIN / (2 × OSR)）──
   enum Osr : uint8_t {
     OSR_128 = 0, OSR_256, OSR_512, OSR_1024 /*既定*/, OSR_2048,
-    OSR_4096 /*本機採用: 8.000MHz で 976.56 SPS*/, OSR_8192, OSR_16256,
+    OSR_4096, OSR_8192, OSR_16256,
   };
   // ── CLOCK.PWR[1:0] ──
   enum Pwr : uint8_t { PWR_VLP = 0, PWR_LP = 1, PWR_HR = 2 /*既定・本機採用*/ };
@@ -106,7 +109,11 @@ public:
   static constexpr uint16_t ST_DRDY_MASK = 0x003F;  // DRDY0〜DRDY5
 
   struct Config {
-    uint8_t osr        = OSR_4096;
+    // ★本機採用 OSR_1024。グローバルチョップ有効で 1295.34 SPS（要件の 1 kSPS を満たす）。
+    //   OSR_4096 にすると GC 有効時は 325 SPS まで落ち、1 kSPS 要件を満たさない。
+    //   ノイズは gain32 で OSR4096:0.77 / OSR2048:1.00 / OSR1024:1.20 µVrms（表7-1）、
+    //   GC 有効ならいずれも √2 改善する。OSR1024+GC = 0.85 µVrms。
+    uint8_t osr        = OSR_1024;
     uint8_t pwr        = PWR_HR;
     uint8_t gain[NUM_CH] = { GAIN_32, GAIN_32, GAIN_32, GAIN_32, GAIN_32, GAIN_32 };
     uint8_t mux[NUM_CH]  = { MUX_AIN, MUX_AIN, MUX_AIN, MUX_AIN, MUX_AIN, MUX_AIN };
@@ -212,6 +219,24 @@ public:
   static constexpr double FSR_COEFF = 0.96;   // FSR = ±FSR_COEFF × VREF / Gain
   static double lsbVolts(uint8_t gainCode, double vref = 1.25) {
     return (2.0 * FSR_COEFF * vref / (double)(1u << gainCode)) / 16777216.0;
+  }
+
+  /**
+   * 設定から実データレート [SPS] を計算する。**この値を手で書き写さないこと。**
+   *
+   *   グローバルチョップ無効: fDATA = fMOD / OSR          （fMOD = fCLKIN / 2）
+   *   グローバルチョップ有効: fDATA = 1 / (tGC_DLY + 3 × OSR × tMOD)   （SBAS949A 式8）
+   *
+   * ★GC 有効時に `fMOD/OSR` を使うと約3倍ずれる。リング長・1秒ブロック・プリ/ポスト長が
+   *   全部この値に乗っているので、ずれると全部が静かに狂う。
+   */
+  static double dataRateSps(const Config& cfg, double fClkInHz = 8000000.0) {
+    static const uint16_t OSR_TABLE[8] = {128, 256, 512, 1024, 2048, 4096, 8192, 16256};
+    const double fMod = fClkInHz / 2.0;
+    const double osr  = OSR_TABLE[cfg.osr & 0x07];
+    if (!cfg.globalChop) return fMod / osr;
+    const double gcDlyMod = (double)(2u << (cfg.gcDelay & 0x0F));  // 0000b=2, 0011b=16 …
+    return fMod / (gcDlyMod + 3.0 * osr);
   }
 
   /** CCITT CRC-16（多項式 0x1021 / シード 0xFFFF）。データシート 表8-7 */
