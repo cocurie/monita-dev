@@ -379,7 +379,7 @@ static float hx711ToPhysical(float rawMedian, uint8_t ch) {
 // ============================================================================
 static constexpr uint8_t  ADS_ADDR     = 0x48;
 static constexpr uint8_t  ADS_REG_CONV = 0x00;
-static constexpr uint8_t  ADS_REG_CFG  = 0x01;
+static constexpr uint8_t  ADS_REG_CFG  = 0x01;    // ADS1115 Configレジスタの固定アドレス（ハードウェア仕様値）
 static constexpr uint16_t ADS_CFG_CH7  = 0x8583;  // A0-A1 / PGA±2.048V / single / 128SPS
 static constexpr uint16_t ADS_CFG_CH8  = 0xB583;  // A2-A3
 
@@ -481,41 +481,25 @@ static void mcp9600CheckFaults(uint8_t addr, bool& ocFault, bool& scFault,
 RTC_DATA_ATTR static bool g_rtc_set = false;
 
 // 専用RTCチップが無いため、コントローラーからSETTIMEを受けるまでの間は
-// 「ファームをビルドした日時」を暫定の初期値として使う（固定値2026/01/01よりは実態に近い）。
-static bool parseBuildDateTime(struct tm& out) {
-    static const char* MONTHS = "JanFebMarAprMayJunJulAugSepOctNovDec";
-    char monStr[4] = {};
-    int day, year, hh, mm, ss;
-    // __DATE__ 例: "Aug 10 2026", __TIME__ 例: "05:51:00"
-    if (sscanf(__DATE__, "%3s %d %d", monStr, &day, &year) != 3) return false;
-    if (sscanf(__TIME__, "%d:%d:%d", &hh, &mm, &ss) != 3) return false;
-
-    const char* p = strstr(MONTHS, monStr);
-    if (p == nullptr) return false;
-    int mon = (int)((p - MONTHS) / 3);  // 0-11
-
-    out = {};
-    out.tm_year = year - 1900;
-    out.tm_mon  = mon;
-    out.tm_mday = day;
-    out.tm_hour = hh;
-    out.tm_min  = mm;
-    out.tm_sec  = ss;
-    return true;
-}
-
+// 「ファームをビルド・書き込みした日時」を暫定の初期値として使う（固定値2026/01/01よりは実態に近い）。
+// ★2026-09-12: 以前は__DATE__/__TIME__（main.cppのソースを実際に再コンパイルした瞬間の値。
+// ソースに変更が無いとpio runしても更新されず、一見「時刻埋め込みが壊れている」ように見えて
+// 混乱した経緯がある）を使っていたが、platformio.iniのbuild_flagsでpio run/upload実行の
+// たびに必ず新しく評価されるFIELD_BUILD_EPOCH（ビルドマシンのローカル時刻からのnaive epoch秒。
+// rtcSetTime()と同じ「TZ変換なし」の流儀）に置き換えた。
 static void rtcApplyDefault() {
+#if defined(FIELD_BUILD_EPOCH)
+    time_t t = (time_t)FIELD_BUILD_EPOCH;
+#else
     struct tm tm0 = {};
-    if (!parseBuildDateTime(tm0)) {
-        // 万一パースに失敗したらフォールバック
-        tm0.tm_year = RTC_DEFAULT_YEAR - 1900;
-        tm0.tm_mon  = RTC_DEFAULT_MONTH - 1;
-        tm0.tm_mday = RTC_DEFAULT_DAY;
-        tm0.tm_hour = RTC_DEFAULT_HOUR;
-        tm0.tm_min  = RTC_DEFAULT_MIN;
-        tm0.tm_sec  = RTC_DEFAULT_SEC;
-    }
+    tm0.tm_year = RTC_DEFAULT_YEAR - 1900;
+    tm0.tm_mon  = RTC_DEFAULT_MONTH - 1;
+    tm0.tm_mday = RTC_DEFAULT_DAY;
+    tm0.tm_hour = RTC_DEFAULT_HOUR;
+    tm0.tm_min  = RTC_DEFAULT_MIN;
+    tm0.tm_sec  = RTC_DEFAULT_SEC;
     time_t t = mktime(&tm0);
+#endif
     struct timeval tv = { t, 0 };
     settimeofday(&tv, nullptr);
 }
@@ -539,6 +523,19 @@ static void rtcNowString(char* out, size_t outLen) {
     time_t now; time(&now);
     struct tm tmNow;
     localtime_r(&now, &tmNow);
+    strftime(out, outLen, "%Y-%m-%d %H:%M:%S", &tmNow);
+}
+
+// ★2026-09-12: LoRa/BLEへ送る「実測epoch」と、シリアルモニタ表示・SDログの時刻が、
+// それぞれ別のタイミングでtime()を読み直していたため、LoRa送信直後の待ち時間
+// （LORA_TX_REPEATの完了待ち＋DOWNLINK_RX_WINDOW_MSの約3.2秒）の分だけ、
+// スプレッドシート（LoRaのepochが由来）とシリアルモニタ（表示直前に読み直した時刻）が
+// 常時ズレて見える事象があった。Measurement::epochを計測直後に1回だけ確定させ、
+// 送信（LoRa/BLE）・シリアルモニタ表示・SDログの全てで同じ値を使うことで解消する。
+static void epochToString(uint32_t epoch, char* out, size_t outLen) {
+    time_t t = (time_t)epoch;
+    struct tm tmNow;
+    localtime_r(&t, &tmNow);
     strftime(out, outLen, "%Y-%m-%d %H:%M:%S", &tmNow);
 }
 
@@ -582,6 +579,7 @@ struct Measurement {
     bool     ch6_shortCircuit;  // デバウンス確定した短絡
     float    ch7_V, ch8_V;
     bool     ch7_ok, ch8_ok;
+    uint32_t epoch;  // この計測が完了した瞬間のepoch。LoRa/BLE送信・シリアル表示・SDログで共通して使う
 };
 
 static Measurement measureAll() {
@@ -622,15 +620,26 @@ static Measurement measureAll() {
     m.ch8_V = adsReadVoltage(ADS_CFG_CH8, GAIN_CH8, OFFSET_CH8);
     m.ch8_ok = !isnan(m.ch8_V);
 
+    // ★2026-09-12: 計測完了直後にepochを1回だけ確定させる（詳細はepochToString()のコメント参照）。
+    {
+        time_t t; time(&t);
+        m.epoch = (uint32_t)t;
+    }
+
     return m;
 }
 
 // 現在のMUX位置のままチャンネルchを再計測し、その生値をゼロ点として記録する（TAREコマンド用）
+// ★2026-09-12: 以前はhx711ReadAveraged()（N回平均のみ、外れ値フィルタなし）でゼロ点を
+// 決めていたが、通常計測（measureAll()）はhx711ReadMedianOfAverages()（N回平均をM回繰り返し
+// 中央値を採用、外れ値に強い）を使っており、両者の耐ノイズ性が不一致だった。センサー未接続の
+// フローティング入力等でTARE時に瞬間的なノイズを拾うと、そのままゼロ点として固定され、通常
+// 計測（ノイズ除去済み）との差分が常時出続ける事象が実機で確認された。同じ読み取り方式に揃える。
 static float tareChannel(uint8_t ch) {
     eplusOn();
     muxSelect(CH_TO_MUX[ch]);
     delay(MUX_SETTLE_MS);
-    float raw = hx711ReadAveraged();
+    float raw = hx711ReadMedianOfAverages();
     eplusOff();
     if (isnan(raw)) return NAN;
     g_ch_offset[ch] = raw;
@@ -647,7 +656,7 @@ static void logToSD(const Measurement& m) {
     File f = SD.open(LOG_PATH, FILE_APPEND);
     if (f) {
         char ts[24];
-        rtcNowString(ts, sizeof(ts));
+        epochToString(m.epoch, ts, sizeof(ts));  // ★2026-09-12: m.epoch使用（詳細はepochToString()参照）
 
         f.print(ts);
         for (uint8_t ch = 0; ch < 5; ch++) {
@@ -902,7 +911,9 @@ static void controllerBleInit() {
 //   [14-15] CH6 熱電対       : int16 LE（0.1℃単位、NaN時は0x7FFF）
 //   [16-17] CH7 電圧         : int16 LE（mV単位）
 //   [18-19] CH8 電圧         : int16 LE（mV単位）
-// 合計20バイト（主パケット31バイト上限にほぼ収まりきる。デバイス名等の他要素は
+//   [20-23] 計測時刻(Epoch)  : uint32 LE（本機RTCのUNIXエポック秒。コントローラーが
+//            未接続時でも計測時刻の絶対値を表示できるようにするため、2026-09-12追加）
+// 合計24バイト（主パケット31バイト上限に収まる。デバイス名等の他要素は
 // スキャンレスポンス側に分離済み、controllerBleInit()参照）。
 // ============================================================================
 static void bleWriteI16(uint8_t* buf, int idx, int32_t val) {
@@ -911,8 +922,15 @@ static void bleWriteI16(uint8_t* buf, int idx, int32_t val) {
     buf[idx + 1] = (uint8_t)((v >> 8) & 0xFF);
 }
 
+static void bleWriteU32(uint8_t* buf, int idx, uint32_t val) {
+    buf[idx]     = (uint8_t)(val & 0xFF);
+    buf[idx + 1] = (uint8_t)((val >> 8) & 0xFF);
+    buf[idx + 2] = (uint8_t)((val >> 16) & 0xFF);
+    buf[idx + 3] = (uint8_t)((val >> 24) & 0xFF);
+}
+
 static void bleAdvertiseMeasurement(const Measurement& m) {
-    uint8_t buf[20];
+    uint8_t buf[24];
     buf[0] = BLE_COMPANY_ID_LO;
     buf[1] = BLE_COMPANY_ID_HI;
     buf[2] = BLE_PKT_TYPE;
@@ -925,6 +943,9 @@ static void bleAdvertiseMeasurement(const Measurement& m) {
     bleWriteI16(buf, 14, m.ch6_ok ? (int32_t)lroundf(m.ch6_tempC * 10.0f) : 0x7FFF);
     bleWriteI16(buf, 16, m.ch7_ok ? (int32_t)lroundf(m.ch7_V * 1000.0f) : 0x7FFF);
     bleWriteI16(buf, 18, m.ch8_ok ? (int32_t)lroundf(m.ch8_V * 1000.0f) : 0x7FFF);
+    // ★2026-09-12: LoRa送信と同じくm.epoch（計測完了時に1回だけ確定した値）を使う
+    // （詳細はsendMeasurementToLoRa()内の同種コメント参照）。
+    bleWriteU32(buf, 20, m.epoch);
 
     NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
     pAdv->stop();
@@ -1024,7 +1045,7 @@ static void sendLiveUpdateIfConnected(const Measurement& m) {
     if (!g_bleControllerConnected || g_pTxCharacteristic == nullptr) return;
 
     char ts[24];
-    rtcNowString(ts, sizeof(ts));
+    epochToString(m.epoch, ts, sizeof(ts));  // ★2026-09-12: m.epoch使用（詳細はepochToString()参照）
 
     char line[160];
     int n = snprintf(line, sizeof(line),
@@ -1288,13 +1309,90 @@ static void loraWriteI16(uint8_t* buf, int idx, int32_t val) {
     buf[idx + 1] = (uint8_t)((v >> 8) & 0xFF);
 }
 
+// ============================================================================
+// LoRaダウンリンク受信（Gatewayからの時刻自動同期、2026-09-12追加）
+// ============================================================================
+// gateway_v1.2 側の sendTimeSyncDownlink() と対になる受信処理。
+// 「子機の電源が入る→Gatewayとつながる→Gatewayから時刻を受け取る→計測開始」という
+// フローにするため、アップリンク送信直後の短い時間だけE220からの受信を待ち、
+// 自分宛の時刻同期ダウンリンクが来ていれば解析してRTCへ反映する。
+// コントローラーからのSETTIME（手動入力）と両立する。両方使える状態にしておき、
+// 現場ではGatewayが届く限り自動で時刻が合う（コントローラーでの手動設定は不要になる）。
+//
+// フレーム形式はGateway側と同一のtransparentプロトコル
+// （[0xAA][LEN][payload...][checksum][RSSI]、RSSIはREG3のbit7で双方とも有効化済み）:
+//   payload(15バイト): [0-1]CompanyID(0xC0DE,BE) [2]PktType(0x81) [3]宛先DeviceID
+//                       [4]flags(bit0=時刻あり) [5-10]年%100/月/日/時/分/秒
+//                       [11-12]sleepMin(BE,本機では未使用) [13]avg [14]median(本機では未使用)
+static const uint16_t DOWNLINK_COMPANY_ID   = 0xC0DE;  // gateway_v1.2側と一致させること
+static const uint8_t  DOWNLINK_PKT_TYPE     = 0x81;
+static const uint8_t  DL_FLAG_TIME          = 1u << 0;
+static const uint32_t DOWNLINK_RX_WINDOW_MS = 2500;    // 送信直後、この時間だけ受信を待つ
+
+// 受信バイトを状態機械で処理し、フレーム(+RSSI)が完成するたびに中身を確認する。
+// windowMsが経過するまでポーリングを続ける（複数フレーム来ても最後まで処理する）。
+static void loraTryReceiveDownlink(uint32_t windowMs) {
+    enum { WAIT_SYNC, WAIT_LEN, WAIT_BODY, WAIT_CKSUM, WAIT_RSSI } state = WAIT_SYNC;
+    static uint8_t body[32];
+    uint8_t bodyLen = 0, bodyIdx = 0, sum = 0;
+    uint32_t t0 = millis();
+
+    while (millis() - t0 < windowMs) {
+        while (Serial1.available()) {
+            uint8_t b = (uint8_t)Serial1.read();
+            switch (state) {
+                case WAIT_SYNC:
+                    if (b == 0xAA) { sum = b; state = WAIT_LEN; }
+                    break;
+                case WAIT_LEN:
+                    bodyLen = b;
+                    sum = (uint8_t)(sum + b);
+                    bodyIdx = 0;
+                    state = (bodyLen == 0 || bodyLen > sizeof(body)) ? WAIT_SYNC : WAIT_BODY;
+                    break;
+                case WAIT_BODY:
+                    body[bodyIdx++] = b;
+                    sum = (uint8_t)(sum + b);
+                    if (bodyIdx >= bodyLen) state = WAIT_CKSUM;
+                    break;
+                case WAIT_CKSUM:
+                    state = (b == sum) ? WAIT_RSSI : WAIT_SYNC;  // 不一致は破棄して再同期
+                    break;
+                case WAIT_RSSI:
+                    state = WAIT_SYNC;  // RSSIバイト自体は読み捨てる（本用途では不要）
+
+                    if (bodyLen == 15 &&
+                        body[0] == (uint8_t)(DOWNLINK_COMPANY_ID >> 8) &&
+                        body[1] == (uint8_t)(DOWNLINK_COMPANY_ID & 0xFF) &&
+                        body[2] == DOWNLINK_PKT_TYPE &&
+                        body[3] == g_device_id) {
+                        uint8_t flags = body[4];
+                        if (flags & DL_FLAG_TIME) {
+                            uint16_t year = 2000 + body[5];
+                            uint8_t  mon  = body[6];
+                            uint8_t  day  = body[7];
+                            uint8_t  hh   = body[8];
+                            uint8_t  mm   = body[9];
+                            uint8_t  ss   = body[10];
+                            rtcSetTime(year, mon, day, hh, mm, ss);
+                            Serial.printf("[LORA] Gatewayから時刻同期を受信: %04u-%02u-%02u %02u:%02u:%02u\n",
+                                          (unsigned)year, mon, day, hh, mm, ss);
+                        }
+                    }
+                    break;
+            }
+        }
+        delay(2);
+    }
+}
+
 static void sendMeasurementToLoRa(const Measurement& m) {
     if (!loraCheckAndConfigure()) {
         Serial.println("[LORA] config check失敗、今回の送信をスキップ");
         return;
     }
 
-    uint8_t msd[29] = {0};
+    uint8_t msd[33] = {0};
     msd[0] = LORA_PKT_TYPE;
     msd[1] = g_device_id;
 
@@ -1305,6 +1403,14 @@ static void sendMeasurementToLoRa(const Measurement& m) {
     loraWriteI16(msd, 22, m.ch6_ok ? (int32_t)lroundf(m.ch6_tempC * 10.0f) : (int32_t)0x7FFF);
     loraWriteI16(msd, 24, m.ch7_ok ? (int32_t)lroundf(m.ch7_V * 1000.0f) : (int32_t)0x7FFF);
     loraWriteI16(msd, 26, m.ch8_ok ? (int32_t)lroundf(m.ch8_V * 1000.0f) : (int32_t)0x7FFF);
+    // ★2026-09-12: Gateway受信時刻ではなく、フィールドユニット自身が計測した時刻を
+    // そのまま「計測時刻」として使えるよう、実測epochを追加（Gateway・シリアルモニタ・
+    // コントローラー表示の時刻源を統一し、数秒単位のズレを無くすため）。
+    // ★同日追記: ここでtime()を読み直すと、この後のLORA_TX_REPEAT完了待ち＋
+    // DOWNLINK_RX_WINDOW_MS（合計約3.2秒）の分だけシリアルモニタ表示より値が早くなり、
+    // スプレッドシートとシリアルモニタが常時ズレる原因になっていた。m.epoch
+    // （計測完了時に1回だけ確定した値）を使うことで、送信内容とシリアル表示を一致させる。
+    bleWriteU32(msd, 29, m.epoch);
 
     for (uint8_t rep = 0; rep < LORA_TX_REPEAT; rep++) {
         loraSendFrame(msd, sizeof(msd));
@@ -1321,6 +1427,9 @@ static void sendMeasurementToLoRa(const Measurement& m) {
         Serial.print(' ');
     }
     Serial.println();
+
+    // Gatewayからの時刻同期ダウンリンクを短時間待ち受ける（上記loraTryReceiveDownlink参照）。
+    loraTryReceiveDownlink(DOWNLINK_RX_WINDOW_MS);
 }
 #endif
 
@@ -1494,6 +1603,18 @@ void setup() {
     g_sdMutex = xSemaphoreCreateMutex();
 
     settingsLoad();
+
+#if defined(FORCE_DEVID)
+    // ★工場出荷時の初期設定用。platformio.iniのbuild_flagsに-D FORCE_DEVID=<番号>を
+    // 指定してビルド・書き込みした場合のみ、NVSの既存値を無視してこの番号で強制上書きする
+    // （1台ごとにFORCE_DEVIDを変えて書き込む運用。設定後は通常ビルドに戻すこと）。
+    if (g_device_id != (uint8_t)FORCE_DEVID) {
+        g_device_id = (uint8_t)FORCE_DEVID;
+        settingsSaveDevId();
+        Serial.printf("[NVS] FORCE_DEVID=%u によりデバイスIDを強制上書き\n", (unsigned)FORCE_DEVID);
+    }
+#endif
+
     Serial.printf("[NVS] interval=%lumin N=%u M=%u devid=0x%02X\n",
                   (unsigned long)g_measure_interval_min, g_avg_n, g_avg_m, g_device_id);
 
@@ -1560,7 +1681,7 @@ void loop() {
 #endif
 
     char ts[24];
-    rtcNowString(ts, sizeof(ts));
+    epochToString(m.epoch, ts, sizeof(ts));  // ★2026-09-12: m.epoch使用（詳細はepochToString()参照）
     Serial.printf("[%s] CH1=%.2f CH2=%.2f CH3=%.2f CH4=%.2f CH5=%.2f  CH6=%.2fC  CH7=%.3fV CH8=%.3fV\n",
                   ts, m.hx_phys[0], m.hx_phys[1], m.hx_phys[2], m.hx_phys[3], m.hx_phys[4],
                   m.ch6_tempC, m.ch7_V, m.ch8_V);

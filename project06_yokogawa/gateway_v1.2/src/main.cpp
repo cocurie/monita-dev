@@ -278,7 +278,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
 // ★project06_yokogawa/gateway_v1.2として分岐した時点のcase02 gateway_v1.20のカウンタ値(96)を
 // そのまま引き継ぎ、以後はこのファイル独自にコミットごとに+1する。
-static uint8_t  const GATEWAY_FW_VERSION = 96;
+static uint8_t  const GATEWAY_FW_VERSION = 101;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する（★BLE受信専用）
 // ★2026-08-28: LoRaは isAllowedLoRaPacket() を使う。BLEの群分離は第3段階まで後回しと
@@ -326,8 +326,11 @@ static int const LORA_M0M1_PIN = 2;  // D2: E220 M0・M1 共通駆動（基板�
 // ★2026-09-10: 横河ver1.3のLoRaペイロードは、スプレッドシート側の小数精度確保のため
 // CH1〜5をint16→int32(µε×100)へ拡張し29バイトになった
 // （PktType+DeviceID+CH1-5(int32×5)+CH6-8(int16×3)+予備1B。project06_yokogawa/ver1.3/
-// src/main.cppのsendMeasurementToLoRa()参照）。将来の拡張余地を見て32バイトを確保する。
-#define MAX_PAYLOAD 32
+// src/main.cppのsendMeasurementToLoRa()参照）。
+// ★2026-09-12: 末尾の予備1Bをフィールド実測epoch(uint32 LE, 4B)に置き換え、33バイトに
+// 拡張した。MAX_PAYLOADはs_loraBody（受信バッファ）とFlexRecord.payload（保持バッファ）
+// の両方の上限を兼ねるため、33バイトを確実に受け切れるようここで拡張しておくこと。
+#define MAX_PAYLOAD 33
 
 struct FlexRecord {
   uint8_t  mac[6];
@@ -1006,15 +1009,13 @@ static String httpGetViaFs(const String& url, bool wantBody) {
 
   if (wantBody) s_gasFetchTry++;
 
-  if (statusCode != 200 || (wantBody && dataLen <= 0)) {
+  if (statusCode != 200) {
     Serial.print(F("[DEBUG] HTTPTOFS raw=[")); Serial.print(res); Serial.println(F("]"));
     s_fsFailStreak++;
     recoverHttpStack();
     return "";
   }
-  s_fsFailStreak = 0;
-  if (wantBody) s_gasFetchOk++;
-  if (!wantBody) return "ok";
+  if (!wantBody) { s_fsFailStreak = 0; return "ok"; }
 
   // ★AT+HTTPTOFSは非同期。+HTTPTOFS URCが返った時点ではファイル書き込みが
   //   完了していないことがあるため、Idleになるまで待ってから読む。
@@ -1029,12 +1030,34 @@ static String httpGetViaFs(const String& url, bool wantBody) {
   int gi = gfis.indexOf("+CFSGFIS: ");
   if (gi >= 0) fileSize = gfis.substring(gi + 10).toInt();
 
-  if (fileSize != dataLen) {
+  // ★2026-09-12: gateway_v1.20由来のフォールバックが未移植だったのを移植（実機ログで
+  // 「HTTPTOFS status=200,len=0」が頻発し、PDPコンテキスト再構築・モデム再起動の無駄な
+  // 復旧ループを誘発していた事象がここから来ていた）。GASの最終応答はTransfer-Encoding:
+  // chunkedでContent-Lengthが無く、+HTTPTOFSはlen=0を報告する。これは「長さを報告
+  // できなかった」の意味であって「ダウンロードできなかった」とは限らない。報告値
+  // （dataLen）ではなく、AT+CFSGFISで確認した実ファイルサイズを信じて読み出す。
+  if (dataLen <= 0) {
+    Serial.print(F("[DIAG] HTTPTOFSはlen=0を報告。実ファイルサイズ=")); Serial.println(fileSize);
+    if (fileSize > 0) {
+      Serial.println(F("[DIAG] → 実体は存在する。報告値ではなくファイルサイズで読み出す"));
+      dataLen = fileSize;
+    } else {
+      sendAT("AT+CFSTERM", 3000);
+      Serial.println(F("[DIAG] → 実体も0バイト。chunked応答は本当に取得できていない"));
+      Serial.print(F("[DEBUG] HTTPTOFS raw=[")); Serial.print(res); Serial.println(F("]"));
+      s_fsFailStreak++;
+      recoverHttpStack();
+      return "";
+    }
+  } else if (fileSize != dataLen) {
     sendAT("AT+CFSTERM", 3000);
     Serial.print(F("[GAS] ファイルサイズ不一致（期待=")); Serial.print(dataLen);
     Serial.print(F(" 実際=")); Serial.print(fileSize); Serial.println(F("）→ 破棄"));
     return "";
   }
+
+  s_fsFailStreak = 0;
+  s_gasFetchOk++;
 
   String fileRes = sendATFull("AT+CFSRFILE=" + String(HTTPTOFS_DIR_INDEX) + ",\"" + HTTPTOFS_FILENAME +
                               "\",0," + String(dataLen) + ",0", 5000);
@@ -1186,6 +1209,14 @@ static void initGwDeviceId() {
 // 受け取る手段が無くなり、リモートで再開できなくなるため）。
 static bool s_gasSendPaused  = false;
 static bool s_forceSendOnce  = false;  // send_nowで次回1回だけ一時停止中でも強制送信する
+
+// ★2026-09-12追加: 顧客側で計測間隔を自由に設定できる（例: 1時間）ため、Gatewayの
+// 定期送信周期（sendIntervalMs、既定5分）と計測間隔がズレると、スプレッドシートの
+// 「計測時刻」が最大1計測サイクル分遅れて見える問題があった（AC電源前提のGatewayなので
+// バッテリー消費は考慮不要、との判断）。新規LoRaフレーム受信のたびに即座にクラウド送信を
+// トリガーすることで解消する。定期送信（sendIntervalMs）自体はダウンリンク予約確認等の
+// フォールバックとして残す。
+static volatile bool s_loraNewDataFlag = false;
 
 #ifdef COMM_MODE_LORA
 static void saveConfig();  // 後方で定義（送信間隔の永続化。LoRaビルドのみ内蔵フラッシュ保存機構あり）
@@ -1757,7 +1788,26 @@ static void updateRecordFromPayload(const uint8_t mac[6], const uint8_t *payload
       records[idx].payloadLen = payloadLen;
       records[idx].rssi       = rssi;
       records[idx].lastSeen   = millis();
-      records[idx].rtcEpoch   = readRtcEpochSafe(records[idx].rtcEpoch);
+      // ★2026-09-12: 横河ver1.3のLoRaペイロード（33バイト、末尾4Bにフィールドユニット
+      // 自身の実測epoch）が来た場合は、Gateway自身の受信時刻（readRtcEpochSafe()）ではなく
+      // フィールドが実際に計測した時刻をそのまま「計測時刻」として採用する。これにより
+      // シリアルモニタ・コントローラー・スプレッドシートの時刻源が一致し、伝搬遅延や
+      // Gateway/フィールド間の時計差による数秒単位のズレが無くなる。
+      // BLE（ver1.1、epochを持たない）の場合は従来通りGateway自身の受信時刻を使う。
+      if (payloadLen == 33 && payload[0] == EXPECTED_PKT_TYPE) {
+        uint32_t fieldEpoch = (uint32_t)payload[29]
+                            | ((uint32_t)payload[30] << 8)
+                            | ((uint32_t)payload[31] << 16)
+                            | ((uint32_t)payload[32] << 24);
+        // ★2026-09-12: フィールドユニットのtime_tは、Gatewayからのダウンリンク（またはビルド時刻）で
+        // 受け取ったJSTの生数字をTZ変換なしのmktime()にそのまま渡して作った値（＝Gateway自身の
+        // rtc.unixtime()と同種の「JSTの数字をUTCとして扱った値」）であり、真のUTC epochではない。
+        // Gateway自身の受信時刻（readRtcEpochSafe()）は必ずJST_OFFSET_SECを引いて真のUTCへ変換して
+        // いるため、fieldEpochをそのまま採用すると変換が非対称になり9時間ズレる。同じ変換を適用する。
+        records[idx].rtcEpoch = (uint32_t)((int64_t)fieldEpoch - JST_OFFSET_SEC);
+      } else {
+        records[idx].rtcEpoch = readRtcEpochSafe(records[idx].rtcEpoch);
+      }
     }
     xSemaphoreGive(recordMutex);
   }
@@ -2287,10 +2337,96 @@ static void sendDownlinkCommand(uint8_t targetDeviceId, uint16_t sleepMinutes,
   NRF_UARTE1->TASKS_STARTRX = 1;
 }
 
+// ★2026-09-12追加: 子機の時刻自動同期用。
+//
+// 【背景】これまでは電源投入のたびにコントローラーから手動でSETTIMEする運用だったが、
+// ユーザー負担が大きいという指摘を受け、「子機の電源が入る→Gatewayとつながる→
+// Gatewayから時刻を受け取る→計測開始」という自動同期フローに変更する。
+// Gatewayは常時LTE-M網時刻でDS3231を同期しているため、これを配れば子機側は
+// 時計を持つ必要が無くなる。
+//
+// 【設計】既存のPendingDownlink（GASボタンで予約された設定変更＋確認応答つき再送）とは
+// 独立した、時刻専用の軽量なダウンリンクとして実装する。設定変更のような「必達」要件は
+// 無く、取りこぼしても子機の次回起床時にまた送られるため、確認応答・リトライ・GASへの
+// 完了報告は行わない（フィールドユニット側の受信実装が入るまでは、そもそも応答自体が
+// 返ってこない）。
+//
+// 【子機側で必要な対応（別途実装予定）】LoRa送信直後に受信待機し、この
+// ダウンリンク（PktType=DOWNLINK_PKT_TYPE、DL_FLAG_TIME）を解析してRTCへ反映すること。
+struct TimeSyncState { bool valid; uint8_t childId; uint32_t lastSendMs; };
+static TimeSyncState s_timeSync[MAX_PENDING_CHILDREN];
+
+static TimeSyncState* findOrAllocTimeSyncState(uint8_t childId) {
+  TimeSyncState* freeSlot = nullptr;
+  for (int i = 0; i < MAX_PENDING_CHILDREN; i++) {
+    if (s_timeSync[i].valid && s_timeSync[i].childId == childId) return &s_timeSync[i];
+    if (!s_timeSync[i].valid && freeSlot == nullptr) freeSlot = &s_timeSync[i];
+  }
+  if (freeSlot != nullptr) {
+    freeSlot->valid      = true;
+    freeSlot->childId    = childId;
+    freeSlot->lastSendMs = 0;
+  }
+  return freeSlot;
+}
+
+// 設定変更ダウンリンク(sendDownlinkCommand)と同じペイロード様式だが、
+// DL_FLAG_TIMEのみを立てて時刻(年月日時分秒)だけを配る軽量版。
+static void sendTimeSyncDownlink(uint8_t targetDeviceId) {
+  loraModeNormal();  // Configモードへ入らず、Normalモードのまま送信する（実機確認済みの方式）
+
+  DateTime now = rtc.now();
+
+  uint8_t payload[15];
+  payload[0]  = (uint8_t)(DOWNLINK_COMPANY_ID >> 8);
+  payload[1]  = (uint8_t)(DOWNLINK_COMPANY_ID & 0xFF);
+  payload[2]  = DOWNLINK_PKT_TYPE;
+  payload[3]  = targetDeviceId;
+  payload[4]  = DL_FLAG_TIME;
+  payload[5]  = (uint8_t)(now.year() % 100);
+  payload[6]  = now.month();
+  payload[7]  = now.day();
+  payload[8]  = now.hour();
+  payload[9]  = now.minute();
+  payload[10] = now.second();
+  payload[11] = 0;
+  payload[12] = 0;
+  payload[13] = 0;
+  payload[14] = 0;
+
+  Serial.print(F("[DOWNLINK] 時刻同期送信: 宛先=0x")); Serial.println(targetDeviceId, HEX);
+
+  loraSendFrame(payload, sizeof(payload));
+  delay(300);  // 送信完了待ち（AUX未接続のため固定ディレイ）
+
+  // sendDownlinkCommand()と同じ理由でRXを明示的に再武装する（コメント参照）。
+  NRF_UARTE1->TASKS_STARTRX = 1;
+}
+
 // 子機のアップリンクを検知したときの処理。予約があればダウンリンクを送る。
+// 予約が無い子機にも、時刻同期のためだけの軽量ダウンリンクを送る（上記参照）。
 static void onUplinkReceived(uint8_t childId) {
   PendingDownlink* p = findPending(childId);
-  if (p == nullptr) return;
+  if (p == nullptr) {
+    // ★2026-09-12: 以前はここで無言でreturnしており、「時刻同期が送られなかった」ことが
+    // シリアルログから追えなかった（GAS通信が不安定でs_atBusyが長く続くと、毎サイクル
+    // 黙ってスキップされ続け、原因究明に時間がかかった事例あり）。ログを出すようにする。
+    if (s_atBusy) {
+      Serial.print(F("[DOWNLINK] 子機0x")); Serial.print(childId, HEX);
+      Serial.println(F(" の時刻同期をAT通信中のためスキップします（次サイクルで再試行）"));
+      return;
+    }
+    TimeSyncState* ts = findOrAllocTimeSyncState(childId);
+    if (ts == nullptr) return;  // 予約テーブル満杯（起きえないはずだが念のため）
+    if (ts->lastSendMs != 0 && (millis() - ts->lastSendMs) < DOWNLINK_DEDUP_MS) return;  // 子機の冗長送信の重複防止
+    {
+      uint32_t t0 = millis();
+      while (millis() - t0 < DOWNLINK_RESPONSE_DELAY_MS) { wdtFeed(); yield(); }
+    }
+    sendTimeSyncDownlink(childId);
+    ts->lastSendMs = millis();
+    return;
+  }
 
   // ★AT通信中はダウンリンクを送らない。
   //   sendAT()の待機ループからloraPoll()が呼ばれるため、ここでLoRa送信（UARTへの書き込みと
@@ -2410,14 +2546,16 @@ static void loraPoll() {
         continue;
       }
 
-      // 横河ver1.3のセンサデータは29バイト固定（PktType+DeviceID+CH1-5(int32×5)+
-      // CH6-8(int16×3)+予備1B。2026-09-10、CH1-5の小数精度確保のためint16→int32へ
-      // 拡張し19→29バイトに変更。project06_yokogawa/ver1.3/src/main.cpp 参照）。
+      // 横河ver1.3のセンサデータは33バイト固定（PktType+DeviceID+CH1-5(int32×5)+
+      // CH6-8(int16×3)+実測epoch(uint32 LE)。2026-09-10、CH1-5の小数精度確保のため
+      // int16→int32へ拡張し19→29バイトに変更。2026-09-12、Gateway受信時刻とフィールド
+      // 自身の計測時刻の数秒ズレを解消するため、末尾の予備1Bを実測epoch(4B)に置き換え
+      // 29→33バイトに変更。project06_yokogawa/ver1.3/src/main.cpp 参照）。
       // 短いフレームを許すと未受信のCHが残留値のままクラウドへ出るため、厳密一致で検証する。
-      if (s_loraLen != 29) {
+      if (s_loraLen != 33) {
         Serial.print(F("[LORA] 不正なセンサフレーム長を破棄: "));
         Serial.print(s_loraLen);
-        Serial.println(F(" バイト（期待値29）"));
+        Serial.println(F(" バイト（期待値33）"));
         s_loraRejected++;
         s_loraRejLen++;
         continue;
@@ -2444,6 +2582,10 @@ static void loraPoll() {
       // LoRaにはBLEのようなMACアドレスが無いため、DeviceIDで一意化した疑似MACを使う
       uint8_t pseudoMac[6] = {0, 0, 0, 0, 0, deviceId};
       updateRecordFromPayload(pseudoMac, s_loraBody, s_loraLen, rssiDbm);
+
+      // ★2026-09-12: 新規センサデータを受信したので、定期送信を待たずに
+      //   loop()側で即座にflushRecords()させる（詳細はs_loraNewDataFlag宣言部のコメント参照）。
+      s_loraNewDataFlag = true;
 
       // ★v1.20: 子機が起きた＝受信窓が開く直前。予約があればここでダウンリンクを送る。
       //   センサデータの取り込みを先に済ませてから呼ぶこと（この中で数百ms待つため）。
@@ -3067,7 +3209,10 @@ static uint16_t const SHREQ_MAX_URL_BYTES = 512;
 //   をそのまま流用できる）。
 // ★2026-09-10: LoRa(ver1.3)は、スプレッドシート側の小数精度確保のためCH1-5が
 // int16→int32(µε×100)へ拡張されたことに合わせてワイヤフォーマットも変更した。
-//   Epoch(4B)+DeviceID(1B)+CH1-5(int32×5=20B)+CH6-8(int16×3=6B) = 31バイト/台 = 62 hex文字
+// ★2026-09-12: 横河ブリッジHD側にLoRaリンクの電波強度も見せたいという要望を受け、
+// Gateway受信時のRSSI(dBm, int8)を末尾に追加した（フィールドユニットのpayloadには
+// 含まれない、Gateway側の受信メタデータ）。
+//   Epoch(4B)+DeviceID(1B)+CH1-5(int32×5=20B)+CH6-8(int16×3=6B)+RSSI(1B) = 32バイト/台 = 64 hex文字
 //   （project06_yokogawa/gateway_v1.2/gas/Code.gsもこの形式に合わせて更新済み）。
 int buildBatchQuery(const FlexRecord* merged, int start, int n,
                      int csq, String& outParams) {
@@ -3090,12 +3235,17 @@ int buildBatchQuery(const FlexRecord* merged, int start, int n,
     // 横河ver1.3(LoRa)は29バイト固定（受信側のs_loraLen!=29チェックで既に保証済み）。
     if (rec.payloadLen < 29) continue;
 
-    char chunk[63];
+    // ★2026-09-12: 横河側への「電波強度も見えるようにしたい」という要望を受け、
+    // LoRa受信時のRSSI(dBm、Gatewayが把握している値。int8にクランプして1バイトで送る)を
+    // 末尾に追加。既存29バイトのフィールドユニットpayloadには含まれない、Gateway側の
+    // 受信メタデータなので、payload配列ではなくrec.rssiから直接埋める。
+    char chunk[67];
     snprintf(chunk, sizeof(chunk),
              "%02X%02X%02X%02X%02X"
              "%02X%02X%02X%02X" "%02X%02X%02X%02X" "%02X%02X%02X%02X"
              "%02X%02X%02X%02X" "%02X%02X%02X%02X"
-             "%02X%02X" "%02X%02X" "%02X%02X",
+             "%02X%02X" "%02X%02X" "%02X%02X"
+             "%02X",
              (uint8_t)(rec.rtcEpoch & 0xFF),
              (uint8_t)((rec.rtcEpoch >> 8) & 0xFF),
              (uint8_t)((rec.rtcEpoch >> 16) & 0xFF),
@@ -3108,7 +3258,8 @@ int buildBatchQuery(const FlexRecord* merged, int start, int n,
              rec.payload[18], rec.payload[19], rec.payload[20], rec.payload[21],  // CH5(int32)
              rec.payload[22], rec.payload[23],                                    // CH6(int16)
              rec.payload[24], rec.payload[25],                                    // CH7(int16)
-             rec.payload[26], rec.payload[27]);                                   // CH8(int16)
+             rec.payload[26], rec.payload[27],                                    // CH8(int16)
+             (uint8_t)(int8_t)constrain(rec.rssi, -128, 127));                    // LoRa RSSI(dBm, int8)
 #else
     // 横河ver1.1(BLE)は18バイト固定。PktType+DeviceID+CH1-8に満たない不正レコードを除外。
     if (rec.payloadLen < 18) continue;
@@ -4067,9 +4218,14 @@ void loop() {
   }
 #endif
 
-  if (now - lastSend >= sendIntervalMs) {
+  // ★2026-09-12: 定期送信（sendIntervalMs経過）に加え、新規LoRaデータ受信時も即座に送信する。
+  //   顧客側で計測間隔（例:1時間）を自由に設定できるため、定期送信任せだと最大1計測サイクル分
+  //   スプレッドシートの「計測時刻」が遅れて見える問題があった（Gateway側main.cpp参照）。
+  bool sendDueByTimer = (now - lastSend >= sendIntervalMs);
+  bool sendDueByNewData = s_loraNewDataFlag;
+  if (sendDueByTimer || sendDueByNewData) {
     lastSend = now;
-    Serial.println(F("\n=== 定期送信 ==="));
+    Serial.println(sendDueByNewData ? F("\n=== 新規LoRa受信による即時送信 ===") : F("\n=== 定期送信 ==="));
     Serial.print(F("時刻: ")); Serial.println(getTimestamp());
 
 #if TEST_PERIODIC_FAKE_DATA
@@ -4133,6 +4289,15 @@ void loop() {
 #ifdef COMM_MODE_BLE
     Bluefruit.Scanner.start(0);
 #endif
+    // ★2026-09-12: このサイクルの開始"前"ではなく完了"後"にクリアする。
+    //   GAS通信が不調で本処理（checkRemoteCmd〜flushRecords）に数十秒〜数分かかる間に
+    //   新しいLoRaフレームが届くと（loraPoll()はAT通信の待機ループ内からも呼ばれるため）、
+    //   そのデータは既に今回のflushRecords()へ取り込まれて送信済みになるが、フラグだけが
+    //   立ったまま残ってしまい、直後に「新規LoRa受信による即時送信」が無駄にもう1サイクル
+    //   走ってしまう事象があった（実機ログで確認。GAS通信不調な状況をさらに悪化させる）。
+    //   サイクル完了後にクリアすることで、このサイクル中に取り込み済みの受信を再トリガーの
+    //   材料にしない。サイクル完了後に届いた本当に新しい受信だけが次のトリガーになる。
+    s_loraNewDataFlag = false;
   }
 
   // 手動 AT コマンドモード（シリアルから入力）

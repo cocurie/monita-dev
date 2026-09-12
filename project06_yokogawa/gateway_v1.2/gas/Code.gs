@@ -61,19 +61,27 @@
 //   未計測チャンネルはCH1-5が0x7FFFFFFF、CH6-8が0x7FFFで埋められる。
 //
 // ================================
-// スプレッドシート列構成（databox シート）
+// スプレッドシート列構成（デバイス別シート・databox シート共通）
 // ================================
-//   A: 受信日時
-//   B: DeviceID
-//   C: CH1（ひずみ/変位、µε相当。LoRaビルドは小数第2位まで、BLEビルドは整数）
-//   D: CH2
-//   E: CH3
-//   F: CH4
-//   G: CH5
-//   H: CH6（熱電対、℃。小数第1位）
-//   I: CH7（電圧、V。小数第3位）
-//   J: CH8（電圧、V。小数第3位）
-//   K: LTE-M RSSI(CSQ)
+//   ★2026-09-11: 計測データはDEVICE_SHEET_MAP（下記）に従い、DeviceIDごとに別シートへ
+//   書き込まれるようになった（例: DeviceID=30→「コクリエ保管用」、1→「顧客1」、2→「顧客2」）。
+//   マップに無いDeviceIDのデータ、およびGWステータス・info行等は従来通りdataboxシートへ入る。
+//   列構成はどのシートも共通（★2026-09-12: 列順を計測時刻優先に変更。過去の記録データは
+//   フェーズ1の実証用のため列がズレていても問題ない）:
+//   A: 受信日時（GASがこのリクエストを処理した時刻＝クラウド受信日時。Gatewayの送信間隔ぶん遅れる）
+//   B: 計測日時（GatewayがそのLoRaフレームを受信した瞬間のRTC時刻〈payloadのEpoch、UTC〉。
+//      フィールドユニットは計測直後にLoRa送信するため、受信日時よりも実際の計測タイミングに近い）
+//   C: DeviceID
+//   D: CH1（ひずみ/変位、µε相当。LoRaビルドは小数第2位まで、BLEビルドは整数）
+//   E: CH2
+//   F: CH3
+//   G: CH4
+//   H: CH5
+//   I: CH6（熱電対、℃。小数第1位）
+//   J: CH7（電圧、V。小数第3位）
+//   K: CH8（電圧、V。小数第3位）
+//   L: LTE-M RSSI(CSQ、GatewayとLTE-Mネットワーク間の電波強度)
+//   M: LoRa RSSI(dBm、フィールドユニットとGateway間の電波強度。★2026-09-12追加、LoRaビルドのみ)
 // ================================
 
 
@@ -195,13 +203,44 @@ function triggerGatewayLogDump() {
 // 基本設定
 // ================================
 
-// データを書き込むシート名
+// データを書き込むシート名（デバイス別振り分け対象外のもの用のフォールバック先）
 const DATABOX_SHEET_NAME = 'databox';
+
+// ★2026-09-12: Gateway起動時のinfo行（row_type=info）専用シート。
+// 以前はdataboxシートに、子機の計測データ行と同じ列構成を無理やり流用して混在させていた
+// （B列:計測日時やD-K列:CH1-8を空欄のまま、L列にcsq/fw/xiao_id/imeiを詰め込んだ文字列で
+// 押し込んでいた）。info行はフィールド子機のDeviceIDを持たない「Gateway自身」の状態報告
+// なので、DEVICE_SHEET_MAPによる子機ごとの振り分けとは概念が異なり、専用シートに分離する。
+const GATEWAY_STATUS_SHEET_NAME = 'Gateway状態';
 
 // リモートコマンド（resetなど）用のトークン。GatewayファームでHTTP経由のset_cmdを
 // 使う場合のみ必要（現状スプレッドシートのボタンはPropertiesServiceを直接操作するため
 // 未使用。将来ブラウザから直接set_cmdを叩く運用に備えて残す）。
 const CMD_TOKEN = 'monita-yokogawa-gw-v1.2-cmd-2026';
+
+// ================================
+// ★2026-09-11追加: 計測データのDeviceID別シート振り分け
+// ================================
+// キー: フィールドユニットのDeviceID（10進数）、値: 書き込み先シート名。
+// ここに登録の無いDeviceIDのデータは、従来通り DATABOX_SHEET_NAME（databox）へ書き込む
+// （未知のデバイスを見落とさないためのフォールバック）。
+// 新しいデバイスを追加するときは、この対応表に1行追記するだけでよい。
+const DEVICE_SHEET_MAP = {
+  30: 'コクリエテスト用',   // DeviceID=30 (0x1E)
+  1:  '0001',            // DeviceID=1
+  2:  '0002',            // DeviceID=2
+};
+
+// 新規シート作成時に入れる見出し行（databox・振り分け先シート共通のレイアウト）
+const DATABOX_HEADER = [
+  '受信日時', '計測日時', 'DeviceID', 'CH1', 'CH2', 'CH3', 'CH4', 'CH5', 'CH6', 'CH7', 'CH8', 'CSQ', 'LoRa RSSI',
+];
+
+// Gateway状態シート（row_type=info専用）の見出し行
+const GATEWAY_STATUS_HEADER = [
+  '受信日時', 'Gateway ID', '群番号', 'FWバージョン', 'XIAO ID', 'SIM IMEI', 'SIM ICCID',
+  'SIM名', 'CSQ', 'SDカード', '送信間隔(分)', '受信済み台数',
+];
 
 function getSpreadsheet() {
   return SpreadsheetApp.openById(SPREADSHEET_ID);
@@ -209,7 +248,36 @@ function getSpreadsheet() {
 
 function getDataboxSheet() {
   var ss = getSpreadsheet();
-  return ss.getSheetByName(DATABOX_SHEET_NAME) || ss.insertSheet(DATABOX_SHEET_NAME);
+  var sheet = ss.getSheetByName(DATABOX_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(DATABOX_SHEET_NAME);
+    sheet.appendRow(DATABOX_HEADER);
+  }
+  return sheet;
+}
+
+// Gateway起動時のinfo行専用。無ければ新規作成し見出し行を入れる。
+function getGatewayStatusSheet() {
+  var ss = getSpreadsheet();
+  var sheet = ss.getSheetByName(GATEWAY_STATUS_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(GATEWAY_STATUS_SHEET_NAME);
+    sheet.appendRow(GATEWAY_STATUS_HEADER);
+  }
+  return sheet;
+}
+
+// 計測データ用。DeviceIDに対応するシートを返す（無ければ新規作成し見出し行を入れる）。
+// DEVICE_SHEET_MAPに無いDeviceIDは、既定のdataboxシートへフォールバックする。
+function getSheetForDevice(deviceId) {
+  var name = DEVICE_SHEET_MAP[deviceId] || DATABOX_SHEET_NAME;
+  var ss = getSpreadsheet();
+  var sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+    sheet.appendRow(DATABOX_HEADER);
+  }
+  return sheet;
 }
 
 
@@ -256,11 +324,13 @@ function parseYokogawaRecord(hex42) {
   };
 }
 
-// [LoRaビルド/ver1.3] 62 hex文字 = 31バイト、CH1-5はint32・CH6-8はint16
-function parseYokogawaRecordLora(hex62) {
+// [LoRaビルド/ver1.3] 64 hex文字 = 32バイト、CH1-5はint32・CH6-8はint16、末尾1バイトはRSSI(int8)
+// ★2026-09-12: 横河ブリッジHD側にLoRaの電波強度も見せるため、Gateway受信時のRSSI(dBm)を
+// 末尾に追加（project06_yokogawa/gateway_v1.2/src/main.cppのbuildBatchQuery()参照）。
+function parseYokogawaRecordLora(hex64) {
   var bytes = [];
-  for (var i = 0; i < hex62.length; i += 2) {
-    bytes.push(parseInt(hex62.substr(i, 2), 16));
+  for (var i = 0; i < hex64.length; i += 2) {
+    bytes.push(parseInt(hex64.substr(i, 2), 16));
   }
   var epoch = bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24);
   var ch = [];
@@ -272,10 +342,13 @@ function parseYokogawaRecordLora(hex62) {
     var o2 = 25 + c2 * 2;
     ch.push(int16le_(bytes[o2], bytes[o2 + 1]));
   }
+  var rssiRaw = bytes[31];
+  var rssi = (rssiRaw > 127) ? (rssiRaw - 256) : rssiRaw;  // int8へ変換(dBm)
   return {
     epoch:    epoch >>> 0,
     deviceId: bytes[4],
     ch:       ch,
+    rssi:     rssi,
   };
 }
 
@@ -332,10 +405,11 @@ function doGet(e) {
     var statusSheet = getDataboxSheet();
     statusSheet.appendRow([
       new Date(),                                              // A: 受信日時
-      'GW',                                                    // B: DeviceID欄にGW識別子
-      '', '', '', '', '', '', '', '',                          // C-J: CH1-8
+      '',                                                      // B: 計測日時（GW自身の行なので無し）
+      'GW',                                                    // C: DeviceID欄にGW識別子
+      '', '', '', '', '', '', '', '',                          // D-K: CH1-8
       (p.csq || '') + '  STATUS uptime=' + (p.uptime_min || '?') +
-        'min free_heap=' + (p.free_heap || '?') + 'B',         // K: CSQ + ステータス文言
+        'min free_heap=' + (p.free_heap || '?') + 'B',         // L: CSQ + ステータス文言
     ]);
     return ContentService.createTextOutput('OK');
   }
@@ -353,15 +427,23 @@ function doGet(e) {
     return ContentService.createTextOutput('ok');
   }
 
-  // 起動確認のinfo行
+  // 起動確認のinfo行（子機DeviceIDを持たないGateway自身の状態報告のため、
+  // DEVICE_SHEET_MAPとは別の専用シートへ書く。詳細はGATEWAY_STATUS_SHEET_NAME参照）
   if (p.row_type === 'info') {
-    var infoSheet = getDataboxSheet();
+    var infoSheet = getGatewayStatusSheet();
     infoSheet.appendRow([
-      new Date(),                                              // A: 受信日時
-      'GW',                                                    // B: DeviceID欄にGW識別子
-      '', '', '', '', '', '', '', '',                          // C-J: CH1-8
-      (p.csq || '') + '  fw' + (p.gw_fw || '?') +
-        ' xiao=' + (p.xiao_id || '') + ' imei=' + (p.sim_imei || ''),  // K
+      new Date(),        // 受信日時
+      p.gw_id || '',     // Gateway ID
+      p.group || '',     // 群番号
+      p.gw_fw || '',     // FWバージョン
+      p.xiao_id || '',   // XIAO ID
+      p.sim_imei || '',  // SIM IMEI
+      p.sim_iccid || '', // SIM ICCID
+      p.sim || '',       // SIM名
+      p.csq || '',       // CSQ
+      p.sd || '',        // SDカード
+      p.interval_min || '', // 送信間隔(分)
+      p.devcount || '',  // 受信済み台数
     ]);
     return ContentService.createTextOutput('OK');
   }
@@ -377,31 +459,36 @@ function doGet(e) {
     lock.waitLock(10000);
 
     var dBlob = p.d || '';
-    var sheet = getDataboxSheet();
 
     // ★2026-09-10: 1台あたりのhex文字数はビルドによって固定（BLE=42/LoRa=62）。
     // n件分をdBlob全体から均等割りして実際のチャンク長を判定する（Gatewayが
     // どちらのビルドでも同じ&d=/&n=形式で送ってくるため、GAS側で自動判別する）。
     var recLen = (n > 0) ? Math.floor(dBlob.length / n) : 0;
-    var isLora = (recLen === 62);
+    var isLora = (recLen === 64);
 
     for (var i = 0; i < n; i++) {
       var chunk = dBlob.substr(i * recLen, recLen);
       if (chunk.length < recLen || recLen === 0) continue;
       var d = isLora ? parseYokogawaRecordLora(chunk) : parseYokogawaRecord(chunk);
 
+      // ★2026-09-11: 1回のリクエストに複数デバイス分がまとまることがあるため、
+      // レコードごとにDeviceIDを見てシートを決める（ループの外で1回だけ取得しない）。
+      var sheet = getSheetForDevice(d.deviceId);
+
       sheet.appendRow([
-        new Date(),                                            // A: 受信日時
-        d.deviceId,                                            // B: DeviceID
-        isLora ? sentinelToScaled(d.ch[0], 100, 2) : sentinelToBlank(d.ch[0]),  // C: CH1
-        isLora ? sentinelToScaled(d.ch[1], 100, 2) : sentinelToBlank(d.ch[1]),  // D: CH2
-        isLora ? sentinelToScaled(d.ch[2], 100, 2) : sentinelToBlank(d.ch[2]),  // E: CH3
-        isLora ? sentinelToScaled(d.ch[3], 100, 2) : sentinelToBlank(d.ch[3]),  // F: CH4
-        isLora ? sentinelToScaled(d.ch[4], 100, 2) : sentinelToBlank(d.ch[4]),  // G: CH5
-        sentinelToScaled(d.ch[5], 10, 1),                       // H: CH6（熱電対、℃。小数第1位まで）
-        sentinelToScaled(d.ch[6], 1000, 3),                     // I: CH7（電圧、V。小数第3位まで）
-        sentinelToScaled(d.ch[7], 1000, 3),                     // J: CH8（電圧、V。小数第3位まで）
-        csq,                                                    // K: LTE-M RSSI
+        new Date(),                                            // A: 受信日時（クラウド受信日時）
+        new Date(d.epoch * 1000),                               // B: 計測日時（Gateway受信時のRTC時刻、UTC epoch→Date変換）
+        d.deviceId,                                            // C: DeviceID
+        isLora ? sentinelToScaled(d.ch[0], 100, 2) : sentinelToBlank(d.ch[0]),  // D: CH1
+        isLora ? sentinelToScaled(d.ch[1], 100, 2) : sentinelToBlank(d.ch[1]),  // E: CH2
+        isLora ? sentinelToScaled(d.ch[2], 100, 2) : sentinelToBlank(d.ch[2]),  // F: CH3
+        isLora ? sentinelToScaled(d.ch[3], 100, 2) : sentinelToBlank(d.ch[3]),  // G: CH4
+        isLora ? sentinelToScaled(d.ch[4], 100, 2) : sentinelToBlank(d.ch[4]),  // H: CH5
+        sentinelToScaled(d.ch[5], 10, 1),                       // I: CH6（熱電対、℃。小数第1位まで）
+        sentinelToScaled(d.ch[6], 1000, 3),                     // J: CH7（電圧、V。小数第3位まで）
+        sentinelToScaled(d.ch[7], 1000, 3),                     // K: CH8（電圧、V。小数第3位まで）
+        csq,                                                    // L: LTE-M RSSI(CSQ)
+        isLora ? d.rssi : '',                                   // M: LoRa RSSI(dBm、LoRaビルドのみ)
       ]);
     }
   } catch (err) {
