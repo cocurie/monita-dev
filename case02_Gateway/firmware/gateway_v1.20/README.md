@@ -1,8 +1,81 @@
 ---
-title: Monita Gateway v1.20 ファームウェア
+title: Monita Gateway v1.20 ファームウェア（FW 98 / Deck子機対応）
 domain: iot_device
 tags: [gateway, nRF52840, SIM7080G, BLE, LoRa, E220-900T22S, LTE-M, DS3231, SD, GAS, DIP, downlink]
-updated: 2026-08-16
+updated: 2026-09-12
+---
+
+# FW 98（2026-09-12）— Deck 子機対応と設定の集約
+
+**ディレクトリ名 `v1.20` はハードウェアの系統。ソフトの版は `GATEWAY_FW_VERSION`（… 96 → 97 → **98**）で表す。**
+新機能ごとにディレクトリを増やさないこと。増やすと同じ修正を両方へ入れ続けることになる
+（実例：`project06_yokogawa/gateway_v1.2` は FW 101、こちらは FW 97 まで乖離していた）。
+
+正本: [Deck Gateway改修範囲](../../../【7】Monita/01_開発/Deck基板/20260909_Monita_Deck_Gateway改修範囲.md)
+
+## 設定の場所（製造・現地設置の担当者向け）
+
+**`src/main.cpp` の冒頭に「設定早見表」がある。**ソースを追う前にまずそこを見る。
+各設定には `★【設定N】` の目印が付いているので、エディタで `【設定` を検索すれば飛べる。
+
+| # | 設定 | 場所 |
+|---|---|---|
+| 1 | **受信する子機の型** | `src/main.cpp` の `SENSOR_FRAME_TYPES[]`。**新しい子機は1行足すだけ** |
+| 2 | Gateway 群 | ビルド時 `-D GATEWAY_GROUP_ID=n`（省略時 群0） |
+| 3 | GAS の宛先 | `src/main.cpp` の `GAS_SCRIPT_ID` |
+| 4 | SIM / APN | `src/main.cpp` の `SIM_1NCE` / `SIM_PLAND` |
+| 5 | LoRa / BLE / クラウド形式 | `platformio.ini` の `build_flags` |
+| 6 | BLE 子機の一覧 | `src/main.cpp` の `ALLOWED_DEVICE_IDS[]`（BLE のみ。LoRa は不要） |
+| 7 | 送信間隔 | 基板上の DIP スイッチ（ソース変更不要） |
+
+### ★書き込んだら必ずシリアルを見ること
+
+起動時に**実際に効いている設定が全部出る**（`printConfigSummary()`）。
+
+```
+---- 設定サマリ ----------------------
+[設定5] 通信モード : LoRa (E220-900T22S)
+[設定2] Gateway群  : 0  → 受け付ける子機 DeviceID: 0x1 〜 0x1F
+[設定4] SIM / APN  : 1NCE / iot.1nce.net
+[設定3] GAS宛先    : AKfycbzKVvW6...
+        クラウド形式: 既定（13B/台）
+[設定1] 受信する子機の型:
+          pktType 0x04  19B  &pt=なし(従来形式)  Flex/One センサ
+          pktType 0x06  21B  &pt=06            Deck 静的(6CH変位)
+          pktType 0x07  22B  &pt=07            Deck イベント統計
+--------------------------------------
+```
+
+**群の焼き間違い・GAS宛先の貼り忘れ・子機型の追加漏れ**は、いずれもここで気づける。
+
+### 使えない pktType
+
+`0x05`（ダウンリンクACK）／`0x81`（ダウンリンク）／`0x82`・`0x83`（Deck用・予約）。
+特に **0x05 は長さ検証より前に ACK として処理される**ため、センサ型に使うとデータが消える。
+
+## FW 98 で入れた変更（Deck Gateway改修範囲 G-0〜G-4）
+
+| # | 内容 |
+|---|---|
+| **G-0/G-1** | pktType の単一値判定を `SENSOR_FRAME_TYPES[]` の型テーブルへ置換。0x04(19B) / 0x06(21B) / 0x07(22B) を型ごとに厳密長で検証 |
+| **G-2** | pseudoMac の5バイト目に pktType を入れ、同一 DeviceID の静的(0x06)とイベント統計(0x07)が上書きし合うのを防ぐ。**Flex(0x04) は従来どおり 0 のまま**（0x04 を入れると SD ログの mac 列が現場で見えている値から変わる） |
+| **G-3** | `buildBatchQuery()` を型別バッチ化。Deck は `&pt=06/07` を付けて `Epoch+payload` をそのまま16進で送る。Gateway はレコードの中身を解釈しないので、**子機側の定義を変えても Gateway の改修は要らない** |
+| **G-4** | `count==0` で `start` が進まない無限ループを修正。既存の潜在不具合だが、型が混ざる Deck 対応で現実に踏みうる経路になった |
+
+**Flex しかいない現場では FW 97 と挙動が完全に同一**になるよう作ってある（`&pt=` を付けない・pseudoMac も従来どおり）。
+
+## 未実装
+
+| # | 内容 |
+|---|---|
+| **G-5** | Deck用ダウンリンク（0x82 / 17B）と ACK（0x83）。既存の 0x81/15B は温存する |
+| **A-1** | GAS `Code.gs`：`&pt=06/07` を見て Deck 形式をパースする |
+| **A-2** | GAS：予約データ構造に Deck用トリガ設定13Bを追加 |
+| **A-3** | スプレッドシート：Deck用の列（6CH静的・イベント統計・正規化形状6点） |
+
+トリガ設定13Bのバイト配置は、子機側の `case04_Deck/v1.00/lib/DeckMeasure/DeckMeasure.cpp` の
+`TriggerConfig::fromBytes()` と**必ず一致させること**。片方だけ直すと静かにずれる。
+
 ---
 
 # gateway_v1.20

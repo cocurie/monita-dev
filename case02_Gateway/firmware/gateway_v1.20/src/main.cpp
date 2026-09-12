@@ -1,4 +1,46 @@
 /**
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  Monita Gateway v1.20（FW 98）— 設定早見表
+ *  **ここを読めば、何をしたいときにどこを変えればよいか分かるようにしてある。**
+ *  ソースを追う前に、まずこの表を見ること。
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *  ■ やりたいこと → 変える場所
+ *
+ *  | やりたいこと                     | 変える場所                                    |
+ *  |----------------------------------|-----------------------------------------------|
+ *  | Deck 子機を受けたい              | **何もしない。FW 98 で標準対応済み**        |
+ *  | 新しい子機の型を追加したい       | **【設定1】SENSOR_FRAME_TYPES[] に1行足すだけ**|
+ *  | Gateway の群を分けたい           | **【設定2】ビルド時 -D GATEWAY_GROUP_ID=n**    |
+ *  | クラウド（GAS）の宛先を変えたい  | **【設定3】GAS_SCRIPT_ID**                     |
+ *  | SIM / APN を変えたい             | **【設定4】SIM_1NCE / SIM_PLAND の #define**   |
+ *  | LoRa と BLE を切り替えたい       | **【設定5】platformio.ini の build_flags**     |
+ *  | BLE 子機を増やしたい             | **【設定6】ALLOWED_DEVICE_IDS[]**（BLE のみ）  |
+ *  | 送信間隔を変えたい               | 【設定7】DIPスイッチ（基板上。ソース変更不要） |
+ *
+ *  各設定には `★【設定N】` というコメントを付けてある。エディタで "【設定" を検索すること。
+ *
+ *  ■ 起動すると、実際に効いている設定がシリアルに全部出る。
+ *    書き込んだあとは必ずシリアルを見て、意図した設定になっているか確認すること。
+ *    （群の焼き間違いを現場で何度か起こしているため、目視できるようにした）
+ *
+ *  ■ 触ってはいけないもの
+ *    - pktType 0x05（ダウンリンクACK）、0x81（ダウンリンク）、0x82/0x83（Deck用・予約）
+ *    - ピン割当（基板 ver1.10 の回路図で確定。D0=LoRa RX / D1=LoRa TX / D2=M0M1 / D3=SD CS）
+ *
+ *  ■ FW 97 との違い（FW 98 で追加したもの）
+ *    Deck 子機（6CH計測ユニット）の受信に対応した。実コードで67行の追加。
+ *    **Flex しかいない現場では FW 97 と挙動が完全に同一**になるよう作ってある
+ *    （&pt= を付けない・pseudoMac も従来どおり）。詳細は README.md を参照。
+ *
+ *    ★ディレクトリ名 v1.20 はハードウェアの系統を指す。ソフトの版は
+ *      GATEWAY_FW_VERSION（88→…→97→98）で表す。**新機能ごとに
+ *      ディレクトリを増やさないこと。**増やすと同じ修正を両方へ入れ続けることになり、
+ *      実際 project06_yokogawa/gateway_v1.2 は FW 101、こちらは FW 97 まで乖離していた。
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+/**
  * Monita Gateway v1.1 — BLE/LoRa 受信 + LTE-M → GAS 送信（AC電源版）
  *
  * MCU    : Seeed XIAO nRF52840
@@ -132,6 +174,7 @@ void gLogPeriodicCommit() {
 // ══════════════════════════════════════════════
 
 // GAS スクリプトID（デプロイURLの "AKfycb..." 部分）
+// ★【設定3】GAS の宛先。デプロイをやり直したら必ず貼り替えること。
 const char* GAS_SCRIPT_ID = "AKfycbzKVvW6vEUvJ28c_xJbHoS2ulvHiPD4OsNONdrTrf6u4kLebl4G7ADI6-YsAFSy2BBB/exec";
 
 // LTE-M送信のON/OFF切替（★2026-07-23追加）
@@ -180,6 +223,7 @@ const char* GAS_SCRIPT_ID = "AKfycbzKVvW6vEUvJ28c_xJbHoS2ulvHiPD4OsNONdrTrf6u4kL
 // #define SIM_PLAN_D
 
 #if defined(SIM_1NCE)
+  // ★【設定4】SIM / APN。使う SIM に応じて platformio.ini で SIM_1NCE / SIM_PLAND を選ぶ。
   const char* APN      = "iot.1nce.net";
   const char* SIM_NAME = "1NCE";
   const char* APN_USER = "";
@@ -239,6 +283,8 @@ static uint32_t       sendIntervalMs           = SEND_INTERVAL_DEFAULT_MS;  // �
 //
 // ビルド時に指定する（既定は群0＝従来と等価）:
 //   PLATFORMIO_BUILD_FLAGS="-D GATEWAY_GROUP_ID=1" pio run -t upload
+// ★【設定2】Gateway 群。ビルド時に上書きする:
+//   PLATFORMIO_BUILD_FLAGS="-D GATEWAY_GROUP_ID=1" pio run -t upload
 #ifndef GATEWAY_GROUP_ID
 #define GATEWAY_GROUP_ID 0
 #endif
@@ -275,6 +321,8 @@ static_assert(GATEWAY_GROUP_ID >= 0 && GATEWAY_GROUP_ID <= 0x07,
 //   送信も起こらない状態になっていた（実機で確認）。
 // ★2026-08-28: LoRaは群方式（isAllowedLoRaPacket）へ移行したため、この一覧はBLE専用に
 //   なった。BLEの群分離はLoRaへの移行が進むまで後回しと決定したので現状維持とする。
+// ★【設定6】BLE 子機のホワイトリスト（BLE モードのときだけ使う）。
+//   LoRa は群のビット判定なので、この一覧を触る必要はない。
 static uint8_t  const ALLOWED_DEVICE_IDS[] = {
   0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
 };   // ★子機を増やしたらここに追加する
@@ -282,7 +330,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 97;
+static uint8_t  const GATEWAY_FW_VERSION = 98;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する（★BLE受信専用）
 // ★2026-08-28: LoRaは isAllowedLoRaPacket() を使う。BLEの群分離は第3段階まで後回しと
@@ -296,12 +344,64 @@ bool isAllowedFlexPacket(uint8_t pktType, uint8_t deviceId) {
   return false;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ★【設定1】受信する子機の型（センサフレーム型テーブル）
+//
+//   **新しい子機に対応するときは、この表に1行足すだけでよい。**
+//   他の場所を触る必要はない（受信・長さ検証・バッチ分割はすべてこの表を見る）。
+//
+//   pktType : 子機が送るペイロード先頭バイト
+//   len     : そのフレームの**厳密な**バイト数。短いフレームを許すと未受信のCHや
+//             電池電圧が残留値のままクラウドへ出るため、必ず一致で判定する
+//   cloudPt : GAS へ渡す "&pt=" の値。**0 を入れるとパラメータ自体を付けない**
+//             ＝従来の Flex 形式（既存 GAS と互換）。0 以外なら GAS 側に
+//             同じ値の分岐が必要（Code.gs）
+//   name    : 起動ログ用の表示名
+//
+//   ■使えない値
+//     0x05 … ダウンリンクACK（子機→親機）として予約済み。onDownlinkAckReceived() が
+//             長さ検証より前に捌くため、センサ型に使うと data が消える
+//     0x81 … ダウンリンク（親機→子機）
+//     0x82 / 0x83 … Deck 用ダウンリンク／ACK（予約）
+// ═══════════════════════════════════════════════════════════════════════════
+struct SensorFrameType {
+  uint8_t     pktType;
+  uint8_t     len;
+  uint8_t     cloudPt;
+  const char* name;
+};
+
+static const uint8_t DECK_STATIC_PKT_TYPE = 0x06;
+static const uint8_t DECK_EVENT_PKT_TYPE  = 0x07;
+
+static const SensorFrameType SENSOR_FRAME_TYPES[] = {
+  // pktType,               len, cloudPt, name
+  { EXPECTED_PKT_TYPE,       19,    0x00, "Flex/One センサ"        },  // 既存。&pt= を付けない
+  { DECK_STATIC_PKT_TYPE,    21,    0x06, "Deck 静的(6CH変位)"     },
+  { DECK_EVENT_PKT_TYPE,     22,    0x07, "Deck イベント統計"      },
+};
+static const size_t SENSOR_FRAME_TYPES_COUNT =
+    sizeof(SENSOR_FRAME_TYPES) / sizeof(SENSOR_FRAME_TYPES[0]);
+
+static const SensorFrameType* findSensorFrameType(uint8_t pktType) {
+  for (size_t i = 0; i < SENSOR_FRAME_TYPES_COUNT; i++) {
+    if (SENSOR_FRAME_TYPES[i].pktType == pktType) return &SENSOR_FRAME_TYPES[i];
+  }
+  return nullptr;
+}
+
+// センサフレームとして受理する型の、厳密なフレーム長を返す。0 なら「受理しない型」。
+static uint8_t expectedSensorFrameLen(uint8_t pktType) {
+  const SensorFrameType* t = findSensorFrameType(pktType);
+  return t ? t->len : 0;
+}
+
 #ifdef COMM_MODE_LORA
 // pktType・deviceId がこのGatewayの群の子機として受信すべき組み合わせか判定する（LoRa専用）
 // ホワイトリストではなくDeviceIDのビット構成で判定するため、子機を増やしても
 // Gateway側のソース修正は不要になる（群内で1〜31が自動的に許可される）。
 bool isAllowedLoRaPacket(uint8_t pktType, uint8_t deviceId) {
-  if (pktType != EXPECTED_PKT_TYPE) return false;
+  if (expectedSensorFrameLen(pktType) == 0) return false;
   if ((deviceId & 0x1F) == 0) return false;            // 下位5bitが0のIDは無効値
   return (deviceId >> 5) == GATEWAY_GROUP_ID;          // 上位3bitが自群と一致するもののみ
 }
@@ -2511,12 +2611,19 @@ static void loraPoll() {
         continue;
       }
 
-      // センサデータはFlex / Oneとも19バイト固定。短いフレームを許すと未受信の
-      // CH2〜4や電池電圧が残留値のままクラウドへ出るため、厳密一致で検証する。
-      if (s_loraLen != 19) {
-        Serial.print(F("[LORA] 不正なセンサフレーム長を破棄: "));
+      // ★FW98 G-1: 型ごとに長さを厳密一致で検証する。
+      //   短いフレームを許すと未受信のCHや電池電圧が残留値のままクラウドへ出る。
+      //   未知の型は expectedSensorFrameLen() が 0 を返し、ここで破棄される。
+      const uint8_t wantLen = expectedSensorFrameLen(pktType);
+      if (wantLen == 0 || s_loraLen != wantLen) {
+        Serial.print(F("[LORA] 不正なセンサフレームを破棄: type=0x"));
+        if (pktType < 0x10) Serial.print('0');
+        Serial.print(pktType, HEX);
+        Serial.print(F(" len="));
         Serial.print(s_loraLen);
-        Serial.println(F(" バイト（期待値19）"));
+        Serial.print(F("（期待値"));
+        Serial.print(wantLen);
+        Serial.println(F("）"));
         s_loraRejected++;
         s_loraRejLen++;
         continue;
@@ -2527,7 +2634,7 @@ static void loraPoll() {
         //   件数だけはハートビートに出す。棄却が増え続けている＝群の焼き間違いや
         //   混信を疑う手がかりになる（以前は0x0Eの登録漏れをこれで見落とした）。
         s_loraRejected++;
-        if (pktType != EXPECTED_PKT_TYPE)  s_loraRejPktType++;
+        if (expectedSensorFrameLen(pktType) == 0) s_loraRejPktType++;
         else if ((deviceId & 0x1F) == 0)   s_loraRejLocalNo++;
         else                               s_loraRejGroup++;
         continue;
@@ -2540,8 +2647,16 @@ static void loraPoll() {
       Serial.print(rssiDbm);
       Serial.println(F("dBm"));
 
-      // LoRaにはBLEのようなMACアドレスが無いため、DeviceIDで一意化した疑似MACを使う
-      uint8_t pseudoMac[6] = {0, 0, 0, 0, 0, deviceId};
+      // LoRaにはBLEのようなMACアドレスが無いため、DeviceIDで一意化した疑似MACを使う。
+      // ★FW98 G-2: 5バイト目に pktType を入れる。Deck は同一 DeviceID で
+      //   静的(0x06)とイベント統計(0x07)の2種類を送るため、これを分けないと
+      //   後から来た方が先の方を上書きしてしまう（Gatewayは子機ごと最新1件しか持たない）。
+      //   ★Flex(0x04) は従来どおり 0 のままにする。ここを 0x04 にすると SD ログの
+      //     mac 列が "00-00-00-00-00-0E" → "00-00-00-00-04-0E" に変わり、
+      //     **稼働中の Flex 現場で見えている値が変わってしまう。**
+      //     Deck 型のときだけ pktType を入れれば、上書き問題は解けて Flex は不変になる。
+      const uint8_t macTypeByte = (pktType == EXPECTED_PKT_TYPE) ? 0 : pktType;
+      uint8_t pseudoMac[6] = {0, 0, 0, 0, macTypeByte, deviceId};
       updateRecordFromPayload(pseudoMac, s_loraBody, s_loraLen, rssiDbm);
 
       // ★v1.20: 子機が起きた＝受信窓が開く直前。予約があればここでダウンリンクを送る。
@@ -3190,10 +3305,55 @@ int buildBatchQuery(const FlexRecord* merged, int start, int n,
   // 既定: Epoch(4B)+DeviceID(1B)+CH1-4(8B) = 13バイト/台 = 26 hex文字。
   // CLOUD_FMT_V2時のみ末尾へBATT(1B)を加え、14バイト/台 = 28 hex文字にする。
   // ビルドフラグ無しの既存現場ではwire formatを一切変えない。
+  // ★FW98 G-3: 1バッチには**同一 pktType のレコードだけ**を入れる。
+  //   呼び出し側が merged を pktType で整列済みなので、型が変わったところで打ち切ればよい。
+  //   Flex(0x04) のときは &pt= を付けない ＝ 既存現場の wire format を一切変えない。
+  //   Deck(0x06/0x07) のときだけ &pt= を付け、GAS 側はこれを見て形式を切り替える。
+  const uint8_t batchType = (start < n) ? merged[start].payload[0] : EXPECTED_PKT_TYPE;
+  const SensorFrameType* bt = findSensorFrameType(batchType);
+  if (bt && bt->cloudPt != 0x00) {          // cloudPt=0 の型は &pt= を付けない（既存GAS互換）
+    char ptHex[3];
+    snprintf(ptHex, sizeof(ptHex), "%02X", bt->cloudPt);
+    header += "&pt=";
+    header += ptHex;
+  }
+
   String body = "";
   int count = 0;
   for (int i = start; i < n; i++) {
     const FlexRecord& rec = merged[i];
+    if (rec.payload[0] != batchType) break;   // 整列済みなので、型が変わったら終わり
+
+    // ── Deck（0x06 静的 / 0x07 イベント統計）──
+    // Epoch(4B LE) + payload[1..] をそのまま16進で送る。デバイス側の
+    // レコード定義（要件 §7.3.8）を Gateway が解釈しないので、
+    // **レコード内容を変えても Gateway の改修が要らない。**
+    // cloudPt != 0 の型は「Epoch + payload そのまま16進」の汎用形式で送る。
+    // Gateway はレコードの中身を解釈しないので、**子機側でレコード定義を変えても
+    // Gateway の改修は要らない。**GAS 側だけ合わせればよい。
+    if (bt && bt->cloudPt != 0x00) {
+      if (rec.payloadLen != bt->len) continue;
+
+      char dchunk[8 + (MAX_PAYLOAD * 2) + 1];
+      int  w = snprintf(dchunk, sizeof(dchunk), "%02X%02X%02X%02X",
+                        (uint8_t)(rec.rtcEpoch & 0xFF),
+                        (uint8_t)((rec.rtcEpoch >> 8) & 0xFF),
+                        (uint8_t)((rec.rtcEpoch >> 16) & 0xFF),
+                        (uint8_t)((rec.rtcEpoch >> 24) & 0xFF));
+      for (uint8_t k = 1; k < rec.payloadLen && w < (int)sizeof(dchunk) - 2; k++) {
+        w += snprintf(dchunk + w, sizeof(dchunk) - w, "%02X", rec.payload[k]);
+      }
+
+      size_t oneLen = (count == 0) ? (String(F("&d=")).length() + strlen(dchunk)) : strlen(dchunk);
+      size_t projected = baseUrl.length() + header.length() + String(F("&n=99")).length()
+                          + body.length() + oneLen;
+      if (count > 0 && projected > SHREQ_MAX_URL_BYTES) break;
+      if (count == 0) body += "&d=";
+      body += dchunk;
+      count++;
+      continue;
+    }
+
     if (rec.payloadLen != 19) continue;  // Flex / Oneのセンサフレームは19バイト固定
 
     char chunk[29];
@@ -3360,11 +3520,32 @@ void flushRecords() {
   int failedN = 0;
   bool cycleHadSuccess = false;  // このサイクルで1バッチでも送信成功したか
 
+  // ★FW98 G-3: バッチは同一 pktType で組むため、先に pktType で安定整列しておく。
+  //   件数は最大 MAX_DEVICES(32) なので挿入ソートで十分。
+  for (int i = 1; i < n; i++) {
+    FlexRecord key = merged[i];
+    int j = i - 1;
+    while (j >= 0 && merged[j].payload[0] > key.payload[0]) { merged[j + 1] = merged[j]; j--; }
+    merged[j + 1] = key;
+  }
+
   {
     int start = 0;
     while (start < n) {
       String params;
       int count = buildBatchQuery(merged, start, n, csq, params);
+
+      // ★FW98 G-4: count==0 のまま start を進めないと**無限ループになる。**
+      //   先頭レコードが長さ不一致などで採用されないと実際に起きる。
+      //   Deck 対応で複数の型が混ざるようになり、現実に踏みうる経路になった。
+      if (count == 0) {
+        Serial.print(F("[BATCH] 先頭レコードを組み立てられないため1件スキップ: type=0x"));
+        Serial.print(merged[start].payload[0], HEX);
+        Serial.print(F(" len="));
+        Serial.println(merged[start].payloadLen);
+        start++;
+        continue;
+      }
 
       bool ok = postBatch(params);
       if (ok) {
@@ -3730,6 +3911,75 @@ static void handlePendingBleCommands() {
 // ══════════════════════════════════════════════
 // setup
 // ══════════════════════════════════════════════
+/**
+ * ★書き込んだあとは必ずこれを見ること。
+ *
+ * 実際に効いている設定を全部出す。**群の焼き間違い・GAS宛先の貼り忘れ・
+ * 子機型の追加漏れ**は、いずれもここを見れば書き込んだ直後に気づける。
+ * 製造・現地設置は本人以外が行うことがあるため、ソースを読まなくても
+ * 確認できる形にしてある（設定早見表はファイル冒頭）。
+ */
+static void printConfigSummary() {
+  Serial.println(F("---- 設定サマリ ----------------------"));
+
+  Serial.print(F("[設定5] 通信モード : "));
+#ifdef COMM_MODE_LORA
+  Serial.println(F("LoRa (E220-900T22S)"));
+#else
+  Serial.println(F("BLE"));
+#endif
+
+  Serial.print(F("[設定2] Gateway群  : ")); Serial.print(GATEWAY_GROUP_ID);
+  Serial.print(F("  → 受け付ける子機 DeviceID: 0x"));
+  Serial.print((GATEWAY_GROUP_ID << 5) | 0x01, HEX);
+  Serial.print(F(" 〜 0x"));
+  Serial.println((GATEWAY_GROUP_ID << 5) | 0x1F, HEX);
+
+  Serial.print(F("[設定4] SIM / APN  : ")); Serial.print(SIM_NAME);
+  Serial.print(F(" / ")); Serial.println(APN);
+
+  Serial.print(F("[設定3] GAS宛先    : "));
+  { // スクリプトIDは長いので先頭12文字だけ。貼り替え忘れの判別にはこれで足りる
+    char head[13] = {0};
+    strncpy(head, GAS_SCRIPT_ID, 12);
+    Serial.print(head); Serial.println(F("..."));
+  }
+
+  Serial.print(F("        クラウド形式: "));
+#ifdef CLOUD_FMT_V2
+  Serial.println(F("V2（BATT付き 14B/台）"));
+#else
+  Serial.println(F("既定（13B/台）"));
+#endif
+
+  Serial.println(F("[設定1] 受信する子機の型:"));
+  for (size_t i = 0; i < SENSOR_FRAME_TYPES_COUNT; i++) {
+    const SensorFrameType& t = SENSOR_FRAME_TYPES[i];
+    Serial.print(F("          pktType 0x"));
+    if (t.pktType < 0x10) Serial.print('0');
+    Serial.print(t.pktType, HEX);
+    Serial.print(F("  ")); Serial.print(t.len); Serial.print(F("B  "));
+    if (t.cloudPt == 0x00) {
+      Serial.print(F("&pt=なし(従来形式)  "));
+    } else {
+      Serial.print(F("&pt=")); 
+      if (t.cloudPt < 0x10) Serial.print('0');
+      Serial.print(t.cloudPt, HEX); Serial.print(F("            "));
+    }
+    Serial.println(t.name);
+  }
+
+#ifndef COMM_MODE_LORA
+  Serial.print(F("[設定6] BLE子機一覧: "));
+  for (size_t i = 0; i < ALLOWED_DEVICE_IDS_COUNT; i++) {
+    Serial.print(F("0x")); Serial.print(ALLOWED_DEVICE_IDS[i], HEX); Serial.print(' ');
+  }
+  Serial.println();
+#endif
+
+  Serial.println(F("--------------------------------------"));
+}
+
 void setup() {
   // ★2026-07-25追加: リセット原因（RESETREAS）の診断ログ。
   // 現場で説明のつかない短間隔の再起動が発生しており、WDT満了・ソフトリセット・
@@ -3766,6 +4016,8 @@ void setup() {
 
   // ★2026-08-28: 個体識別・群の焼き間違いを現場で切り分けるための起動ログ。
   Serial.print(F("GW_DEVICE_ID: ")); Serial.println(GW_DEVICE_ID);
+
+  printConfigSummary();
   Serial.print(F("XIAO固有ID: ")); Serial.println(&GW_DEVICE_ID[3]);  // "gw_"を除いた16桁
   Serial.print(F("Gateway群: ")); Serial.print(GATEWAY_GROUP_ID);
   Serial.print(F("（受信する子機DeviceID: 0x"));
