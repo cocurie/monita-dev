@@ -148,10 +148,36 @@ OSR を 1024 に変更し、1295.34 SPS・サンプル間隔 **0.772 ms** で確
 - **E220**（F-27）：M0/M1 を Low → `Serial1.end()` して TX を Low 固定 → Q1 OFF → 待機 → Q1 ON
   （TX のアイドル High と M0/M1 から逆給電され、電源を切ってもリセットされないため）
 
-### ★ SPI バス共有（F-28）
+### ★ SPI バス共有（F-28）— S6 を書く前に必ず読むこと
 
-ADC はモード1、SD はモード0。どちらも CPOL=0 なので SCLK のアイドルは Low で共通。
-切替時は「両 CS High → SD 後は 8 クロックのダミー → `SPISettings` 切替 → 対象 CS を Low」。
+ADC（モード1）と microSD（モード0）が**同じバス**（D8/D9/D10）にいる。CS だけ別。
+どちらも CPOL=0 なので SCLK のアイドルは Low で共通。切替時は
+「両 CS High → SD 後は 8 クロックのダミー → `SPISettings` 切替 → 対象 CS を Low」。
+
+**`SPI.beginTransaction()` は排他ロックではない。**SD の転送中に DRDY 割込みが入って
+CS_ADC を落とすと CS が2本とも Low になり、**両方の転送が壊れる**。
+これを防ぐのが `lib/SpiBus`。
+
+```cpp
+// main 側（SDなど）
+{
+  spibus::Lock lk;                      // ← スコープを抜けると自動で離す
+  digitalWrite(PIN_CS_SD, LOW);
+  ... 512 バイト転送 ...
+  digitalWrite(PIN_CS_SD, HIGH);
+}                                        // ← 待っていた DRDY がここで処理される
+
+// ISR 側（実装済み）
+if (spibus::busyFromIsr()) { ring.pushGap(1); adc.notifyPaused(); return; }
+```
+
+**★1ブロック（512 B）ごとに握り直すこと。**イベント波形は 117 kB あり、一度に握ると
+0.3〜0.5 秒バスを占有して**その間のサンプルが全部欠測**になる。
+**★SD の内部ビジー中は握らないこと。**ビジーは数 ms〜数百 ms ありうる。
+ブロックを送り終えたら CS_SD を上げて Lock を離し、ビジー確認のたびに握り直す。
+
+起動後の統計に `最長保持 xxx µs` が出る。**1周期（772 µs）を超えていたら、
+その回数だけ確実に欠測が出ている。**ブロック単位に割れているか確認すること。
 
 ---
 

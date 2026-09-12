@@ -41,6 +41,7 @@
 #include <Adafruit_TinyUSB.h>
 #include <ADS131M06.h>
 #include <DeckMeasure.h>
+#include <SpiBus.h>
 
 // ─────────────────────────────────────────────────────────────
 // ピン割当（要件 §5.1.1 / ネットリスト ver1.00 で確認済み）
@@ -183,10 +184,23 @@ static volatile uint16_t s_evOverflow = 0;    // キューが溢れた回数
 
 static volatile uint32_t s_isrFrames    = 0;
 static volatile uint32_t s_isrCrcErrors = 0;
+// SD などが SPI を握っていて読めなかった回数（欠測の内訳を分けて見るため）
+static volatile uint32_t s_busSkips     = 0;
 static volatile bool     s_haveSample   = false;
 static ADS131M06::Frame  s_lastFrame;
 
 static void onDrdyFalling() {
+  // ★SPI を main 側（SDカード等）が握っているなら、**絶対に触らない。**
+  //   CS が2本とも Low になると MISO が衝突し、ADC と SD の両方の転送が壊れる。
+  //   `SPI.beginTransaction()` は排他ロックではないので、これを自前でやる必要がある。
+  //   ここでは SPI に一切触れない処理だけを行って戻る（要件 F-28・§7.3.3 B-2）。
+  if (spibus::busyFromIsr()) {
+    ring.pushGap(1);        // ★欠測として番号を進める。詰めると時間軸がずれる
+    adc.notifyPaused();     // ★復帰時に FIFO を吐き出させる。忘れると DRDY が不定になる
+    s_busSkips++;
+    return;
+  }
+
   // F-4：割込みコンテキストで完結させる。8 MHz・24バイトで約 24 µs。
   // 以下の処理はすべて整数演算 6CH 分で、1295 Hz に対して十分軽い。
   ADS131M06::Frame f;
@@ -444,6 +458,12 @@ void loop() {
   Serial.printf("  欠測 %lu サンプル / 中断 %lu 回 / FIFO吐き出し %lu 回  STATUS異常 %lu\n",
                 (unsigned long)st.dropped, (unsigned long)st.gaps,
                 (unsigned long)st.fifoClears, (unsigned long)st.statusErr);
+  // ★SPI をどれだけ握られていたか。maxHold が1サンプル周期を超えていたら、
+  //   その回数だけ確実に欠測が出ている。SD をブロック単位に割っているか確認すること。
+  Serial.printf("  SPI: バス占有で読めず %lu / 握った回数 %lu / 最長保持 %lu µs（1周期 %lu µs）\n",
+                (unsigned long)s_busSkips, (unsigned long)spibus::claims(),
+                (unsigned long)spibus::maxHoldUs(),
+                (unsigned long)adc.samplePeriodUs());
   Serial.printf("  リング番号 %lu  検出 %u/収録 %u  EVQ溢れ %u\n",
                 (unsigned long)ring.count(),
                 detector.detectedThisHour(), detector.recordedThisHour(),
