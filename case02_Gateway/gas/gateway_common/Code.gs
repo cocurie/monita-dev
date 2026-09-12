@@ -137,6 +137,16 @@ function writeDownlinkFile_(group, nonce, body) {
 //            ・送信: トリガ設定13B を予約行の8番目のフィールド（16進26文字）で運ぶ
 //            ・deck_trigger シートと［Deck操作］メニューを追加
 //            ★&pt= が無いリクエストは従来と1行も変わらない挙動になる（既存Flex現場は無影響）
+//     - v12: Codexレビュー対応（2026-09-13）。
+//            ・受信データの書込み失敗（ロック待ち・シート例外）を黙って 'OK' にしていたのをやめ、
+//              Script Properties に退避して再処理する（receiveTelemetry_）。★Gateway は応答本文を
+//              読まないので、GAS 側で持たないと消える。設置時に［【初回のみ】受信データ再処理の
+//              自動実行を設定］を1回実行すること
+//            ・DECK_CHILD_IDS 未登録の Deck はシートを自動作成せず invalid_payload_log へ
+//            ・群1以降の Deck にも予約を配信（downlinkChildIds_）
+//            ・確定済み・取り消し済みを downlink_sent で sent に戻さない
+//            ・予約の取り消しをロック付き・state='cancelled' に（削除すると seq が振り直される）
+//            ・deck_trigger の状態列を seq で行特定。子機の適用値を子機と同じ規則で検査
 //
 //   対応する子機ファーム:
 //     - project07_NEXCO/firmware/src/main.cpp（COMM_MODE_BLE、本番項目用）
@@ -332,10 +342,21 @@ function dlSet_(childHex, obj) {
 // 両方から呼ばれる。表現を1か所に集約し、片方だけ形式が変わる事故を防ぐ。
 var DOWNLINK_MAX_LINES = 20;
 
+// 予約を持ちうる子機IDの一覧（Flex の CMD_STATUS_CHILD_IDS ＋ Deck の DECK_CHILD_IDS）。
+// ★以前は CMD_STATUS_CHILD_IDS だけを回していたため、そこに無い Deck（群1以降など）は
+//   予約を積んでも**一度も Gateway へ配信されなかった**（Codexレビュー指摘）。
+//   配信・状況表示の両方がここを通るようにして、片方だけ漏れる事故を防ぐ。
+function downlinkChildIds_() {
+  var ids = CMD_STATUS_CHILD_IDS.slice();
+  DECK_CHILD_IDS.forEach(function (h) { if (ids.indexOf(h) < 0) ids.push(h); });
+  return ids;
+}
+
 function buildDownlinkLines_(group) {
   var lines = [];
-  for (var ci = 0; ci < CMD_STATUS_CHILD_IDS.length && lines.length < DOWNLINK_MAX_LINES; ci++) {
-    var hex = CMD_STATUS_CHILD_IDS[ci];
+  var childIds = downlinkChildIds_();
+  for (var ci = 0; ci < childIds.length && lines.length < DOWNLINK_MAX_LINES; ci++) {
+    var hex = childIds[ci];
     if (group !== undefined && (parseInt(hex, 16) >> 5) !== group) continue;
     var d = dlGet_(hex);
     if (d && (d.state === 'queued' || d.state === 'sent')) {
@@ -362,10 +383,13 @@ function dlStatusLabel_(d) {
   if (!d) return '';
   if (d.state === 'queued') return '';
   if (d.state === 'sent')   return '送信済み（確認待ち）';
+  if (d.state === 'cancelled') return '取り消し済み';
   // ★Deck は sleep/avg/median を持たない。適用後のトリガ設定で表示する。
   if (d.kind === 'deck') {
-    if (d.status === DL_STATUS_OK)          return '完了: ' + deckTrigHexToText_(d.appliedTrigHex || '');
-    if (d.status === DL_STATUS_CLAMPED)     return '完了（子機が値を丸めた）: ' + deckTrigHexToText_(d.appliedTrigHex || '');
+    // appliedCheck は「完了と応答したが中身がおかしい」ときだけ入る（deckAppliedCheck_）
+    var warn = d.appliedCheck ? ('　' + d.appliedCheck) : '';
+    if (d.status === DL_STATUS_OK)          return '完了: ' + deckTrigHexToText_(d.appliedTrigHex || '') + warn;
+    if (d.status === DL_STATUS_CLAMPED)     return '完了（子機が値を丸めた）: ' + deckTrigHexToText_(d.appliedTrigHex || '') + warn;
     if (d.status === DL_STATUS_RANGE_ERROR) return '失敗（子機が値域エラーで拒否）';
     if (d.status === DL_STATUS_NO_ACK)      return '失敗（未達。' + (d.attempts || 0) + '回試行しても確認が返らず）';
     return '失敗（不明なステータス: ' + d.status + '）';
@@ -433,7 +457,7 @@ function queueDownlink_(childHex, sleepMin, avg, median, sourceNote, mode) {
 
     dlLog_(childHex, nextSeq, (mode === 'status') ? 'ステータス確認要求' : '予約',
            (mode === 'status') ? '（設定変更なし）' : ('間隔=' + sleepMin + '分 / 平均=' + avg + ' / メジアン=' + median),
-           (prevRec && prevRec.state !== 'done' && prevRec.state !== 'failed')
+           (prevRec && prevRec.state !== 'done' && prevRec.state !== 'failed' && prevRec.state !== 'cancelled')
              ? '★未完了の予約(seq=' + prevRec.seq + ')を上書きしました'
              : sourceNote);
   } catch (err) {
@@ -559,8 +583,8 @@ function triggerCancelFlexReservation() {
   if (!deviceIdHex) return;
 
   var d = dlGet_(deviceIdHex);
-  if (!d) {
-    ui.alert('子機0x' + deviceIdHex + ' には現在予約がありません。');
+  if (!d || (d.state !== 'queued' && d.state !== 'sent')) {
+    ui.alert('子機0x' + deviceIdHex + ' には未完了の予約がありません。');
     return;
   }
   var current = '間隔=' + d.sleep + '分, 平均=' + d.avg + ', メジアン=' + d.median +
@@ -573,10 +597,46 @@ function triggerCancelFlexReservation() {
   );
   if (r2 !== ui.Button.YES) return;
 
+  var res = cancelDownlinkLocked_(deviceIdHex, d.seq);
+  if (res !== 'ok') { ui.alert(res); return; }
+
   dlLog_(deviceIdHex, d.seq, '取消', current, 'スプレッドシートのメニューから手動取消');
-  PropertiesService.getScriptProperties().deleteProperty(dlKey_(deviceIdHex));
   refreshCmdStatusSheet();
   ui.alert('子機0x' + deviceIdHex + ' の予約を取り消しました。');
+}
+
+// 予約の取り消し（Flex / Deck 共通）。成功なら 'ok'、できなければ利用者に見せる理由を返す。
+//
+// ★ロックを取り、**確認ダイアログを出す前に見た seq と今の seq が同じか**を確かめる
+//   （Codexレビュー指摘）。ダイアログを出している数十秒の間に、Gateway の結果報告で
+//   完了していたり、別の人が新しい予約を入れていたりすると、ロック無しでは
+//   「取り消したつもりが新しい予約を消した」「完了した記録を消した」になる。
+//
+// ★予約は**削除せず state='cancelled' にする。**削除すると seq が 1 から振り直され、
+//   取り消す前に Gateway が送っていた古い seq=1 の応答が、新しい seq=1 の予約を
+//   完了扱いにしてしまう。seq は子機IDごとに単調増加でなければならない。
+function cancelDownlinkLocked_(childHex, expectedSeq) {
+  var lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+  } catch (err) {
+    return '他の処理が実行中のため取り消せませんでした。少し待ってからもう一度試してください。';
+  }
+  try {
+    var now = dlGet_(childHex);
+    if (!now || now.seq !== expectedSeq) {
+      return '確認している間に新しい予約（seq=' + (now ? now.seq : '?') + '）が入ったため、取り消しを中止しました。\n' +
+             'もう一度内容を確かめてから取り消してください。';
+    }
+    if (now.state !== 'queued' && now.state !== 'sent') {
+      return '確認している間に予約が確定しました（' + (dlStatusLabel_(now) || now.state) + '）。取り消しは不要です。';
+    }
+    now.state = 'cancelled';
+    dlSet_(childHex, now);
+    return 'ok';
+  } finally {
+    try { lock.releaseLock(); } catch (e2) {}
+  }
 }
 
 
@@ -679,7 +739,7 @@ function refreshCmdStatusSheet() {
   // Flex子機側（子機IDごとに独立した予約・状態を持つ）。
   // ★MAC列はgetDeviceSheetNameByMac_が実際に照合する形式と完全一致させる
   //   （"00-00-00-00-00-<HEX2>"）。ここが表示専用の別形式だと紛らわしいため。
-  CMD_STATUS_CHILD_IDS.forEach(function (childHex) {
+  downlinkChildIds_().forEach(function (childHex) {
     var mac = '00-00-00-00-00-' + childHex;
     // ★DECK_CHILD_IDS に載っていれば Deck。載っていなければ従来どおり製品プロファイルで判定する
     var productLabel = (DECK_CHILD_IDS.indexOf(childHex) >= 0)
@@ -693,7 +753,7 @@ function refreshCmdStatusSheet() {
     var req = (d.kind === 'deck')
       ? ('トリガ設定: ' + deckTrigHexToText_(d.trigHex || ''))
       : ('間隔=' + d.sleep + '分, 平均=' + d.avg + ', メジアン=' + d.median);
-    var stateLabel = { queued: '予約中', sent: '送信済み（確認待ち）', done: '完了', failed: '失敗' }[d.state] || d.state;
+    var stateLabel = { queued: '予約中', sent: '送信済み（確認待ち）', done: '完了', failed: '失敗', cancelled: '取り消し' }[d.state] || d.state;
     rows.push([
       '0x' + childHex, productLabel, mac, req, stateLabel, dlStatusLabel_(d),
       d.attempts || 0, d.updated ? new Date(d.updated) : now,
@@ -722,6 +782,10 @@ function onOpen() {
     .addItem('予約を取り消す', 'triggerCancelGatewayReservation')
     .addSeparator()
     .addItem('予約状況を更新', 'refreshCmdStatusSheet')
+    .addSeparator()
+    // ★受信データの書込み失敗時の再処理（retryStashedBatches）。**設置時に一度だけ実行すること。**
+    .addItem('【初回のみ】受信データ再処理の自動実行を設定', 'installRetryTrigger')
+    .addItem('退避中の受信データを今すぐ再処理', 'triggerRetryStashedNow')
     .addToUi();
 
   // ★2026-08-10追加: Flex子機向けのLoRaダウンリンク操作をGateway操作から分離。
@@ -1187,39 +1251,26 @@ function getDeckSheet_(ss, name, header) {
   return sheet;
 }
 
-// ── 受信処理（doGet から呼ぶ）──────────────────────────────
-// dBlob を n 件に切り分けてシートへ追記する。戻り値は文字列（doGet の応答）。
-function handleDeckBatch_(ss, pt, dBlob, n, csq) {
-  var perLen = (pt === DECK_PT_STATIC) ? DECK_STATIC_HEX_LEN : DECK_EVENT_HEX_LEN;
-  if (dBlob.length !== perLen * n) {
-    logInvalidPayload_(ss, 'Deck(pt=' + pt + ')の1件が' + perLen + ' hexではありません: ' +
-                       (n ? dBlob.length / n : '?'), n, dBlob);
-    return 'ERROR: unsupported deck record length';
-  }
-  if (!/^[0-9A-Fa-f]+$/.test(dBlob)) {
-    logInvalidPayload_(ss, 'Deck(pt=' + pt + ')のdにhex以外の文字が含まれます', n, dBlob);
-    return 'ERROR: non-hex payload';
-  }
+// ── 受信処理 ──────────────────────────────────────────
+// 形式検査・ロック・書込み失敗時の退避は Flex と共通（receiveTelemetry_ を参照）。
+// ここにあるのは「1レコードをシートへ書く」処理だけ。
 
-  var lock = LockService.getScriptLock();
-  try {
-    lock.waitLock(10000);
-    for (var i = 0; i < n; i++) {
-      var chunk = dBlob.substr(i * perLen, perLen);
-      if (pt === DECK_PT_STATIC) appendDeckStaticRow_(ss, chunk, csq);
-      else                       appendDeckEventRow_(ss, chunk, csq);
-    }
-  } catch (err) {
-    console.log('Deck append error: ' + err);
-  } finally {
-    try { lock.releaseLock(); } catch (e2) {}
-  }
-  return 'OK';
+// ★DECK_CHILD_IDS に無い DeviceID のシートは**自動作成しない**（Codexレビュー指摘）。
+//   電波の化けや他現場の子機で deck_XX シートが勝手に増えると、現場の人はどれが本物か
+//   判断できない。データは捨てずに invalid_payload_log へ全文を残す（1件は 48/50 hex で収まる）。
+//   登録し忘れに気づいたら、そこから復元できる。
+function deckRegisteredOrLog_(ss, deviceId, chunk, kind) {
+  var hex = deviceIdHex_(deviceId);
+  if (DECK_CHILD_IDS.indexOf(hex) >= 0) return hex;
+  logInvalidPayload_(ss, 'Deck ' + kind + ': DeviceID ' + hex + ' が DECK_CHILD_IDS に未登録' +
+                     '（シートは作らない。登録後にこの行の d から復元できる）', 1, chunk);
+  return null;
 }
 
 function appendDeckStaticRow_(ss, chunk, csq) {
   var d = parseDeckStaticRecord(chunk);
-  var hex = deviceIdHex_(d.deviceId);
+  var hex = deckRegisteredOrLog_(ss, d.deviceId, chunk, '静的');
+  if (!hex) return;
   var sheet = getDeckSheet_(ss, 'deck_' + hex, DECK_STATIC_HEADER);
   var childClock = ('0' + d.childHour).slice(-2) + ':' + ('0' + d.childMin).slice(-2);
   // CHステータスは16進1桁だと読み違えるので、正常CHを列挙した文字列にする
@@ -1236,7 +1287,8 @@ function appendDeckStaticRow_(ss, chunk, csq) {
 
 function appendDeckEventRow_(ss, chunk, csq) {
   var d = parseDeckEventRecord(chunk);
-  var hex = deviceIdHex_(d.deviceId);
+  var hex = deckRegisteredOrLog_(ss, d.deviceId, chunk, 'イベント');
+  if (!hex) return;
   var sheet = getDeckSheet_(ss, 'deck_' + hex + '_event', DECK_EVENT_HEADER);
   sheet.appendRow([
     new Date(d.epoch * 1000), d.deviceId, d.fwVer, d.aggHour, d.detected, d.recorded,
@@ -1342,7 +1394,8 @@ function deckRowToTrigBytes_(row) {
     return x;
   }
 
-  var enabled    = num('収録有効', row.enabled) ? 1 : 0;
+  // ★0/1 以外を「真なら1」に丸めない。子機は 0/1 以外を拒否する（fromBytes）
+  var enabled    = Math.round(num('収録有効', row.enabled));
   var threshold  = Math.round(num('閾値', row.threshold));
   var threshMode = Math.round(num('閾値の定義', row.threshMode));
   var chMask     = Math.round(num('対象CHマスク', row.chMask));
@@ -1355,11 +1408,16 @@ function deckRowToTrigBytes_(row) {
   var maxPerHour = Math.round(num('最大収録件数(件/時)', row.maxPerHour));
   var staticMin  = Math.round(num('静的計測の周期(分)', row.staticMin));
 
+  if (enabled !== 0 && enabled !== 1)       errs.push('収録有効は 0 か 1');
   if (threshold < 0 || threshold > 65535)   errs.push('閾値は 0〜65535');
   if (threshMode < 0 || threshMode > 2)     errs.push('閾値の定義は 0〜2');
   if (chMask < 1 || chMask > 63)            errs.push('対象CHマスクは 1〜63（0は不可）');
   if (decision < 0 || decision > 2)         errs.push('判定方式は 0〜2');
   if (decision === 2 && (nRequired < 1 || nRequired > 6)) errs.push('判定方式=2 のとき N は 1〜6');
+  // ★N が監視CH数より多いと**一度も発火しない。**「車が来ない」と区別がつかないので弾く
+  if (decision === 2 && chMask >= 1 && chMask <= 63 && nRequired > deckPopcount_(chMask)) {
+    errs.push('N（' + nRequired + '）が対象CHの数（' + deckPopcount_(chMask) + '）より多い。一度も発火しません');
+  }
   if (durationMs < 0 || durationMs > 255)   errs.push('継続時間は 0〜255 ms');
   if (deadTen < 0 || deadTen > 255)         errs.push('不感時間は 0〜2550 ms');
   if (preTenth < 5 || preTenth > 30)        errs.push('プリトリガは 0.5〜3.0 秒');
@@ -1392,8 +1450,51 @@ function deckRowToTrigBytes_(row) {
     (maxPerHour >> 8) & 0xFF, maxPerHour & 0xFF,
     staticMin,
   ];
-  if (b.length !== DECK_TRIG_BYTES) return { errors: ['内部エラー: バイト数が ' + b.length] };
+  // 最後に子機と同じ規則でバイト列を検査する。上の欄ごとの検査と食い違ったら内部エラー
+  var problems = deckTrigBytesProblems_(b);
+  if (problems.length) return { errors: ['内部エラー（バイト列の検査で不合格）: ' + problems.join(' / ')] };
   return { bytes: b };
+}
+
+function deckPopcount_(v) { var n = 0; for (; v; v &= v - 1) n++; return n; }
+
+function deckNormalizeHex_(v) {
+  return ('0' + String(v).trim().replace(/^0x/i, '')).slice(-2).toUpperCase();
+}
+
+// 13バイトを**子機の TriggerConfig::fromBytes() と同じ規則で**検査する。問題の一覧を返す（空なら合格）。
+// 送る前の最終確認と、子機が「適用した」と返してきた値の確認の両方に使う。
+// ★DeckMeasure.cpp の fromBytes() を変えたら、ここも同時に変えること。
+function deckTrigBytesProblems_(b) {
+  if (!b || b.length !== DECK_TRIG_BYTES) return ['バイト数が ' + (b ? b.length : 0)];
+  var errs = [];
+  if (b[0] > 1)                errs.push('収録有効が 0/1 以外');
+  if (b[3] > 2)                errs.push('閾値の定義が 0〜2 以外');
+  if (b[4] & 0xC0)             errs.push('対象CHマスクの上位2bitが立っている');
+  var mask = b[4] & 0x3F;
+  if (mask === 0)              errs.push('対象CHマスクが 0');
+  var dec = b[5] & 0x0F, nReq = b[5] >> 4;
+  if (dec > 2)                 errs.push('判定方式が 0〜2 以外');
+  if (b[12] === 0)             errs.push('静的計測の周期が 0');
+  if (dec === 2 && (nReq === 0 || nReq > deckPopcount_(mask))) errs.push('N が 1〜監視CH数 の範囲外');
+  var need = Math.floor((b[8] + b[9]) * DECK_SAMPLES_PER_SEC / 10);
+  if (need + DECK_SAMPLES_PER_SEC > DECK_RING_SAMPLES) errs.push('プリ+ポストがリングに収まらない');
+  if (b[8] < 5 || b[8] > 30)   errs.push('プリトリガが 0.5〜3.0 秒の範囲外');
+  if (b[9] < 10)               errs.push('ポストトリガが 1.0 秒未満');
+  return errs;
+}
+
+// 子機が「完了」と返してきた適用値が信用できるかを見る。問題が無ければ ''。
+// ★Gateway は 13 バイトの中身を検査しない（status の値域だけ見る）。ここが最後の砦。
+function deckAppliedCheck_(rec, statusNum, isDeckResult, appliedHex) {
+  if (statusNum !== DL_STATUS_OK && statusNum !== DL_STATUS_CLAMPED) return '';
+  if (!isDeckResult) return '★完了の応答に適用値が付いていません（Gateway が古い可能性）';
+  var problems = deckTrigBytesProblems_(deckHexToBytes_(appliedHex));
+  if (problems.length) return '★子機の適用値が規則外: ' + problems.join(' / ');
+  if (statusNum === DL_STATUS_OK && appliedHex !== String(rec.trigHex || '').toUpperCase()) {
+    return '★「要求どおり適用」と応答したのに要求値と一致しません（子機ファームを確認）';
+  }
+  return '';
 }
 
 function deckBytesToHex_(bytes) {
@@ -1436,7 +1537,7 @@ function queueDeckDownlink_(childHex, trigBytes, sourceNote) {
     });
 
     dlLog_(childHex, nextSeq, 'Deck予約', deckTrigHexToText_(trigHex),
-           (prevRec && prevRec.state !== 'done' && prevRec.state !== 'failed')
+           (prevRec && prevRec.state !== 'done' && prevRec.state !== 'failed' && prevRec.state !== 'cancelled')
              ? '★未完了の予約(seq=' + prevRec.seq + ')を上書きしました'
              : sourceNote);
     return nextSeq;
@@ -1501,7 +1602,8 @@ function triggerDeckSendTrigger() {
   if (seq === null) { ui.alert('予約に失敗しました（ロックのタイムアウト）。もう一度試してください。'); return; }
 
   sheet.getRange(idx + 1, deckTriggerCol_('sentAt')).setValue(new Date());
-  sheet.getRange(idx + 1, deckTriggerCol_('result')).setValue('送信待ち（seq=' + seq + '）');
+  sheet.getRange(idx + 1, deckTriggerCol_('result')).setValue('送信待ち' + deckSeqTag_(seq));
+  markSupersededDeckRows_(sheet, childHex, idx + 1, seq);
   ui.alert('予約しました（seq=' + seq + '）。\n子機の応答が返ると、この行の「状態」列が更新されます。');
 }
 
@@ -1515,26 +1617,72 @@ function triggerCancelDeckReservation() {
     ui.alert('DeviceID ' + hex + ' に未完了の予約はありません。');
     return;
   }
-  PropertiesService.getScriptProperties().deleteProperty(dlKey_(hex));
+  var ok = ui.alert('Deck 予約の取り消し',
+                    'DeviceID ' + hex + ' の以下の予約(seq=' + rec.seq + ')を取り消しますか？\n\n' +
+                    deckTrigHexToText_(rec.trigHex || ''), ui.ButtonSet.YES_NO);
+  if (ok !== ui.Button.YES) return;
+
+  // ★ロックを取り、確認中に状態が変わっていないか確かめてから取り消す（cancelDownlinkLocked_ 参照）
+  var res = cancelDownlinkLocked_(hex, rec.seq);
+  if (res !== 'ok') { ui.alert(res); return; }
+
   dlLog_(hex, rec.seq, '取り消し', deckTrigHexToText_(rec.trigHex || ''), '手動で取り消しました');
+  updateDeckTriggerResult_(hex, rec.seq, '取り消し済み　' +
+                           Utilities.formatDate(new Date(), 'Asia/Tokyo', 'MM/dd HH:mm'));
+  refreshCmdStatusSheet();
   ui.alert('DeviceID ' + hex + ' の予約(seq=' + rec.seq + ')を取り消しました。');
 }
 
+// 「状態」列に付ける seq の目印。行の特定に使うので書式を変えないこと。
+// ★全角括弧で挟むので、seq=5 を探して seq=15 や seq=55 に当たることはない。
+function deckSeqTag_(seq) { return '（seq=' + seq + '）'; }
+
 // deck_trigger シートの「状態」列を、子機からの応答結果で更新する。
-// ★DeviceID 列で行を探す。同じDeviceIDが複数行あるときは最初の行だけ更新する。
-function updateDeckTriggerResult_(childHex, text) {
+//
+// ★**その予約を送った行**を seq の目印で探す（Codexレビュー指摘）。以前は DeviceID が
+//   一致する最初の行に書いていたため、同じ子機の行が複数あると（設定を変えて試す現場では
+//   普通にある）、送っていない行に「完了」が付いた。
+//   目印が見つからない（行を消した・状態列を手で書き換えた）ときは、**別の行に書かない。**
+//   結果は downlink_log に必ず残っている。
+function updateDeckTriggerResult_(childHex, seq, text) {
   try {
     var sheet = getDeckTriggerSheet_();
-    if (!sheet) return;
+    if (!sheet) return false;
     var last = sheet.getLastRow();
-    if (last < 2) return;
-    var ids = sheet.getRange(2, 1, last - 1, 1).getValues();
+    if (last < 2) return false;
+    var idCol = deckTriggerCol_('deviceId'), resCol = deckTriggerCol_('result');
+    var ids = sheet.getRange(2, idCol, last - 1, 1).getValues();
+    var res = sheet.getRange(2, resCol, last - 1, 1).getValues();
+    var tag = deckSeqTag_(seq);
     for (var i = 0; i < ids.length; i++) {
-      var v = ('0' + String(ids[i][0]).trim().replace(/^0x/i, '')).slice(-2).toUpperCase();
-      if (v === childHex) { sheet.getRange(i + 2, deckTriggerCol_('result')).setValue(text); return; }
+      if (deckNormalizeHex_(ids[i][0]) !== childHex) continue;
+      if (String(res[i][0]).indexOf(tag) < 0) continue;
+      sheet.getRange(i + 2, resCol).setValue(text + tag);
+      return true;
     }
+    console.log('deck_trigger に ' + childHex + tag + ' の行が見つからないため状態列は更新しない（downlink_log を参照）');
   } catch (e) {
     console.log('deck_trigger 状態列の更新に失敗: ' + e);
+  }
+  return false;
+}
+
+// 同じ子機の別の行で「送信待ち」のまま残っているものに、置き換わったことを書く。
+// GAS の予約は子機ごとに1件なので、新しい行を送った時点で古い行の予約はもう届かない。
+// 書かないと、その行は永久に「送信待ち」のままになる。
+function markSupersededDeckRows_(sheet, childHex, keepRow, newSeq) {
+  var last = sheet.getLastRow();
+  if (last < 2) return;
+  var idCol = deckTriggerCol_('deviceId'), resCol = deckTriggerCol_('result');
+  var ids = sheet.getRange(2, idCol, last - 1, 1).getValues();
+  var res = sheet.getRange(2, resCol, last - 1, 1).getValues();
+  for (var i = 0; i < ids.length; i++) {
+    if (i + 2 === keepRow) continue;
+    if (deckNormalizeHex_(ids[i][0]) !== childHex) continue;
+    var m = String(res[i][0]).match(/^送信待ち（seq=(\d+)）$/);
+    if (!m) continue;
+    sheet.getRange(i + 2, resCol).setValue('置き換え済み（' + (keepRow) + '行目の予約 seq=' + newSeq +
+                                           ' に置き換え。この行は送られない）' + deckSeqTag_(m[1]));
   }
 }
 
@@ -1707,6 +1855,252 @@ function checkProfileAlerts_(ss, profile, values, mac, measuredAt) {
 }
 
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 受信データの取り込みと、書込み失敗時の退避・再処理（2026-09-13 Codexレビュー対応）
+//
+//   ★**Gateway は GAS の応答本文を読まない。**postToGAS() は HTTP ステータス 200 だけを見て
+//     成功とする（gateway_v1.21 main.cpp の postToGAS 参照）。ContentService は常に 200 を返すので、
+//     ここで 'ERROR' を返しても**Gateway は再送しない。**
+//     以前はロック待ちのタイムアウトやシート書込みの例外を console.log に出して 'OK' を返しており、
+//     そのバッチは誰にも気づかれずに消えていた。
+//
+//   そこで「書けなかった分は GAS 自身が持っておき、後で書く」ようにした。
+//     ① 形式が壊れている      → invalid_payload_log に残して終わり（再試行しても直らない）
+//     ② ロックが取れない      → バッチ全体を Script Properties に退避
+//     ③ i 件目で書込みに失敗  → **i 件目以降だけ**を退避（書けた分を二重に書かないため）
+//     ④ 退避分は、次の受信のついでに2件、および10分ごとの時間主導トリガで再処理する
+//     ⑤ 24時間（144回）書けなければ retry_giveup_log に全文を残して諦める
+//
+//   ★時間主導トリガは**設置時に一度だけ**メニュー［Gateway操作］→
+//     ［【初回のみ】受信データ再処理の自動実行を設定］で入れること。
+//     入れなくても④の「受信のついで」で再処理はされるが、受信が止まると退避分も止まる。
+// ═══════════════════════════════════════════════════════════════════════════
+
+const RETRY_KEY_PREFIX    = 'retry_batch_';
+const RETRY_MAX_ATTEMPTS  = 144;   // 10分ごと × 144 = 24時間
+const RETRY_PER_REQUEST   = 2;     // 通常の受信1回のついでに再処理する件数（応答を遅らせすぎない）
+const RETRY_GIVEUP_SHEET  = 'retry_giveup_log';
+
+// 1レコードをシートへ書く。**例外はそのまま投げる**（呼び出し側が退避に回す）。
+function appendTelemetryRecord_(ss, pt, chunk, csq) {
+  if (pt === DECK_PT_STATIC) return appendDeckStaticRow_(ss, chunk, csq);
+  if (pt === DECK_PT_EVENT)  return appendDeckEventRow_(ss, chunk, csq);
+  return appendFlexRecord_(ss, chunk, csq);
+}
+
+// Flex / One の1レコード（26 or 28 hex）。旧 doGet のループ本体をそのまま移した。
+function appendFlexRecord_(ss, chunk, csq) {
+  var d = parseGatewayRecord(chunk);
+  var profile = getProductProfile_(d.deviceId);
+  var displayCh = transformChannels_(d.ch, profile);
+  var measuredAt = new Date(d.epoch * 1000);
+
+  // DeviceID → 内部識別キー（クールダウン用）
+  var macHex = deviceIdHex_(d.deviceId);
+  var mac = '00-00-00-00-00-' + macHex;
+
+  // DeviceID → シート名（「シート名編集」シートで紐付け。未登録は 'databox' へ）
+  var sheetName = getDeviceSheetNameByMac(ss, mac) || 'databox';
+  // ★子機シート(child_XX)は無ければ自動作成する。databox等の既存シートを取り違えて
+  //   作ってしまわないよう、自動作成の対象は 'child_' で始まる名前だけに限定する。
+  var sheet;
+  if (sheetName.indexOf('child_') === 0) {
+    sheet = getOrCreateDeviceSheet_(ss, sheetName, profile);
+  } else {
+    sheet = ss.getSheetByName(sheetName);
+  }
+  if (!sheet) {
+    // ★以前は console.log だけで捨てていた。設定の問題なので再試行はしないが、データは残す
+    logInvalidPayload_(ss, 'シートが見つかりません: ' + sheetName + '（DeviceID ' + macHex + '）', 1, chunk);
+    return;
+  }
+
+  // 列構成（17列）。Gatewayは温度・CH Max/Minを送っていないため空欄:
+  // A:計測日時(Gateway epoch) B:DeviceID C:温度(℃、空欄)
+  // D:CH1 E:CH2 F:CH3 G:CH4
+  // H〜O: Max/Min（空欄）
+  // P:LTE-M RSSI Q:電池電圧(V。旧13B/255は空欄)
+  sheet.appendRow([
+    measuredAt,                                            // A: Gateway受信epoch由来の計測日時
+    d.deviceId,                                            // B: DeviceID
+    '',                                                    // C: 温度(未送信)
+    displayCh[0], displayCh[1], displayCh[2], displayCh[3],// D-G: 製品別に変換したCH1-4
+    '', '', '', '', '', '', '', '',                        // H-O: Max/Min(未送信)
+    csq,                                                   // P: LTE-M RSSI
+    d.battV,                                               // Q: 電池電圧(V)
+  ]);
+
+  // ★ここから先（アラート）の失敗で、**書けたレコードを退避に回してはいけない。**二重記録になる。
+  try {
+    // シート設定による従来アラートには製品別の表示値を渡す。
+    var dataObj = {
+      CH1: displayCh[0], CH2: displayCh[1], CH3: displayCh[2], CH4: displayCh[3],
+    };
+    checkAlertsForDeviceSheet(sheet, dataObj, mac);
+    checkProfileAlerts_(ss, profile, displayCh, mac, measuredAt);
+  } catch (err) {
+    console.error('[ALERT] アラート判定に失敗（データは記録済み）: ' + err);
+  }
+}
+
+// ★呼ぶ前に ScriptLock を取っていること。
+// 戻り値: { failedAt: 書けなかった最初のレコード番号（全部書けたら -1）, error }
+function ingestRecordsLocked_(ss, pt, n, perLen, dBlob, csq) {
+  for (var i = 0; i < n; i++) {
+    try {
+      appendTelemetryRecord_(ss, pt, dBlob.substr(i * perLen, perLen), csq);
+    } catch (err) {
+      return { failedAt: i, error: String(err) };
+    }
+  }
+  return { failedAt: -1, error: '' };
+}
+
+// doGet から呼ぶ。形式検査は済んでいる前提。戻り値は応答文字列（Gateway は読まない。ログ用）。
+function receiveTelemetry_(ss, pt, n, perLen, dBlob, csq) {
+  var lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+  } catch (err) {
+    stashBatch_(pt, n, dBlob, csq, 'ロック待ちタイムアウト: ' + err);
+    return 'RETRY: lock timeout (stashed)';
+  }
+  var r;
+  try {
+    if (!ss) throw new Error('スプレッドシートを開けませんでした');
+    r = ingestRecordsLocked_(ss, pt, n, perLen, dBlob, csq);
+  } catch (err) {
+    r = { failedAt: 0, error: String(err) };
+  } finally {
+    try { lock.releaseLock(); } catch (e2) {}
+  }
+
+  if (r.failedAt >= 0) {
+    stashBatch_(pt, n - r.failedAt, dBlob.substr(r.failedAt * perLen), csq,
+                (r.failedAt + 1) + '/' + n + '件目で書込み失敗: ' + r.error);
+    return 'RETRY: write failed at ' + r.failedAt + '/' + n + ' (stashed)';
+  }
+
+  // 正常に書けた＝シートが使える状態。ついでに退避分を少しだけ片付ける
+  try { retryStashedBatches_(RETRY_PER_REQUEST); } catch (err) { console.error('[RETRY] ' + err); }
+  return 'OK';
+}
+
+function stashBatch_(pt, n, dBlob, csq, reason) {
+  var rec = { pt: pt, n: n, d: dBlob, csq: csq, reason: reason,
+              at: new Date().toISOString(), attempts: 0 };
+  // キーは時刻順に並ぶようにする（再処理を古い順に行うため）
+  var key = RETRY_KEY_PREFIX + Date.now() + '_' + ('00000' + Math.floor(Math.random() * 100000)).slice(-5);
+  try {
+    PropertiesService.getScriptProperties().setProperty(key, JSON.stringify(rec));
+    console.error('[RETRY] 書けなかった受信データを退避: ' + key + ' pt=' + pt + ' n=' + n + ' 理由=' + reason);
+  } catch (err) {
+    // 退避すらできない。最後の手段として実行ログに全文を残す（Cloud Logging から復元できる）
+    console.error('[RETRY] ★退避にも失敗。データ全文: pt=' + pt + ' n=' + n + ' csq=' + csq +
+                  ' d=' + dBlob + ' 理由=' + reason + ' 退避エラー=' + err);
+  }
+}
+
+function perRecordHexLen_(pt, n, dBlob) {
+  if (pt === DECK_PT_STATIC) return DECK_STATIC_HEX_LEN;
+  if (pt === DECK_PT_EVENT)  return DECK_EVENT_HEX_LEN;
+  return dBlob.length / n;
+}
+
+function listStashedKeys_() {
+  return PropertiesService.getScriptProperties().getKeys()
+    .filter(function (k) { return k.indexOf(RETRY_KEY_PREFIX) === 0; })
+    .sort();
+}
+
+// 退避分を古い順に最大 maxCount 件再処理する。書けた件数を返す。
+function retryStashedBatches_(maxCount) {
+  var keys = listStashedKeys_();
+  if (!keys.length) return 0;
+  var props = PropertiesService.getScriptProperties();
+  var ss = getSpreadsheet();
+  var done = 0;
+
+  for (var k = 0; k < keys.length && k < maxCount; k++) {
+    var lock = LockService.getScriptLock();
+    if (!lock.tryLock(5000)) break;   // 混んでいるなら次の機会に回す
+    try {
+      // ★ロックを取ってから読み直す。並行した別の実行が先に処理していれば、もう消えている。
+      //   ロックの外で読んだ値で書くと、同じバッチを二重に書く。
+      var raw = props.getProperty(keys[k]);
+      if (!raw) continue;
+      var rec = JSON.parse(raw);
+      var perLen = perRecordHexLen_(rec.pt, rec.n, rec.d);
+      var r = ingestRecordsLocked_(ss, rec.pt, rec.n, perLen, rec.d, rec.csq);
+
+      if (r.failedAt < 0) {
+        props.deleteProperty(keys[k]);
+        done++;
+        console.log('[RETRY] 再処理で記録できました: ' + keys[k] + '（退避 ' + rec.at + '・' + (rec.attempts + 1) + '回目）');
+        continue;
+      }
+      // 途中まで書けたら、残りだけを持ち直す
+      rec.n -= r.failedAt;
+      rec.d = rec.d.substr(r.failedAt * perLen);
+      rec.attempts++;
+      rec.reason = r.error;
+      if (rec.attempts >= RETRY_MAX_ATTEMPTS && logRetryGiveUp_(ss, rec)) {
+        props.deleteProperty(keys[k]);
+        console.error('[RETRY] ★' + RETRY_MAX_ATTEMPTS + '回書けなかったため諦めました（' + RETRY_GIVEUP_SHEET + ' に全文）: ' + keys[k]);
+      } else {
+        props.setProperty(keys[k], JSON.stringify(rec));
+      }
+    } catch (err) {
+      console.error('[RETRY] 再処理中のエラー（退避分はそのまま残す）: ' + keys[k] + ' ' + err);
+    } finally {
+      try { lock.releaseLock(); } catch (e2) {}
+    }
+  }
+  return done;
+}
+
+function logRetryGiveUp_(ss, rec) {
+  try {
+    var sheet = ss.getSheetByName(RETRY_GIVEUP_SHEET) || ss.insertSheet(RETRY_GIVEUP_SHEET);
+    if (sheet.getLastRow() === 0) {
+      sheet.appendRow(['退避日時', '断念日時', 'pt', 'n', 'CSQ', '最後の理由', 'd（全文。復元に使う）']);
+      sheet.setFrozenRows(1);
+    }
+    sheet.appendRow([new Date(rec.at), new Date(), rec.pt || '(Flex)', rec.n, rec.csq, rec.reason, rec.d]);
+    return true;
+  } catch (err) {
+    return false;   // 記録できないなら消さずに持ち続ける
+  }
+}
+
+// 時間主導トリガから呼ばれる入口（installRetryTrigger で登録）
+function retryStashedBatches() {
+  var n = retryStashedBatches_(50);
+  var left = listStashedKeys_().length;
+  if (n || left) console.log('[RETRY] 定期再処理: 記録 ' + n + ' 件 / 残り ' + left + ' 件');
+}
+
+// メニュー［【初回のみ】受信データ再処理の自動実行を設定］。何度実行しても1つだけになる。
+function installRetryTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'retryStashedBatches') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('retryStashedBatches').timeBased().everyMinutes(10).create();
+  SpreadsheetApp.getUi().alert(
+    '受信データの再処理を10分ごとに自動実行するよう設定しました。\n\n' +
+    '現在退避されている受信データ: ' + listStashedKeys_().length + ' 件');
+}
+
+// メニュー［退避中の受信データを今すぐ再処理］
+function triggerRetryStashedNow() {
+  var before = listStashedKeys_().length;
+  var n = retryStashedBatches_(50);
+  SpreadsheetApp.getUi().alert(
+    '退避中 ' + before + ' 件のうち ' + n + ' 件を記録しました。残り ' + listStashedKeys_().length + ' 件。\n\n' +
+    '残りがある場合は、実行ログの [RETRY] に理由が出ています。');
+}
+
+
 // ================================
 // Webhook 受信本体（GET）
 // ================================
@@ -1842,18 +2236,24 @@ function doGet(e) {
         return ContentService.createTextOutput('stale: seq mismatch');
       }
 
+      // ★取り消した後に応答が届くことがある（Gateway がすでに送っていた）。子機には
+      //   実際に適用されているので事実として記録するが、履歴には分かるように書く。
+      var cancelledNote = (rec.state === 'cancelled') ? '　★取り消し後に届いた応答（子機には適用済み）' : '';
       rec.status        = statusNum;
       rec.attempts      = parseInt(p.attempts || '0', 10);
       rec.state = (rec.status === DL_STATUS_OK || rec.status === DL_STATUS_CLAMPED) ? 'done' : 'failed';
 
       if (rec.kind === 'deck') {
         rec.appliedTrigHex = isDeckResult ? deckTrigHex : '';
+        rec.childFw = (p.fw !== undefined && /^\d+$/.test(String(p.fw))) ? parseInt(p.fw, 10) : null;
+        rec.appliedCheck = deckAppliedCheck_(rec, statusNum, isDeckResult, deckTrigHex);
         dlSet_(childHex, rec);
         dlLog_(childHex, p.seq, '結果',
-               '要求: ' + deckTrigHexToText_(rec.trigHex || '') + '　→　適用: ' + applied,
-               dlStatusLabel_(rec) + '（' + rec.attempts + '回目で確定）', reportGroup);
+               '要求: ' + deckTrigHexToText_(rec.trigHex || '') + '　→　適用: ' + applied +
+               (rec.childFw !== null ? ('（子機FW ' + rec.childFw + '）') : ''),
+               dlStatusLabel_(rec) + '（' + rec.attempts + '回目で確定）' + cancelledNote, reportGroup);
         // deck_trigger シートの「状態」列にも書き戻す（現場はこのシートしか見ない）
-        updateDeckTriggerResult_(childHex, dlStatusLabel_(rec) +
+        updateDeckTriggerResult_(childHex, rec.seq, dlStatusLabel_(rec) +
                                  '　' + Utilities.formatDate(new Date(), 'Asia/Tokyo', 'MM/dd HH:mm'));
       } else {
         rec.appliedSleep  = parseInt(p.sleep  || '0', 10);
@@ -1863,7 +2263,7 @@ function doGet(e) {
         dlSet_(childHex, rec);
         dlLog_(childHex, p.seq, '結果',
                '要求: ' + rec.sleep + ' / ' + rec.avg + ' / ' + rec.median + '　→　適用: ' + applied,
-               dlStatusLabel_(rec) + '（' + rec.attempts + '回目で確定）', reportGroup);
+               dlStatusLabel_(rec) + '（' + rec.attempts + '回目で確定）' + cancelledNote, reportGroup);
       }
     } catch (err) {
       console.log('Downlink result lock error: ' + err);
@@ -1903,12 +2303,25 @@ function doGet(e) {
         return ContentService.createTextOutput('stale: seq mismatch');
       }
 
+      // ★確定済み（done / failed）・取り消し済みを sent に**戻さない**（Codexレビュー指摘）。
+      //   Gateway の報告が順序逆転して「結果 → 送信」の順に届くと、完了した予約が sent に戻り、
+      //   buildDownlinkLines_ が再び配信対象にして子機へ撃ち続ける。取り消しも同じく復活する。
+      //   Gateway 側（FW99追補）でも順序を守るようにしたが、旧ファームや再送の重複に備えてここでも止める。
+      if (sentRec.state !== 'queued' && sentRec.state !== 'sent') {
+        dlLog_(sentHex, p.seq, '送信(確定済み)', '',
+               '状態が ' + sentRec.state + ' のため sent に戻しません（報告の順序逆転・重複、または取り消し後の送信）',
+               sentGroup);
+        return ContentService.createTextOutput('stale: already ' + sentRec.state);
+      }
+
       sentRec.state = 'sent';
       sentRec.attempts = parseInt(p.attempts || '1', 10);
       dlSet_(sentHex, sentRec);
 
       dlLog_(sentHex, p.seq, '送信',
-             '間隔=' + sentRec.sleep + '分 / 平均=' + sentRec.avg + ' / メジアン=' + sentRec.median,
+             (sentRec.kind === 'deck')
+               ? ('トリガ設定: ' + deckTrigHexToText_(sentRec.trigHex || ''))
+               : ('間隔=' + sentRec.sleep + '分 / 平均=' + sentRec.avg + ' / メジアン=' + sentRec.median),
              sentRec.attempts + '回目（子機からの確認応答を待っています）', sentGroup);
     } catch (err) {
       console.log('Downlink sent lock error: ' + err);
@@ -2011,8 +2424,11 @@ function doGet(e) {
   var nRaw = String(p.n || '1');
   var n   = parseInt(nRaw, 10);
 
-  var ss = getSpreadsheet();
   var dBlob = String(p.d || '');
+  // ★スプレッドシートを開けないのは一時障害でありうる。ここで例外にするとバッチが消えるので、
+  //   null のまま進めて receiveTelemetry_ で退避させる（形式エラーのログだけは書けない）。
+  var ss = null;
+  try { ss = getSpreadsheet(); } catch (err) { console.error('[RECV] スプレッドシートを開けません: ' + err); }
 
   // nとdから1台分の長さを自己判別する。26=旧13B、28=新14B。
   // 割り切れない/未知長/非hexはパース位置がずれるため、ログを残して全件破棄する。
@@ -2022,93 +2438,42 @@ function doGet(e) {
   }
 
   // ★2026-09-12: Deck 子機（&pt=06 / 07）。Gateway FW98 以降が付けてくる。
-  //   **&pt= が無ければ従来の Flex 形式で、コードは1行も変わらない。**
+  //   **&pt= が無ければ従来の Flex 形式。**
   //   Gateway 側は 1バッチに同じ pktType のレコードしか入れないので、
   //   ここで pt を見れば1回のリクエスト全体の形式が決まる。
   var pt = String(p.pt || '');
-  if (pt === DECK_PT_STATIC || pt === DECK_PT_EVENT) {
-    return ContentService.createTextOutput(handleDeckBatch_(ss, pt, dBlob, n, csq));
-  }
-  if (pt !== '') {
+  var isDeckPt = (pt === DECK_PT_STATIC || pt === DECK_PT_EVENT);
+  if (pt !== '' && !isDeckPt) {
     logInvalidPayload_(ss, '未知の pt=' + pt + '（Code.gs 側が Gateway に追随していない可能性）', n, dBlob);
     return ContentService.createTextOutput('ERROR: unknown pt');
   }
+  var label = isDeckPt ? ('Deck(pt=' + pt + ')の') : '';
 
-  if (dBlob.length % n !== 0) {
-    logInvalidPayload_(ss, 'd.lengthがnで割り切れません', n, dBlob);
-    return ContentService.createTextOutput('ERROR: invalid d length');
-  }
-  var perDeviceHexLen = dBlob.length / n;
-  if (perDeviceHexLen !== 26 && perDeviceHexLen !== 28) {
-    logInvalidPayload_(ss, '1台分が26/28 hexではありません: ' + perDeviceHexLen, n, dBlob);
-    return ContentService.createTextOutput('ERROR: unsupported record length');
+  var perLen;
+  if (isDeckPt) {
+    perLen = (pt === DECK_PT_STATIC) ? DECK_STATIC_HEX_LEN : DECK_EVENT_HEX_LEN;
+    if (dBlob.length !== perLen * n) {
+      logInvalidPayload_(ss, label + '1件が' + perLen + ' hexではありません: ' + (dBlob.length / n), n, dBlob);
+      return ContentService.createTextOutput('ERROR: unsupported deck record length');
+    }
+  } else {
+    if (dBlob.length % n !== 0) {
+      logInvalidPayload_(ss, 'd.lengthがnで割り切れません', n, dBlob);
+      return ContentService.createTextOutput('ERROR: invalid d length');
+    }
+    perLen = dBlob.length / n;
+    if (perLen !== 26 && perLen !== 28) {
+      logInvalidPayload_(ss, '1台分が26/28 hexではありません: ' + perLen, n, dBlob);
+      return ContentService.createTextOutput('ERROR: unsupported record length');
+    }
   }
   if (!/^[0-9A-Fa-f]+$/.test(dBlob)) {
-    logInvalidPayload_(ss, 'dにhex以外の文字が含まれます', n, dBlob);
+    logInvalidPayload_(ss, label + 'dにhex以外の文字が含まれます', n, dBlob);
     return ContentService.createTextOutput('ERROR: non-hex payload');
   }
 
-  var lock = LockService.getScriptLock();
-  try {
-    lock.waitLock(10000);
-
-    for (var i = 0; i < n; i++) {
-      var chunk = dBlob.substr(i * perDeviceHexLen, perDeviceHexLen);
-      var d = parseGatewayRecord(chunk);
-      var profile = getProductProfile_(d.deviceId);
-      var displayCh = transformChannels_(d.ch, profile);
-      var measuredAt = new Date(d.epoch * 1000);
-
-      // DeviceID → 内部識別キー（クールダウン用）
-      var macHex = deviceIdHex_(d.deviceId);
-      var mac = '00-00-00-00-00-' + macHex;
-
-      // DeviceID → シート名（「シート名編集」シートで紐付け。未登録は 'databox' へ）
-      var sheetName = getDeviceSheetNameByMac(ss, mac) || 'databox';
-      // ★子機シート(child_XX)は無ければ自動作成する。databox等の既存シートを取り違えて
-      //   作ってしまわないよう、自動作成の対象は 'child_' で始まる名前だけに限定する。
-      var sheet;
-      if (sheetName.indexOf('child_') === 0) {
-        sheet = getOrCreateDeviceSheet_(ss, sheetName, profile);
-      } else {
-        sheet = ss.getSheetByName(sheetName);
-      }
-      if (!sheet) {
-        console.log('シートが見つかりません: ' + sheetName);
-        continue;
-      }
-
-      // 列構成（17列）。Gatewayは温度・CH Max/Minを送っていないため空欄:
-      // A:計測日時(Gateway epoch) B:DeviceID C:温度(℃、空欄)
-      // D:CH1 E:CH2 F:CH3 G:CH4
-      // H〜O: Max/Min（空欄）
-      // P:LTE-M RSSI Q:電池電圧(V。旧13B/255は空欄)
-      sheet.appendRow([
-        measuredAt,                                            // A: Gateway受信epoch由来の計測日時
-        d.deviceId,                                            // B: DeviceID
-        '',                                                    // C: 温度(未送信)
-        displayCh[0], displayCh[1], displayCh[2], displayCh[3],// D-G: 製品別に変換したCH1-4
-        '', '', '', '', '', '', '', '',                        // H-O: Max/Min(未送信)
-        csq,                                                   // P: LTE-M RSSI
-        d.battV,                                               // Q: 電池電圧(V)
-      ]);
-
-      // シート設定による従来アラートには製品別の表示値を渡す。
-      var dataObj = {
-        CH1: displayCh[0], CH2: displayCh[1], CH3: displayCh[2], CH4: displayCh[3],
-      };
-
-      checkAlertsForDeviceSheet(sheet, dataObj, mac);
-      checkProfileAlerts_(ss, profile, displayCh, mac, measuredAt);
-    }
-
-  } catch (err) {
-    console.log('Lock or append error: ' + err);
-  } finally {
-    try { lock.releaseLock(); } catch (e2) {}
-  }
-
-  return ContentService.createTextOutput('OK');
+  // 書込み・失敗時の退避・再処理は receiveTelemetry_ に集約（Flex と Deck で共通）
+  return ContentService.createTextOutput(receiveTelemetry_(ss, pt, n, perLen, dBlob, csq));
 }
 
 
