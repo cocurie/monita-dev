@@ -185,13 +185,22 @@ public:
 
   /**
    * 1 LSB あたりの入力換算電圧 [V]。
-   * FSR = ±VREF / Gain なので LSB = (2 × VREF / Gain) / 2^24。
-   * **外部リファレンス使用時 VREF = 1.25 V**（内蔵は 1.2 V）。
-   * 要件定義 F-7 の「LSB = (2.4/Gain)/2^24」は内蔵基準の式であり、
-   * 本機は外部基準なので **2.5/Gain** が正しい。
+   *
+   * **FSR = ±0.96 × VREF / Gain**（要件定義 §3.3 の表。SBAS949A）。
+   * したがって LSB = (2 × 0.96 × VREF / Gain) / 2^24。
+   * 外部リファレンス VREF = 1.25 V では **2.4/Gain**、ゲイン32 で **4.470 nV**、
+   * FSR は **±37.5 mV**（変位換算 ±15.8 mm）。
+   *
+   * ★係数 0.96 を落として `2 × VREF/Gain` としてはいけない。**4.17% のゲイン誤差**になる。
+   *   2026-09-12 に一度この誤りを入れ、外部レビューで指摘されて戻している。
+   *   FSR が内蔵基準（1.2 V）のときと同じ ±1.2 V/Gain になるのは偶然ではなく、
+   *   0.96 × 1.25 = 1.2 だからである。
+   *
+   * ★最終確認は実機で行うこと。既知電圧を入力し、読み値との比が 1.000 になることを見る。
    */
+  static constexpr double FSR_COEFF = 0.96;   // FSR = ±FSR_COEFF × VREF / Gain
   static double lsbVolts(uint8_t gainCode, double vref = 1.25) {
-    return (2.0 * vref / (double)(1u << gainCode)) / 16777216.0;
+    return (2.0 * FSR_COEFF * vref / (double)(1u << gainCode)) / 16777216.0;
   }
 
   /** CCITT CRC-16（多項式 0x1021 / シード 0xFFFF）。データシート 表8-7 */
