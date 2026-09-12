@@ -1527,24 +1527,49 @@ struct DownlinkReport {
   // ★Deck 用。true なら sleep/avg/median/wdt ではなく trig[] をGASへ送る
   bool     isDeck;
   uint8_t  trig[DECK_TRIG_BYTES];
+  uint8_t  childFw;  // Deck ACK に載る子機FWバージョン（GASで「どの版が適用したか」を残す）
+  uint32_t order;    // 積んだ順の通し番号。processReportQueue() はこの昇順で送る
 };
 #define MAX_REPORTS 32
 static DownlinkReport s_reports[MAX_REPORTS];
+static uint32_t s_reportOrder = 0;
+
+// ★報告は**積んだ順に**送らなければならない（Codexレビュー指摘）。
+//   以前は配列の先頭から空きを探して積み、先頭から送っていた。途中のスロットが先に空くと
+//   後から積んだ最終結果(downlink_result)が前のスロットに入り、先に積んだ中間報告
+//   (downlink_sent)より**先に**GASへ届く。GAS は done → sent に戻し、完了した予約が
+//   再び配信対象になって子機へ同じ設定を撃ち続ける。
+//   順序は order の昇順で決め、加えて最終結果を積むときは同じ予約の中間報告を消す（下）。
+
+// 同じ子機・同じ seq の未送信の中間報告を取り除く。最終結果が出た時点で意味が無くなり、
+// 残しておくと上の逆転の火種になる。
+static void dropSupersededReports(uint8_t childId, uint32_t seq) {
+  for (int i = 0; i < MAX_REPORTS; i++) {
+    if (s_reports[i].used && !s_reports[i].finalResult &&
+        s_reports[i].childId == childId && s_reports[i].seq == seq) {
+      s_reports[i].used = false;
+    }
+  }
+}
 
 // 空きスロットを1つ返す。満杯なら nullptr。
 // ★LTE-M不調でキューが満杯でも、最終結果を失うとGASの予約が未完了のまま残り、
 //   子機への再送が続いてしまう。中間報告(downlink_sent)は失ってもよいため、
-//   最終結果だけは既存の中間報告を上書きして優先する。
+//   最終結果だけは既存の中間報告を上書きして優先する。上書きするのは**最も古い**中間報告。
 static DownlinkReport* allocReportSlot(bool finalResult) {
   for (int i = 0; i < MAX_REPORTS; i++) {
     if (!s_reports[i].used) return &s_reports[i];
   }
   if (finalResult) {
+    DownlinkReport* oldest = nullptr;
     for (int i = 0; i < MAX_REPORTS; i++) {
-      if (!s_reports[i].finalResult) {
-        Serial.println(F("[REPORT] キュー満杯のため中間報告を最終結果で上書きします"));
-        return &s_reports[i];
+      if (!s_reports[i].finalResult && (oldest == nullptr || s_reports[i].order < oldest->order)) {
+        oldest = &s_reports[i];
       }
+    }
+    if (oldest != nullptr) {
+      Serial.println(F("[REPORT] キュー満杯のため最も古い中間報告を最終結果で上書きします"));
+      return oldest;
     }
   }
   Serial.println(F("[REPORT] キューが満杯のため報告を破棄しました"));
@@ -1554,6 +1579,7 @@ static DownlinkReport* allocReportSlot(bool finalResult) {
 static void queueReport(bool finalResult, uint8_t childId, uint8_t status,
                         uint16_t sleepMin, uint8_t avg, uint8_t median,
                         uint8_t attempts, uint32_t seq, uint16_t wdtMin = 0) {
+  if (finalResult) dropSupersededReports(childId, seq);
   DownlinkReport* r = allocReportSlot(finalResult);
   if (r == nullptr) return;
 
@@ -1569,11 +1595,14 @@ static void queueReport(bool finalResult, uint8_t childId, uint8_t status,
   r->seq         = seq;
   r->wdtMin      = wdtMin;
   r->isDeck      = false;
+  r->order       = s_reportOrder++;
 }
 
 // Deck 用の報告。trig=nullptr なら13バイトはゼロで埋める（未達の報告など）。
 static void queueDeckReport(bool finalResult, uint8_t childId, uint8_t status,
-                            const uint8_t* trig, uint8_t attempts, uint32_t seq) {
+                            const uint8_t* trig, uint8_t attempts, uint32_t seq,
+                            uint8_t childFw = 0) {
+  if (finalResult) dropSupersededReports(childId, seq);
   DownlinkReport* r = allocReportSlot(finalResult);
   if (r == nullptr) return;
 
@@ -1585,6 +1614,8 @@ static void queueDeckReport(bool finalResult, uint8_t childId, uint8_t status,
   r->attempts    = attempts;
   r->seq         = seq;
   r->isDeck      = true;
+  r->childFw     = childFw;
+  r->order       = s_reportOrder++;
   if (trig != nullptr) memcpy(r->trig, trig, DECK_TRIG_BYTES);
 }
 
@@ -1637,6 +1668,37 @@ static int hexNibble(char c) {
   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
   if (c >= 'a' && c <= 'f') return c - 'a' + 10;
   return -1;
+}
+
+// ★予約行の数値欄を厳密に読む（Codexレビュー指摘）。
+//   String::toInt() と strtoul() は**先頭の数字だけを読んで残りを黙って捨てる。**
+//   "12abc" → 12、"0Az" → 0x0A、"" → 0 がすべてエラーにならずに通り、GAS 側の
+//   組み立て誤りや通信の化けが「別の値の予約」として受理される。
+//   全文字が数字で、桁数が上限以内のときだけ true を返す。
+static bool parseDecStrict(const String& s, uint8_t maxDigits, unsigned long& out) {
+  const unsigned int len = s.length();
+  if (len == 0 || len > maxDigits) return false;
+  unsigned long v = 0;
+  for (unsigned int i = 0; i < len; i++) {
+    const char c = s.charAt(i);
+    if (c < '0' || c > '9') return false;
+    v = v * 10 + (unsigned long)(c - '0');
+  }
+  out = v;
+  return true;
+}
+
+static bool parseHexStrict(const String& s, uint8_t maxDigits, unsigned long& out) {
+  const unsigned int len = s.length();
+  if (len == 0 || len > maxDigits) return false;
+  unsigned long v = 0;
+  for (unsigned int i = 0; i < len; i++) {
+    const int n = hexNibble(s.charAt(i));
+    if (n < 0) return false;
+    v = (v << 4) | (unsigned long)n;
+  }
+  out = v;
+  return true;
 }
 
 // 16進文字列をバイト列へ。長さ不一致・非16進なら false（outは書き換えない）。
@@ -1702,21 +1764,36 @@ static void applyDownlinkCache(const String& body) {
     //   群検証も切り詰め後の値に対して行われるので、他群あての異常値が自群の実在IDに
     //   化けて誤配送される経路になっていた（avg/medianの257→1、sleepMinの65537→1も同じ）。
     //   したがって一旦 long / unsigned long のまま受けてから値域を見る。
-    unsigned long childIdRaw  = strtoul(line.substring(0, pos[0]).c_str(), nullptr, 16);
-    long          sleepMinRaw = line.substring(pos[0] + 1, pos[1]).toInt();
-    long          avgRaw      = line.substring(pos[1] + 1, pos[2]).toInt();
-    long          medianRaw   = line.substring(pos[2] + 1, pos[3]).toInt();
-    long          attemptsRaw = line.substring(pos[3] + 1, pos[4]).toInt();
-    long          seqRaw      = line.substring(pos[4] + 1, pos[5]).toInt();
     // ★7番目(mode)の終端は、8番目(trig)が有るかどうかで変わる。
-    //   ここを従来どおり「行末まで」にすると Deck 行では "0:AABB.." を toInt() することになり、
+    //   ここを従来どおり「行末まで」にすると Deck 行では "0:AABB.." を数値として読むことになり、
     //   0 に化けて**エラーにならずに誤った値が入る**。必ず区切ってから解釈する。
     String        modeField   = (found >= 7) ? line.substring(pos[5] + 1, pos[6])
                                              : line.substring(pos[5] + 1);
     String        trigField   = (found >= 7) ? line.substring(pos[6] + 1) : String("");
     modeField.trim();
     trigField.trim();
-    bool          statusOnly  = modeField.toInt() != 0;
+
+    // 桁数の上限：childId 2桁(16進) / sleep 4桁(≦1440) / avg・median 3桁 / attempts 3桁 / seq 9桁。
+    // seq を9桁で止めるのは、unsigned long(32bit) で桁あふれさせないため（GASの採番は1ずつ）。
+    unsigned long childIdRaw = 0, sleepMinU = 0, avgU = 0, medianU = 0, attemptsU = 0, seqU = 0;
+    const bool numsOk =
+        parseHexStrict(line.substring(0, pos[0]), 2, childIdRaw) &&
+        parseDecStrict(line.substring(pos[0] + 1, pos[1]), 4, sleepMinU) &&
+        parseDecStrict(line.substring(pos[1] + 1, pos[2]), 3, avgU) &&
+        parseDecStrict(line.substring(pos[2] + 1, pos[3]), 3, medianU) &&
+        parseDecStrict(line.substring(pos[3] + 1, pos[4]), 3, attemptsU) &&
+        parseDecStrict(line.substring(pos[4] + 1, pos[5]), 9, seqU) &&
+        (modeField == "0" || modeField == "1");
+    if (!numsOk) {
+      Serial.print(F("[CACHE] 数値欄が不正（数字以外・空欄・桁あふれ）のため無視: ")); Serial.println(line);
+      continue;
+    }
+    long          sleepMinRaw = (long)sleepMinU;
+    long          avgRaw      = (long)avgU;
+    long          medianRaw   = (long)medianU;
+    long          attemptsRaw = (long)attemptsU;
+    long          seqRaw      = (long)seqU;
+    bool          statusOnly  = (modeField == "1");
     const bool    isDeck      = (trigField.length() > 0);
 
     uint8_t trigBytes[DECK_TRIG_BYTES] = {0};
@@ -1793,8 +1870,13 @@ static void applyDownlinkCache(const String& body) {
 // 溜まった報告をGASへ送る。★loop()の安全な場所からのみ呼ぶこと
 // （loraPoll()の中から呼ぶとAT通信が入れ子になって破綻する）。
 static void processReportQueue() {
-  for (int i = 0; i < MAX_REPORTS; i++) {
-    if (!s_reports[i].used) continue;
+  for (;;) {
+    // 積んだ順（order 昇順）に1件ずつ取り出す。配列の並びは順序を表さない
+    int i = -1;
+    for (int k = 0; k < MAX_REPORTS; k++) {
+      if (s_reports[k].used && (i < 0 || s_reports[k].order < s_reports[i].order)) i = k;
+    }
+    if (i < 0) return;
 
     // GAS側は child を大文字16進2桁で判定する（/^[0-9A-F]{2}$/）ため、ここで整形する
     char childHex[3];
@@ -1814,6 +1896,7 @@ static void processReportQueue() {
       q += "&attempts="; q += String(s_reports[i].attempts);
       q += "&seq=";      q += String(s_reports[i].seq);
       q += "&trig=";     q += trigHex;
+      q += "&fw=";       q += String(s_reports[i].childFw);
     } else if (s_reports[i].finalResult) {
       q  = "action=downlink_result&child="; q += childHex;
       q += "&group=";    q += String(GATEWAY_GROUP_ID);
@@ -1832,8 +1915,12 @@ static void processReportQueue() {
     }
 
     Serial.print(F("[REPORT] GASへ報告: ")); Serial.println(q);
+    // ★送信中（sendAT の待機ループ内の loraPoll）に ACK が届くと、dropSupersededReports() が
+    //   このスロットを空け、新しい最終結果が**同じスロットに**入ることがある。
+    //   送信後に無条件で used=false にすると、その最終結果を消してしまう。order で本人確認する。
+    const uint32_t sentOrder = s_reports[i].order;
     if (postToGAS(q)) {
-      s_reports[i].used = false;
+      if (s_reports[i].used && s_reports[i].order == sentOrder) s_reports[i].used = false;
     } else {
       Serial.println(F("[REPORT] 報告に失敗。次サイクルで再送します"));
       return;  // 通信不調とみなし、残りは次回に回す
@@ -2829,6 +2916,15 @@ static void onDeckDownlinkAckReceived(const uint8_t* ack, uint8_t len) {
   const uint8_t childFw  = ack[3];
   const uint8_t* applied = &ack[4];
 
+  // ★status が定義外なら、完了扱いにせず捨てる（Codexレビュー指摘）。
+  //   長さが17バイトで型が 0x83 でも、中身が壊れていれば予約を止める根拠にならない。
+  //   捨てれば予約は active のまま残り、次の起床で再送される（最悪でも未達で終わる）。
+  //   適用値13バイトの値域はここでは見ない。GAS が子機と同じ検査で判定し、シートに出す。
+  if (status != DL_STATUS_OK && status != DL_STATUS_RANGE_ERROR && status != DL_STATUS_CLAMPED) {
+    Serial.print(F("[DOWNLINK] Deck ACKのstatusが定義外のため破棄: ")); Serial.println(status);
+    return;
+  }
+
   SentDownlink* sent = findLastSent(childId);
   if (sent == nullptr) {
     Serial.print(F("[DOWNLINK] 送信控えが無い子機0x")); Serial.print(childId, HEX);
@@ -2848,7 +2944,7 @@ static void onDeckDownlinkAckReceived(const uint8_t* ack, uint8_t len) {
   }
   Serial.println();
 
-  queueDeckReport(true, childId, status, applied, attempts, seq);
+  queueDeckReport(true, childId, status, applied, attempts, seq, childFw);
   sent->valid = false;  // この控えは消費した
 
   PendingDownlink* dp = findPending(childId);
