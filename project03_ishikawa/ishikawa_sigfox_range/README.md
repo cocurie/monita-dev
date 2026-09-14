@@ -1,0 +1,63 @@
+---
+title: 石川案件向け Monita Flex Sigfox ファームウェア（CH1レンジ＋気温ペイロード）
+domain: iot_device
+tags: [project03_ishikawa, Sigfox, HX711, Flex, v3.20, strain, range, experimental]
+updated: 2026-09-14
+---
+
+# project03_ishikawa 向け Monita Flex Sigfox ファームウェア
+
+## 目的
+
+project03_ishikawa案件向けに、Monita Flex v3.20の標準ペイロード（CH1-4 + 気温 + 電池電圧）のうち、
+スロット5・6を [CH1レンジ（max-min）, 気温] に差し替えたファームウェア。
+
+ベース: `case01_Flex/v3.20/`（同一スナップショットからコピー）。対象基板: Monita Flex v3.20。
+
+## ペイロード構成（12バイト）
+
+| バイト | 内容 | 単位 |
+|--------|------|------|
+| 0-1 | CH1 ひずみ | µε |
+| 2-3 | CH2 ひずみ | µε |
+| 4-5 | CH3 ひずみ | µε |
+| 6-7 | CH4 ひずみ | µε |
+| 8-9 | **CH5: CH1レンジ（max-min）** | µε |
+| 10-11 | **CH6: 気温** | ℃×10 |
+
+## 主な変更点（v3.20標準比）
+
+| 項目 | v3.20標準 | 本ファーム |
+|------|-----------|-----------|
+| スロット5 | 気温 | **CH1レンジ（max-min）** |
+| スロット6 | 電池電圧 | **気温** |
+| 電池電圧 | 送信する | **送信しない**（`measureBatt()`は呼ぶがペイロードに含めない） |
+| CH1レンジの計算 | BLE/LoRaモードのみ | **全モード（Sigfoxでも）で計算** |
+
+CH1のレンジ（`chRange[0]`）は、v3.20のBLE/LoRaモードに元々あった「MEASURE_COUNT回の平均値群の最大-最小」の仕組みをそのまま流用している（ひずみ値と同じ単位・STRAIN_SCALEで換算済み）。
+
+CH2〜4のレンジも内部的には計算されているが（`chRange[1..3]`）、本ファームでは送信しない。必要になればペイロード再設計を検討する。
+
+## それ以外の設定（v3.20標準のまま・要現場確認）
+
+- `CH_ASSIGN[4] = {1, 1, 1, 1}`（4CHともひずみ想定。現場のセンサー構成に応じて要変更）
+- `STRAIN_SCALE`（要校正）
+- `SLEEP_MINUTES`（送信間隔。要現場確認）
+- `DEVICE_ID`（機体ごとに焼き分け。Sigfoxモードでは未使用）
+
+## ハード
+
+- ボード: XIAO nRF52840（Monita Flex v3.20基板）
+- HX711: 4CH（SN74LV4052 MUX経由、TCA9534でA/B制御）
+
+## ビルド
+
+```bash
+pio run
+pio run --target upload
+```
+
+## 関連
+
+- ベースファーム: `case01_Flex/v3.20/`
+- 同種の実装前例: `project01_YCE/yce_sigfox_range/`（v3.02ベース、CH1・CH3レンジ版。電池・気温の代わりにレンジ2種を送信する方式は同じ考え方）
