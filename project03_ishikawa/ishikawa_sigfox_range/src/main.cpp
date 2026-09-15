@@ -171,7 +171,7 @@ static_assert(((DEVICE_ID) & 0x1F) != 0,
 #if DOWNLINK_E2E_TEST
 #define SLEEP_MINUTES        2         // 【テスト用】1サイクル後のスリープ時間（分）
 #else
-#define SLEEP_MINUTES        60        // 1サイクル後のスリープ時間（分）
+#define SLEEP_MINUTES        720       // 1サイクル後のスリープ時間（分）。project03_ishikawa: 12時間に1回送信（2026-09-15）
 #endif
 #define BOOT_BLUE_MS         500      // 電源 ON 後の青点灯時間（ms）
 // ── タレ（ゼロ点補正）操作 ─────────────────────────────────────
