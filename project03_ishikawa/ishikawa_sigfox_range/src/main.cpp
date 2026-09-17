@@ -1576,6 +1576,16 @@ static void measureAll() {
           hxRead(&ch[i], &range);
           // レンジも生値→ひずみ値（με）変換で単位を揃える
           chRange[i] = (int)(range / STRAIN_SCALE);
+          // ★2026-09-18: レンジが 0 で送信される件の切り分け用ログ。
+          //   生値レンジが STRAIN_SCALE（1µε 相当のカウント数）未満だと
+          //   整数化で 0 に落ちる。生値と換算後の両方を出す。
+          Serial.print("[CH");
+          Serial.print(i + 1);
+          Serial.print(" RANGE] raw=");
+          Serial.print(range, 1);
+          Serial.print(" counts -> ");
+          Serial.print(chRange[i]);
+          Serial.println(" ue");
         }
         // 生値 → ひずみ値（με）変換
         ch[i] = (int)((float)ch[i] / STRAIN_SCALE);
