@@ -40,6 +40,13 @@ constexpr uint32_t ROLLING_WINDOW_MS = 3600000UL;
 constexpr uint32_t MAX_ACTIVITY_MS = 180000UL;
 constexpr uint32_t DOWNLINK_WINDOW_MS = 2000UL;
 constexpr uint32_t PIR_STUCK_MS = 10000UL;
+// ★週次レビュー B18: E220 が設定コマンドに続けて応答しないとき、3V3_SW を入れ直して復旧を試みる。
+//   Gateway では「E220 の受信不能ラッチは MCU リセットでは解除されない」ことを実機で確認している
+//   （gateway_v1.21 main.cpp loraKickTx() のコメント）。PIR 版は PIR 給電のため 3V3_SW を常時 ON に
+//   しており、これまで E220 の電源を切る経路が無かった。
+constexpr uint8_t RADIO_POWER_CYCLE_AFTER_FAILS = 2;  // 連続この回数の報告で設定確認に失敗したら入れ直す
+constexpr uint32_t RADIO_POWER_OFF_MS = 1000UL;
+constexpr uint32_t RADIO_POWER_ON_SETTLE_MS = 500UL;  // センサ版 loop() の電源投入後待ちと同じ値
 
 enum class State : uint8_t { WAIT, SCAN, REPORT_SNAPSHOT, TX, RX_WINDOW };
 
@@ -100,6 +107,9 @@ bool s_pirArmed = false;
 bool s_pirQuarantined = false;
 uint32_t s_pirHighSince = 0;
 bool s_resetAfterAck = false;
+#ifdef COMM_MODE_LORA
+uint8_t s_radioFailStreak = 0;  // 設定確認に続けて失敗した報告の回数（B18）
+#endif
 uint32_t s_pirNrfPin = 0;
 constexpr uint8_t PIR_PPI_CHANNEL = 15;  // SoftDeviceでアプリ利用可能なPPI 8..19から専用確保
 
@@ -373,6 +383,49 @@ void takeReportSnapshot() {
     s_nextReportAt = millis() + static_cast<uint32_t>(s_settings.reportIntervalMin) * 60000UL;
 }
 
+// ★2026-09-22（週次レビュー B17）: 送信できなかった期間の集計を捨てずに、進行中の期間へ合算する。
+//   以前は送信の成否に関わらずスナップショットを消していたため、無線の不調1回で
+//   その期間（既定60分）の人数・PIRイベント数が丸ごと失われていた。
+//   合算した次回の報告は2期間ぶんを表す（最大人数は大きい方、平均は合計÷スキャン回数で正しく出る）。
+void returnSnapshotToActive() {
+  taskENTER_CRITICAL();
+  if (s_snapshot->maxPeople > s_active->maxPeople) s_active->maxPeople = s_snapshot->maxPeople;
+  s_active->sumPeople          += s_snapshot->sumPeople;
+  s_active->scanCount          += s_snapshot->scanCount;
+  s_active->rawWakeCount       += s_snapshot->rawWakeCount;
+  s_active->pirEventCount      += s_snapshot->pirEventCount;
+  s_active->holdoffSuppressed  += s_snapshot->holdoffSuppressed;
+  s_active->rateSuppressed     += s_snapshot->rateSuppressed;
+  s_active->droppedDeviceCount += s_snapshot->droppedDeviceCount;
+  memset(s_snapshot, 0, sizeof(*s_snapshot));
+  taskEXIT_CRITICAL();
+}
+
+#ifdef COMM_MODE_LORA
+// B18: 3V3_SW を入れ直して E220 を電源から再起動し、設定確認をやり直す。成功なら true。
+//   同じレールの PIR も一度落ちるので、入れ直し後は pirHoldoffSec のあいだ PIR 通知を抑止する
+//   （電源投入直後の誤検知を人数計測に入れないため。抑止した通知は holdoffSuppressed に数える）。
+//   PIR の入力ピンは HX711 DOUT と共用で、setPeripheralPower(false) が切り離すので付け直す。
+bool powerCycleRadio() {
+  Serial.println("[LORA] E220が続けて応答しないため3V3_SWを入れ直します（PIRも一時停止）");
+  one::endRadioUart();
+  disarmPirSense();
+  one::setPeripheralPower(false);
+  delay(RADIO_POWER_OFF_MS);
+  one::setPeripheralPower(true);
+  pinMode(ONE_DOUT_PIN, INPUT_PULLDOWN);
+  s_pirHighSince = 0;
+  s_pirQuarantined = false;
+  s_holdoffUntil = millis() + static_cast<uint32_t>(s_settings.pirHoldoffSec) * 1000UL;
+  one::beginRadioUart();
+  delay(RADIO_POWER_ON_SETTLE_MS);
+  one::watchdogFeed();
+  const bool ok = one::checkAndConfigureLoRa();
+  Serial.println(ok ? "[LORA] 入れ直し後に設定確認OK" : "[LORA] ★入れ直し後も設定確認に失敗");
+  return ok;
+}
+#endif
+
 #ifdef COMM_MODE_LORA
 void sendDownlinkAck(uint8_t status) {
   const uint8_t ack[] = {0x05, DEVICE_ID, status,
@@ -427,21 +480,32 @@ void transmitSnapshot() {
       static_cast<uint8_t>(charge)};
   Serial.print("[REPORT] batt_mV="); Serial.print(input.batteryMv);
   Serial.print(" charge="); Serial.println(one::chargeStateName(charge));
+  bool sent = false;
 #ifdef COMM_MODE_LORA
   one::beginRadioUart();
-  if (one::checkAndConfigureLoRa()) {
+  bool ready = one::checkAndConfigureLoRa();
+  if (!ready && ++s_radioFailStreak >= RADIO_POWER_CYCLE_AFTER_FAILS) {
+    ready = powerCycleRadio();
+    // 入れ直しても駄目なら、次の報告でもう一度入れ直す（毎報告1回まで）。
+  }
+  if (ready) {
+    s_radioFailStreak = 0;
     uint8_t payload[one::LORA_PAYLOAD_SIZE];
     one::buildPirLoRaPayload(input, DEVICE_ID, FW_VERSION, payload);
     one::sendLoRaFrame(payload, sizeof(payload));
     delay(300);
     one::sendLoRaFrame(payload, sizeof(payload));
     delay(300);
+    // 送信の成否は「E220が設定コマンドに応答した＝UART経由で届いた」ことで判定する。
+    // AUXの完了待ちは v1.1 基板で実機未検証のため、成否の判定には使っていない。
+    sent = true;
     s_state = State::RX_WINDOW;
     uint8_t downlink[32], length = 0;
     if (one::receiveLoRaFrame(downlink, sizeof(downlink), length, DOWNLINK_WINDOW_MS))
       applyPirDownlink(downlink, length);
   } else {
-    Serial.println("[LORA] 設定確認失敗、送信中止");
+    Serial.print("[LORA] 設定確認失敗、送信中止（連続"); Serial.print(s_radioFailStreak);
+    Serial.println("回目）。集計は次回へ持ち越します");
   }
   one::endRadioUart();
   one::setLoRaModeSleep();
@@ -449,11 +513,13 @@ void transmitSnapshot() {
   one::beginRadioUart();
   uint8_t payload[one::SIGFOX_PAYLOAD_SIZE];
   one::buildPirSigfoxPayload(input, one::readCpuTemperatureDeciC(), payload);
-  if (!one::sendSigfoxPayload(payload, sizeof(payload))) Serial.println("[SIGFOX] 送信失敗");
+  sent = one::sendSigfoxPayload(payload, sizeof(payload));
+  if (!sent) Serial.println("[SIGFOX] 送信失敗。集計は次回へ持ち越します");
   one::endRadioUart();
   // LSM100Aの低消費モード契約は仕様未確定。3V3_SWはPIRのため落とさない。
 #endif
-  memset(s_snapshot, 0, sizeof(*s_snapshot));
+  if (sent) memset(s_snapshot, 0, sizeof(*s_snapshot));
+  else      returnSnapshotToActive();  // B17
   s_state = State::WAIT;
   one::watchdogFeed();  // TX/RX状態遷移完了のチェックポイント
   if (s_resetAfterAck) {

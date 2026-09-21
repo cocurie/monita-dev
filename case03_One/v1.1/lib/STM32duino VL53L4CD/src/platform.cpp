@@ -116,6 +116,11 @@ uint8_t VL53L4CD::VL53L4CD_I2CRead(uint8_t DeviceAddr, uint16_t RegisterAddress,
 {
   int status = 0;
   uint8_t buffer[2];
+  // ★Monita改変（2026-09-22）: 上流は endTransmission が成功するまで回数無制限に再試行するため、
+  //   センサ未接続・NACK応答が続くと戻らず、WDTリセットまで計測が止まる。
+  //   回数を限り、失敗は呼出し元へエラーとして返す（上流 1.0.5 からの差分はこの関数のみ）。
+  const uint8_t kMaxAddrRetries = 3;
+  uint8_t tries = 0;
 
   // Loop until the port is transmitted correctly
   do {
@@ -138,7 +143,8 @@ uint8_t VL53L4CD::VL53L4CD_I2CRead(uint8_t DeviceAddr, uint16_t RegisterAddress,
 #endif
     // End of fix
 
-  } while (status != 0);
+  } while (status != 0 && ++tries < kMaxAddrRetries);
+  if (status != 0) return 1;
 
   uint32_t i = 0;
   if (size > DEFAULT_I2C_BUFFER_LEN) {
@@ -146,8 +152,9 @@ uint8_t VL53L4CD::VL53L4CD_I2CRead(uint8_t DeviceAddr, uint16_t RegisterAddress,
       // If still more than DEFAULT_I2C_BUFFER_LEN bytes to go, DEFAULT_I2C_BUFFER_LEN,
       // else the remaining number of bytes
       uint8_t current_read_size = (size - i > DEFAULT_I2C_BUFFER_LEN ? DEFAULT_I2C_BUFFER_LEN : size - i);
-      dev_i2c->requestFrom(((uint8_t)((DeviceAddr >> 1) & 0x7F)),
-                           current_read_size);
+      // ★Monita改変: 1バイトも返らない場合に while(i < size) が永久に回らないよう打ち切る
+      if (dev_i2c->requestFrom(((uint8_t)((DeviceAddr >> 1) & 0x7F)),
+                               current_read_size) == 0) break;
       while (dev_i2c->available()) {
         p_values[i] = dev_i2c->read();
         i++;

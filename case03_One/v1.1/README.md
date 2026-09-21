@@ -36,6 +36,8 @@ pio run -e one_pir_sigfox
 
 ## 構成
 
+- `lib/STM32duino VL53L4CD`: 上流1.0.5に改変あり。`src/platform.cpp` の `VL53L4CD_I2CRead()` の
+  無制限再試行を3回までに制限（センサ未接続で戻らなくなるため）。上流へ差し替えたら当て直すこと
 - `src/one_hal.*`: ピン、反転MOSFET電源と逆給電対策、専用I2C、VBAT/CPU温度、充電状態、E220（AUX待ち）、Sigfox UART、WDT、InternalFS/CRC
 - `src/one_status.h`: 充電状態の判定（Arduino非依存の純粋関数）
 - `src/one_payload.*`: LoRa 19B / Sigfox 12B生成と、丸め・飽和・電池圧縮の純粋関数
@@ -104,6 +106,8 @@ holdoffSec(2,BE) maxScansPerHour scanDurationSec
 
 PIRはGPIOTE IN eventを割り当てません。GPIO `SENSE=HIGH`のPORTイベントをPPI channel 15でEGU3へ転送し、ISRではPORT/LATCHのclearとタスク通知だけを行います。タスク側でSENSEをdisarmし、PIRがLOWへ戻ってからrearmします。HIGHが10秒続いた場合は張り付きとしてquarantineし、LOW復帰時だけ解除します。
 
+送信できなかった期間の集計は捨てずに次の期間へ合算します（FW 6〜。LoRaは設定確認の失敗、Sigfoxは送信失敗を「送れなかった」とみなす。AUXの完了待ちは実機未検証のため判定に使わない）。LoRa版は、設定確認に2回続けて失敗すると3V3_SWを1秒切ってE220を電源から再起動します。同じレールのPIRも落ちるため、入れ直し後は`pirHoldoffSec`のあいだPIR通知を抑止します（FW 6〜）。
+
 BLEはpassive、interval/window=150/100ms、初期スキャン30秒、RSSI=-65、MIN_HITS=10、merge gap=3、最大64台です。MACはスキャンRAMだけに保持し、停止直後に全領域をゼロクリアします。flash、Serial、ペイロードには出力しません。
 
 ## ペイロード
@@ -121,7 +125,7 @@ LoRaはPkt type `0x04`の19B固定です。PIR版はCH1=最大人数、CH2=平�
 
 Sigfox 12B契約は正本でも未確定です。本実装では既存Flex互換の`CH1..4 + temperature×10 + battery mV`を暫定採用し、PIRのCH意味・欠測・飽和はLoRaと揃えています。backend確定時に双方を同時更新してください。
 
-`FW_VERSION`は`platformio.ini`で定義します。ファーム更新コミットではインクリメントしてください。0x04まではv1.00基板用、0x05以降がv1.1基板用です。
+`FW_VERSION`は`platformio.ini`で定義します。ファーム更新コミットではインクリメントしてください。版数は10進で書きます（4まではv1.00基板用、5以降がv1.1基板用）。
 
 ### DEVICE_ID（子機ID）の設定
 
@@ -168,6 +172,7 @@ v1.00基板で確認済み（2026-08-26。詳細は `【7】Monita/01_開発/開
 - AUX待ちでタイムアウトが出ないこと、送信・ダウンリンク受信が v1.00 と同等に成功すること
 - CHRG / DONE の表示が充電LEDと一致すること。夜間（VIN=0V）に `invalid` / `charging` と誤表示しないか
 - ポゴピン経由のVBAT ADC実測校正
+- PIR版でE220のUARTを外して設定確認を2回失敗させ、3V3_SWの入れ直し後に送信が復帰し、PIRの誤検知が抑止されること（FW 6）
 
 v1.00から引き続き未確認:
 
