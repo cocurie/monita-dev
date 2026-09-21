@@ -42,7 +42,7 @@ c++ -std=c++11 -Wall -Wextra -pedantic \
 
 `setPeripheralPower()`だけがMOSFETゲートを操作します。OneではLOW=ON / HIGH=OFFです。電源断前にLORA_MODEをLOWへ戻し、UARTを`Serial1.end()`で閉じます。PIR版だけはPIR給電のため3V3_SWを常時ONとし、LoRa待機中はE220をMode 3へ置きます。
 
-VBATはAdafruit variantの`VBAT_ENABLE`（LOW=測定有効）と`PIN_VBAT=P0.31`を使用します。ADC既定レンジ3.6Vと、1510kΩ/510kΩの分圧比を整数演算で復元します。
+VBATはAdafruit variantの`VBAT_ENABLE`（LOW=測定有効）と`PIN_VBAT=P0.31`を使用します。ADC既定レンジ3.6Vと、XIAO内蔵の分圧（上1MΩ／下510kΩ、比1510/510）を整数演算で復元します。**2026-09-16以前のビルドは比を2020/510で計算しており、電池電圧を約1.34倍高く読んでいました。**
 
 ## 設定とダウンリンク
 

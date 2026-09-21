@@ -65,6 +65,12 @@ void halBegin() {
   pinMode(ONE_MOSFET_GATE_PIN, OUTPUT);
   digitalWrite(ONE_MOSFET_GATE_PIN, HIGH);
   s_powerOn = false;
+  // ★VBAT_ENABLE(P0.14)は常時LOW。分圧は BAT+ ─1MΩ─ P0.31 ─510kΩ─ P0.14。
+  // P0.14をHIGH(3.3V)にするとP0.31は 3.3+(4.2-3.3)×510/1510 ≒ 3.60V となり、
+  // 満充電時にnRF52840の絶対最大定格(VDD+0.3V)の上限へ達する(Seeed Wikiの注意)。
+  // LOW固定時の分圧電流は約3µA(4.2V/1.51MΩ)で、消費への影響は無視できる。
+  pinMode(VBAT_ENABLE, OUTPUT);
+  digitalWrite(VBAT_ENABLE, LOW);
 }
 
 void setPeripheralPower(bool on) {
@@ -212,15 +218,16 @@ bool sendSigfoxPayload(const uint8_t *payload, size_t length) {
 
 uint16_t readBatteryMv() {
   // variant.hの実値: VBAT_ENABLE=P0.14/D14、LOWで分圧回路が有効。
+  // ★読取後もHIGHに戻さない(halBegin()の注意を参照)。念のためここでもLOWを確定する。
   pinMode(VBAT_ENABLE, OUTPUT);
   digitalWrite(VBAT_ENABLE, LOW);
   delay(2);
   analogReadResolution(12);
   const uint32_t raw = analogRead(PIN_VBAT);
-  digitalWrite(VBAT_ENABLE, HIGH);
   // Adafruit nRF52 coreのAR_DEFAULTは0.6V×6=3.6V full-scale。
-  // 1510k/510kの分圧比を復元し、整数のround half upでmV化する。
-  const uint64_t numerator = static_cast<uint64_t>(raw) * 3600ULL * 2020ULL;
+  // 分圧 1MΩ(上)/510kΩ(下) の比 (1000k+510k)/510k を復元し、整数のround half upでmV化する。
+  // ★FW 0x04初版までは 2020/510 で計算しており約1.34倍高く読んでいた(2026-09-16修正)。
+  const uint64_t numerator = static_cast<uint64_t>(raw) * 3600ULL * 1510ULL;
   const uint32_t mv = static_cast<uint32_t>((numerator + 4095ULL * 510ULL / 2ULL) /
                                              (4095ULL * 510ULL));
   return mv > 65535U ? 65535U : static_cast<uint16_t>(mv);
