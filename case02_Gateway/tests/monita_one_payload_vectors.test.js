@@ -9,7 +9,7 @@ const gasPath = path.join(__dirname, '..', 'gas', 'one', 'Code.gs');
 const context = vm.createContext({ console });
 vm.runInContext(
   fs.readFileSync(gasPath, 'utf8') +
-    '\nthis.__gasTestApi = { parseGatewayRecord, getProductProfile_, transformChannels_, profileAlertTriggered_, checkAlertsForProductProfile_ };',
+    '\nthis.__gasTestApi = { parseGatewayRecord, getProductProfile_, transformChannels_, profileAlertTriggered_, checkAlertsForProductProfile_, decodeChargeState_, PRODUCT_PROFILES };',
   context,
   { filename: gasPath }
 );
@@ -115,6 +115,35 @@ vectors.forEach((v) => {
   }
 });
 
+// GV-1〜GV-5は充電状態0（v1.00互換）。CH4のスキャン回数は充電状態のbitに影響されない。
+vectors.forEach((v) => {
+  const decoded = decodeOne(v.chunk);
+  assert.strictEqual(gas.decodeChargeState_(decoded.record.ch, decoded.profile), '日照なし/未接続', v.name + ' charge');
+});
+
+// GV-7: One-PIR CH4 = スキャン回数4 | 充電中(1)<<13（One v1.1 FW 0x05〜）。
+const gv7 = buildGatewayChunk('04 0F 01 05 00 23 00 0B 00 04 20 8C 0F 00 00 00 00 00 00', true);
+assert.strictEqual(gv7, '3412A0680F050023000B000420C4', 'GV-7 V2 chunk');
+const d7 = decodeOne(gv7);
+assert.deepStrictEqual(d7.values, [5, 3.5, 11, 4], 'GV-7 scan count masked');
+assert.strictEqual(gas.decodeChargeState_(d7.record.ch, d7.profile), '充電中', 'GV-7 charge');
+// 上限: 32767 = スキャン回数8191 | 異常(3)<<13。
+const packed = decodeOne('3412A0680F050023000B00FF7FC4');
+assert.strictEqual(packed.values[3], 8191, 'packed scan count');
+assert.strictEqual(gas.decodeChargeState_(packed.record.ch, packed.profile), '異常(CHRG/DONE同時)', 'packed charge');
+
+// GV-8: One-Sensor CH4 = 満充電(2)。
+const sensorProfile = gas.PRODUCT_PROFILES.ONE_SENSOR;
+const gv8 = gas.parseGatewayRecord(
+  buildGatewayChunk('04 0F 05 D2 04 FF FF FF FF 02 00 74 0E 00 00 07 00 00 00', true)
+);
+assert.deepStrictEqual(Array.from(gas.transformChannels_(gv8.ch, sensorProfile)), [1234, '', '', 2], 'GV-8 values');
+assert.strictEqual(gas.decodeChargeState_(gv8.ch, sensorProfile), '満充電', 'GV-8 charge');
+// v1.00基板(FW 0x04以前)の標準センサ版はCH4=-1 → 充電状態は空欄。
+assert.strictEqual(gas.decodeChargeState_([1234, -1, -1, -1], sensorProfile), '', 'legacy sensor charge blank');
+// Flexは充電状態を持たない。
+assert.strictEqual(gas.decodeChargeState_([1, 2, 3, 4], gas.getProductProfile_(0x01)), '', 'Flex charge blank');
+
 // GV-6: 電池の下限飽和と不明センチネル。
 assert.strictEqual(encodeBatt(2800), 0);
 assert.strictEqual(encodeBatt(3000), 0);
@@ -147,4 +176,4 @@ gas.checkAlertsForProductProfile_(
 assert.strictEqual(legacyAlertCalls, 1, 'One-PIR skips legacy strain alert path');
 assert.strictEqual(profileAlertCalls, 2, 'One-PIR profile alert path');
 
-console.log('GV-1〜GV-6: legacy/V2 chunk, GAS decode, and alert routing OK');
+console.log('GV-1〜GV-8: legacy/V2 chunk, GAS decode, charge state, and alert routing OK');

@@ -7,7 +7,7 @@
 // ================================
 // バージョン対応表
 // ================================
-//   GASスクリプトバージョン: 10
+//   GASスクリプトバージョン: 11
 //     - v1〜3: 旧フォーマット（case02_Gateway/firmware/gateway_v1.1 対応）
 //     - v4: project07_NEXCO 専用フォーマットに対応（2026-07-25）
 //       ペイロード: 26B/台 = 52 hex文字
@@ -26,6 +26,8 @@
 //     - v9: Gatewayの旧13B/新14Bレコードを自動判別し、電池電圧・Gateway epoch・
 //       DEVICE_ID台帳による製品別の列名/単位/スケール/アラート定義へ対応（2026-08-16）
 //     - v10: check_cmdの群別ダウンリンク配信と、送信・結果報告のACK所有権検証に対応（2026-08-28）
+//     - v11: One v1.1（FW 0x05〜）の充電状態をCH4から復号し、R列「充電状態」へ出力（2026-09-16）。
+//       One-PIRのCH4はスキャン回数(bit0〜12)と充電状態(bit13〜14)を同居させるためマスクして表示
 //
 //   対応する子機ファーム:
 //     - project07_NEXCO/firmware/src/main.cpp（COMM_MODE_BLE、本番項目用）
@@ -53,6 +55,7 @@
 //   O: CH4 Min(με)
 //   P: LTE-M RSSI(CSQ)
 //   Q: 電池電圧(V)（旧13B形式または値255の場合は空欄）
+//   R: 充電状態（One v1.1のみ。Flex・欠測は空欄）
 // ================================
 
 
@@ -647,18 +650,24 @@ const PRODUCT_PROFILES = {
       { key: 'CH4', label: 'CH4 メジアン', unit: 'με', scale: 1 },
     ],
   },
-  // 根拠: case03_One/v1.00/src/one_payload.cpp buildSensorLoRaPayload()（CH1実測、CH2〜CH4=MISSING_VALUE(-1)）。
+  // 根拠: case03_One/v1.1/src/one_payload.cpp buildSensorLoRaPayload()
+  // （CH1実測、CH2〜CH3=MISSING_VALUE(-1)、CH4=充電状態0〜3。v1.00基板のFW 0x04以前はCH4=-1）。
+  // chargeStateを定義した製品は、そのCHの (値 >> shift) & 3 を R列「充電状態」へ出す。
   ONE_SENSOR: {
     productType: 'One-Sensor',
+    chargeState: { channel: 3, shift: 0 },
     channelDefs: [
       { key: 'CH1', label: 'CH1 メジアン', unit: 'με', scale: 1 },
       { key: 'CH2', label: 'CH2（未使用）', unit: 'με', scale: 1, missingValues: [-1] },
       { key: 'CH3', label: 'CH3（未使用）', unit: 'με', scale: 1, missingValues: [-1] },
-      { key: 'CH4', label: 'CH4（未使用）', unit: 'με', scale: 1, missingValues: [-1] },
+      { key: 'CH4', label: '充電状態コード', unit: '', scale: 1, missingValues: [-1] },
     ],
   },
+  // 根拠: case03_One/v1.1/src/one_payload.cpp buildPirLoRaPayload()
+  // （CH4 = スキャン回数(bit0〜12、8191で飽和) | 充電状態(bit13〜14)）。
   ONE_PIR: {
     productType: 'One-PIR',
+    chargeState: { channel: 3, shift: 13 },
     rowMissingWhen: { channel: 0, value: -1, blankChannels: [0, 1] },
     channelDefs: [
       { key: 'CH1', label: '最大人数', unit: '人', scale: 1, missingValues: [-1] },
@@ -671,10 +680,12 @@ const PRODUCT_PROFILES = {
           message: 'PIRイベント数が32767に張り付いています。PIR故障の疑いがあります。',
         },
       },
-      { key: 'CH4', label: 'スキャン回数', unit: '回', scale: 1, zeroMeansNoMeasurement: true },
+      { key: 'CH4', label: 'スキャン回数', unit: '回', scale: 1, bitMask: 0x1FFF, zeroMeansNoMeasurement: true },
     ],
   },
 };
+// 充電モジュール(CN3063)のCHRG/DONEを子機が0〜3へ符号化した値の表示名（one_status.h ChargeState）。
+const CHARGE_STATE_LABELS = ['日照なし/未接続', '充電中', '満充電', '異常(CHRG/DONE同時)'];
 const DEFAULT_PRODUCT_TYPE = 'FLEX';
 const DEVICE_PRODUCT_REGISTRY = {
   '0F': 'ONE_PIR',
@@ -949,9 +960,19 @@ function transformChannels_(rawCh, profile) {
   return profile.channelDefs.map(function (def, index) {
     if (rowMissing && profile.rowMissingWhen.blankChannels.indexOf(index) >= 0) return '';
     if (valueIsMissing_(rawCh[index], def)) return '';
-    var value = rawCh[index] * (def.scale === undefined ? 1 : def.scale);
+    // bitMaskを持つCHは同居する別フィールド（充電状態など）を除いてから換算する。
+    var raw = def.bitMask === undefined ? rawCh[index] : (rawCh[index] & def.bitMask);
+    var value = raw * (def.scale === undefined ? 1 : def.scale);
     return def.decimals === undefined ? value : Number(value.toFixed(def.decimals));
   });
+}
+
+// 製品プロファイルのchargeStateに従い、充電状態の表示名を返す。対象外の製品・欠測(負値)は空欄。
+function decodeChargeState_(rawCh, profile) {
+  if (!profile.chargeState) return '';
+  var raw = rawCh[profile.chargeState.channel];
+  if (raw < 0) return '';
+  return CHARGE_STATE_LABELS[(raw >> profile.chargeState.shift) & 0x03];
 }
 
 
@@ -1011,6 +1032,7 @@ function getOrCreateDeviceSheet_(ss, sheetName, profile) {
     'CH3 Max(με)', 'CH3 Min(με)', 'CH4 Max(με)', 'CH4 Min(με)',
     'LTE-M RSSI(CSQ)',
     '電池電圧(V)',
+    '充電状態',
   ]);
   sheet.setFrozenRows(1);
   console.log('子機シートを新規作成しました: ' + sheetName);
@@ -1026,6 +1048,7 @@ function updateDeviceSheetHeaders_(sheet, profile) {
   sheet.getRange(headerRow, 1).setValue('計測日時');
   sheet.getRange(headerRow, 4, 1, 4).setValues([headers]);
   sheet.getRange(headerRow, 17).setValue('電池電圧(V)');
+  sheet.getRange(headerRow, 18).setValue('充電状態');
 }
 
 // d/nの自己記述形式が壊れている場合は、実行ログだけでなく専用シートにも残す。
@@ -1429,11 +1452,11 @@ function doGet(e) {
         continue;
       }
 
-      // 列構成（17列）。Gatewayは温度・CH Max/Minを送っていないため空欄:
+      // 列構成（18列）。Gatewayは温度・CH Max/Minを送っていないため空欄:
       // A:計測日時(Gateway epoch) B:DeviceID C:温度(℃、空欄)
       // D:CH1 E:CH2 F:CH3 G:CH4
       // H〜O: Max/Min（空欄）
-      // P:LTE-M RSSI Q:電池電圧(V。旧13B/255は空欄)
+      // P:LTE-M RSSI Q:電池電圧(V。旧13B/255は空欄) R:充電状態(One v1.1のみ。Flexは空欄)
       sheet.appendRow([
         measuredAt,                                            // A: Gateway受信epoch由来の計測日時
         d.deviceId,                                            // B: DeviceID
@@ -1442,6 +1465,7 @@ function doGet(e) {
         '', '', '', '', '', '', '', '',                        // H-O: Max/Min(未送信)
         csq,                                                   // P: LTE-M RSSI
         d.battV,                                               // Q: 電池電圧(V)
+        decodeChargeState_(d.ch, profile),                     // R: 充電状態
       ]);
 
       // Flexのシート設定による従来アラートには表示値を渡す。
