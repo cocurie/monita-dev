@@ -105,7 +105,7 @@ using namespace Adafruit_LittleFS_Namespace;
 #ifndef DEVICE_ID
 #define DEVICE_ID 0x01                             // BLEモードの既定値（群0・機器1）
 #endif
-static const uint8_t  FW_VERSION          = 6;     // 子機ファームのバージョン。コミットのたびに+1すること
+static const uint8_t  FW_VERSION          = 7;     // 子機ファームのバージョン。コミットのたびに+1すること（7: 週次レビュー A4/B19/B21/C10）
 static const uint32_t MEASURE_INTERVAL_MIN = 20;   // 計測間隔（分）
 static const uint32_t ADV_DURATION_MIN     = 10;   // アドバタイズ継続時間（分）
 static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のときアドバタイズ
@@ -128,7 +128,7 @@ static const uint8_t  ADV_TRIGGER_MIN      = 2;    // 毎時 :00〜:02 のとき
 #ifndef DEVICE_ID
 #define DEVICE_ID 0x0E                    // LoRaモードの既定値（群0・機器14。iPEC実機テスト用）
 #endif
-static const uint8_t  FW_VERSION = 14;    // 子機ファームのバージョン。コミットのたびに+1すること
+static const uint8_t  FW_VERSION = 15;    // 子機ファームのバージョン。コミットのたびに+1すること（15: 週次レビュー A4/B19/B21/C10）
 #endif
 
 // ============================================================
@@ -331,37 +331,48 @@ static inline void nrfPinDisconnect(uint8_t arduinoPin) {
 //   SDA が LOW に張り付いている間、SCL を手動で最大9回トグルして
 //   スレーブに残りのビットを吐き出させ、最後に STOP 条件を作ってバスを解放する。
 //   Gateway v1.0/v1.1・NEXCO には同等の対策を実装済み（差分ログ E 章）。
+//
+// ★2026-09-22（週次レビュー C10）: 以下の2点を直した。
+//   (1) HIGH を OUTPUT で能動駆動していたため、スレーブが LOW に掴んでいる線と
+//       ショート状態で競合し得た。I2C はオープンドレインなので、HIGH は「手を離して
+//       プルアップに任せる」(INPUT_PULLUP)、LOW だけを OUTPUT で引く形に改めた。
+//   (2) SDA しか見ておらず、SCL が LOW に張り付いた状態（クロックストレッチの固着・
+//       短絡）を「正常」と判定していた。SCL が LOW のままならクロックを出せないので、
+//       ログを残して何もしない（TWIM 側の失敗・WDT に委ねる）。
+static inline void i2cLineRelease(uint8_t pin) { pinMode(pin, INPUT_PULLUP); }
+static inline void i2cLineLow(uint8_t pin)     { digitalWrite(pin, LOW); pinMode(pin, OUTPUT); }
+
 static void i2cBusRecover() {
   const uint8_t sda = PIN_WIRE_SDA;
   const uint8_t scl = PIN_WIRE_SCL;
 
-  pinMode(sda, INPUT_PULLUP);
-  pinMode(scl, INPUT_PULLUP);
+  i2cLineRelease(sda);
+  i2cLineRelease(scl);
   delayMicroseconds(10);
 
+  if (digitalRead(scl) == LOW) {
+    Serial.println("[I2C] ★SCL が LOW に張り付いています（クロックを出せないため復旧不可）");
+    return;
+  }
   if (digitalRead(sda) == HIGH) return;  // 掴まれていない = 正常
 
   Serial.println("[I2C] SDA が LOW に張り付いています。バス復旧を試みます");
 
-  pinMode(scl, OUTPUT);
   for (uint8_t i = 0; i < 9 && digitalRead(sda) == LOW; i++) {
-    digitalWrite(scl, LOW);
+    i2cLineLow(scl);
     delayMicroseconds(5);
-    digitalWrite(scl, HIGH);   // 約100kHz相当のクロックを手動生成
+    i2cLineRelease(scl);       // 約100kHz相当のクロックを手動生成（HIGHはプルアップ任せ）
     delayMicroseconds(5);
   }
 
   // STOP 条件（SCL=HIGH の状態で SDA を LOW→HIGH）を作ってバスを解放する
-  pinMode(sda, OUTPUT);
-  digitalWrite(sda, LOW);
+  i2cLineLow(scl);
   delayMicroseconds(5);
-  digitalWrite(scl, HIGH);
+  i2cLineLow(sda);
   delayMicroseconds(5);
-  digitalWrite(sda, HIGH);
+  i2cLineRelease(scl);
   delayMicroseconds(5);
-
-  pinMode(sda, INPUT_PULLUP);
-  pinMode(scl, INPUT_PULLUP);
+  i2cLineRelease(sda);
   delayMicroseconds(10);
 
   Serial.println(digitalRead(sda) == HIGH ? "[I2C] バス復旧に成功しました"
@@ -1046,6 +1057,15 @@ static void performTare() {
   for (uint8_t i = 0; i < 4; i++) {
     if (CH_ASSIGN[i] != 1) continue;
     muxSelect((uint8_t)(i + 1));
+    // ★2026-09-22（週次レビュー B21）: 切替に失敗すると MUX は前のCHのままなので、
+    //   ここで読むと前CHの値を「このCHのタレ値」として永続保存してしまう。
+    //   関数先頭の検査はタレ開始時点のもので、途中の失敗は拾えないため切替ごとに確認する。
+    //   バスが壊れている以上、残りのCHも同じなので打ち切る（保存済みの値は変更しない）。
+    if ((s_errors & ERR_TCA9534_I2C) != 0U) {
+      Serial.print("[TARE] CH"); Serial.print(i + 1);
+      Serial.println(" MUX切替失敗のため中止（このCH以降のタレ値は変更しない）");
+      break;
+    }
     delay(10);
     hx.begin(HX711_DOUT_PIN, HX711_SCK_PIN);
     if (hxTareWithTimeout()) {
@@ -1144,6 +1164,12 @@ static bool hxReadAvg(float *outAvg) {
     // get_value() = read() - tare_offset（タレ補正済み生値）
     // read() だとタレ値が反映されないため get_value() を使う
     sum += hx.get_value();
+    // ★2026-09-22（週次レビュー A4）: 1サンプル取れるたびに給餌する。
+    //   平均回数×メジアン回数×CH数はダウンリンクで大きくでき（例: 255×20×4ch、10SPSなら約34分）、
+    //   WDT（送信間隔＋WDT_MARGIN_MINUTES）を超えると再起動→同じ設定で再計測→受信窓に届かず
+    //   遠隔で戻せない再起動ループになっていた。各サンプルは HX711_SAMPLE_TIMEOUT_MS で打ち切られる
+    //   ので、「サンプルが進んでいる間だけ給餌」してもハング検出は失われない。
+    wdtFeed();
   }
   *outAvg = sum / ACTIVE_SAMPLES_PER_AVG;
   return true;
@@ -1470,27 +1496,50 @@ static int measureVL53L4CD() {
 
   for (int m = 0; m < VL53_MEASURE_COUNT; m++) {
     int samples[VL53_SAMPLES_PER_MEDIAN];
+    // ★2026-09-22（週次レビュー B19）: range_status が有効(0)でない測距は採用しない。
+    //   以前は戻り値も range_status も見ずに distance_mm を使っており、通信失敗や
+    //   無効測距（信号不足・範囲外など）の値がそのままメジアンに入っていた。
+    //   無効が有効サンプル数を超えたら、この計測は失敗として扱う（無限に取り直さない）。
+    int invalidCount = 0;
 
-    for (int s = 0; s < VL53_SAMPLES_PER_MEDIAN; s++) {
+    for (int s = 0; s < VL53_SAMPLES_PER_MEDIAN; ) {
       uint8_t dataReady = 0;
       unsigned long t0 = millis();
       while (!dataReady) {
-        vl53.VL53L4CD_CheckForDataReady(&dataReady);
-        if (millis() - t0 > 1000) {
+        if (vl53.VL53L4CD_CheckForDataReady(&dataReady) != 0 || millis() - t0 > 1000) {
           s_errors |= ERR_VL53L4CD_I2C;
           statusErrorRed();
-          Serial.println("[VL53L4CD] timeout waiting for data");
+          Serial.println("[VL53L4CD] timeout/I2C error waiting for data");
           failed = true;
           break;
         }
-        delay(5);
+        if (!dataReady) delay(5);
       }
       if (failed) break;
 
       VL53L4CD_Result_t results;
-      vl53.VL53L4CD_GetResult(&results);
+      const bool readOk = (vl53.VL53L4CD_GetResult(&results) == 0);
       vl53.VL53L4CD_ClearInterrupt();
-      samples[s] = (int)results.distance_mm;
+      if (!readOk) {
+        s_errors |= ERR_VL53L4CD_I2C;
+        statusErrorRed();
+        Serial.println("[VL53L4CD] GetResult I2C error");
+        failed = true;
+        break;
+      }
+      if (results.range_status != 0) {
+        if (++invalidCount > VL53_SAMPLES_PER_MEDIAN) {
+          s_errors |= ERR_VL53L4CD_I2C;
+          statusErrorRed();
+          Serial.print("[VL53L4CD] 無効測距が続いたため失敗扱い（最後のrange_status=");
+          Serial.print(results.range_status); Serial.println("）");
+          failed = true;
+          break;
+        }
+        continue;  // 有効サンプルとして数えず取り直す
+      }
+      samples[s++] = (int)results.distance_mm;
+      wdtFeed();  // 週次レビュー A4 と同じ理由（計測時間が WDT マージンを超え得る）
     }
 
     if (failed) break;
