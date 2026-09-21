@@ -1,6 +1,6 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- *  Monita Gateway v1.21（FW 99）— 設定早見表
+ *  Monita Gateway v1.21（FW 100）— 設定早見表
  *  **ここを読めば、何をしたいときにどこを変えればよいか分かるようにしてある。**
  *  ソースを追う前に、まずこの表を見ること。
  * ═══════════════════════════════════════════════════════════════════════════
@@ -345,7 +345,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 
 // Gateway（本ファーム）自身のバージョン。コミットのたびに+1すること。
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
-static uint8_t  const GATEWAY_FW_VERSION = 99;
+static uint8_t  const GATEWAY_FW_VERSION = 100;  // 100: 週次レビュー A14/A15/A18（2026-09-22）
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する（★BLE受信専用）
 // ★2026-08-28: LoRaは isAllowedLoRaPacket() を使う。BLEの群分離は第3段階まで後回しと
@@ -599,6 +599,9 @@ static uint32_t computeAppWdtMs(uint32_t intervalMs) {
   return intervalMs + intervalMs / 2;  // intervalMs × 1.5
 }
 static uint32_t lastGasSuccessMs = 0;  // 最後にGAS送信が成功した millis()（setup先頭で初期化）
+// 最後に check_cmd（コマンド・予約の確認）が成功した millis()。stop中のアプリ層WDTの起点に使う
+// （週次レビュー A15。loop() の「[STOP] データ送信を一時停止中」の箇所を参照）。
+static uint32_t s_lastCmdCheckOkMs = 0;
 
 // 段階的復旧（★2026-07-21 追加、有野川障害の教訓）:
 // アプリWDTの「30分無送信で全再起動(NVIC_SystemReset)」の前に、より軽く速い一段目として
@@ -1274,11 +1277,18 @@ bool postToGAS(String queryParams) {
       //   正常時のGAS応答は 'ok'/'OK' 数バイトのchunkedで、モジュールは長さを決められず
       //   len=0 を返す。一方Googleのエラーページは Content-Length 付きなので数KBが実際に
       //   ダウンロードされる。この非対称を使って取り違えを検出する。
+      //
+      // ★2026-09-22（週次レビュー A14）: 検出しても警告を出すだけで true を返していたため、
+      //   GASが処理に失敗しても再送キュー・報告キューから消え、lastGasSuccessMs も更新されて
+      //   アプリ層WDTも障害に気づけなかった。エラーページは失敗として扱い、再送に回す。
+      //   GAS側も、再送で直る失敗（ロック待ち）ではわざと例外を投げてエラーページにしている
+      //   （gateway_common/Code.gs waitLockOrThrowRetryable_）。
       if (s_lastHttpLen > GAS_ERROR_PAGE_MIN_LEN) {
-        Serial.print(F("⚠ GASがエラーページを返した可能性（本文 "));
+        Serial.print(F("✗ GASがエラーページを返した（本文 "));
         Serial.print(s_lastHttpLen);
-        Serial.println(F(" バイト）。シートに記録されていない恐れがあります"));
-        Serial.println(F("  → GAS側のSPREADSHEET_ID設定・デプロイ内容を確認してください"));
+        Serial.println(F(" バイト）。記録されていないので失敗として扱い、再送に回します"));
+        Serial.println(F("  → 続く場合はGAS側のSPREADSHEET_ID設定・デプロイ内容・実行ログを確認してください"));
+        continue;  // 通信自体はできているので、残りの試行でロック待ち等が解ける可能性がある
       }
       Serial.println(F("✓ GAS 送信成功！"));
       lastGasSuccessMs = millis();  // アプリ層ウォッチドッグ: 送信成功を記録
@@ -2119,7 +2129,7 @@ static bool checkRemoteCmdOnce() {
 
 void checkRemoteCmd() {
   for (int attempt = 1; attempt <= CMD_FETCH_MAX_ATTEMPTS; attempt++) {
-    if (checkRemoteCmdOnce()) return;
+    if (checkRemoteCmdOnce()) { s_lastCmdCheckOkMs = millis(); return; }
     if (attempt < CMD_FETCH_MAX_ATTEMPTS) {
       Serial.print(F("[CMD] 取得に失敗（")); Serial.print(attempt);
       Serial.print(F("回目/")); Serial.print(CMD_FETCH_MAX_ATTEMPTS);
@@ -2501,7 +2511,17 @@ static bool     s_loraConfigOk   = false;  // 起動時のconfig check結果
 // 実際「起動時のconfig readは成功するのに、その後は永久に0バイト」という
 // 症状が出たため、一定時間受信が無ければRXを再起動して自力復帰させる。
 #define LORA_RX_STALL_MS 30000UL   // この時間1バイトも来なければストールとみなす
+// ★2026-09-22（週次レビュー A18）: 子機の送信間隔は数分〜1時間なので、30秒の無受信は平常時も
+//   毎回起きる。以前は平常時もほぼ30秒ごとにキック（3バイトの電波送信＋受信バッファ破棄）を
+//   繰り返し、その窓に届いた子機のフレームを捨てていた。受信バッファは捨てないように改め、
+//   電波を出すキックは、有効フレームが来ないまま続く間は間隔を倍々に延ばす（上限は下記）。
+//   RX再武装（TASKS_STARTRX、電波を出さない）は従来どおり30秒ごと。
+//   有効フレームを1つ受信したらキック間隔を30秒に戻す。起動時の受信不能ラッチ
+//   （loraKickTx()のコメント）は setup() で必ずキックするので、この延長の影響は受けない。
+#define LORA_RX_STALL_MAX_SHIFT 4  // 30秒×2^4 = 8分がキック間隔の上限
 static uint32_t s_loraLastRxMs  = 0;  // 最後に1バイト受信した時刻
+static uint8_t  s_loraKickStreak = 0; // 有効フレームを受けないまま続いたキックの回数（キック間隔の延長に使う）
+static uint8_t  s_loraStallTicks = 0; // 前回キック以降の「30秒無受信」の回数
 static uint32_t s_loraRekicks   = 0;  // RX再起動の実行回数
 static uint8_t  s_loraErrSrcAcc = 0;  // 観測したERRORSRCの累積OR（bit0=OVERRUN,1=PARITY,2=FRAMING,3=BREAK）
 
@@ -2549,7 +2569,10 @@ static void loraKickTx() {
   loraSerial.write(dummy, sizeof(dummy));
   loraSerial.flush();
   delay(200);  // 送信完了待ち（AUX未接続のため固定ディレイ）
-  while (loraSerial.available()) loraSerial.read();  // 反射・エコーがあれば捨てる
+  // ★2026-09-22（週次レビュー A18）: ここで受信バッファを全部捨てていたため、待機中に届いた
+  //   子機の正規フレームまで失っていた。E220は透過モードで自分の送信をUARTへ返さず、
+  //   仮に0x00が返っても loraFeedByte() は同期バイト0xAAを待つので読み飛ばされる。
+  //   よって捨てずに、次の loraPoll() に解析させる。
 }
 
 // UARTE1のエラー要因を回収し、受信が止まっていれば受信を再起動する
@@ -2573,11 +2596,22 @@ static void loraRxWatchdog() {
   if (millis() - s_loraLastRxMs >= LORA_RX_STALL_MS) {
     s_loraLastRxMs = millis();  // 次の判定まで再度この時間だけ待つ
     s_loraRekicks++;
-    NRF_UARTE1->TASKS_STARTRX = 1;  // DMA受信を再武装する（既に動作中でも実害はない）
+    NRF_UARTE1->TASKS_STARTRX = 1;  // DMA受信を再武装する（既に動作中でも実害はない。電波は出さない）
+
+    // ★週次レビュー A18: 電波を出すキックは、有効フレームが来ないまま続いた回数に応じて
+    //   30秒→1分→2分→4分→8分（上限）と間隔を延ばす。s_loraStallTicks は30秒の無受信の回数。
+    s_loraStallTicks++;
+    const uint8_t shift = (s_loraKickStreak < LORA_RX_STALL_MAX_SHIFT) ? s_loraKickStreak
+                                                                       : LORA_RX_STALL_MAX_SHIFT;
+    const bool doKick = (s_loraStallTicks >= (1U << shift));
     Serial.print(F("[LORA] 受信ストール検出 → RX再起動 #"));
     Serial.print(s_loraRekicks);
     Serial.print(F(" ERRORSRC累積=0x"));
-    Serial.println(s_loraErrSrcAcc, HEX);
+    Serial.print(s_loraErrSrcAcc, HEX);
+    Serial.println(doKick ? F(" → キック送信") : F(" （キックは間隔延長中のため見送り）"));
+    if (!doKick) return;
+    s_loraStallTicks = 0;
+    if (s_loraKickStreak < 255) s_loraKickStreak++;
 
     // 初回のストール時だけモードを検査する（毎回やると余計な電波を出すため）
     if (!s_loraProbeDone) loraProbeMode();
@@ -2959,6 +2993,8 @@ static void loraPoll() {
     s_loraLastRxMs = millis();  // 受信が生きている証跡（ストール監視の基準）
     if (loraFeedByte(b)) {
       s_loraFramesOk++;
+      s_loraKickStreak = 0;  // 受信は生きている。キック間隔を30秒へ戻す（週次レビュー A18）
+      s_loraStallTicks = 0;
       if (s_loraLen < 2) {
         Serial.print(F("[LORA] 不正な短フレームを破棄: "));
         Serial.print(s_loraLen);
@@ -4892,6 +4928,16 @@ void loop() {
       flushRecords();
     } else {
       Serial.println(F("[STOP] データ送信を一時停止中のためスキップします"));
+      // ★2026-09-22（週次レビュー A15）: stop中は送信しないので lastGasSuccessMs が進まず、
+      //   1.5周期後にアプリ層WDTが再起動していた。再起動するとRAM上の s_gasSendPaused が
+      //   false に戻り、stop が無音で解除されて送信が再開していた。
+      //   stop中に限り「GASとの通信（check_cmd）が今サイクル成功した」ことを生存の証拠とする。
+      //   通常時はここを通らないので、テレメトリ停止の検出を鈍らせない（1966行付近の方針どおり）。
+      //   check_cmd も失敗し続ける場合は通信断なので、従来どおりWDTで再起動する
+      //   （その場合 stop は解除される。停止状態はフラッシュに保存していない）。
+      if (millis() - s_lastCmdCheckOkMs < sendIntervalMs) {
+        lastGasSuccessMs = s_lastCmdCheckOkMs;
+      }
     }
 #ifdef COMM_MODE_BLE
     Bluefruit.Scanner.start(0);

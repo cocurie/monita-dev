@@ -147,6 +147,11 @@ function writeDownlinkFile_(group, nonce, body) {
 //            ・確定済み・取り消し済みを downlink_sent で sent に戻さない
 //            ・予約の取り消しをロック付き・state='cancelled' に（削除すると seq が振り直される）
 //            ・deck_trigger の状態列を seq で行特定。子機の適用値を子機と同じ規則で検査
+//     - v13: 週次レビュー対応（2026-09-22）。Gateway FW100 と組で使うと効果が出る（片方だけでも無害）。
+//            ・downlink_result / downlink_sent のロック待ちタイムアウトで例外を投げ、Google の
+//              エラーページを返す（waitLockOrThrowRetryable_）。FW100 はこれを失敗として再送する。
+//              以前は HTTP 200 の 'error: lock timeout' を Gateway が成功と区別できず報告を捨てていた（A14）
+//            ・Flex 平均/メジアン変更メニューのメジアン上限を 255→20（子機の MEASURE_COUNT_MAX）に（B15）
 //
 //   対応する子機ファーム:
 //     - project07_NEXCO/firmware/src/main.cpp（COMM_MODE_BLE、本番項目用）
@@ -440,6 +445,9 @@ function getKnownChildSettings_(childHex) {
 // (flags=0)」を送る。子機はapplyDownlinkPayload()の仕様上、変更が無くても確認応答
 // （現在の送信間隔・平均・メジアン・WDTタイムアウト）を必ず返すため、この応答だけを
 // 目的に使う。sleep/avg/medianは送信フレームには使われないダミー値でよい。
+// Flex 子機が受け付けるメジアン回数の上限（case01_Flex/v3.20/src/main.cpp の MEASURE_COUNT_MAX）。
+const FLEX_MEDIAN_MAX = 20;
+
 function queueDownlink_(childHex, sleepMin, avg, median, sourceNote, mode) {
   // ★同時予約でseqの採番・予約更新が競合しないようにする。
   var lock = LockService.getScriptLock();
@@ -523,8 +531,12 @@ function triggerFlexSetAvgMedian() {
   var parts = r2.getResponseText().split(',');
   var avg = parseInt(parts[0], 10);
   var median = parseInt(parts[1], 10);
-  if (isNaN(avg) || isNaN(median) || avg < 1 || avg > 255 || median < 1 || median > 255) {
-    ui.alert('平均回数・メジアン回数はそれぞれ1〜255の整数で入力してください（例: 8,8）。');
+  // ★2026-09-22（週次レビュー B15）: メジアン回数の上限を子機に合わせる。
+  //   以前は1〜255を受け付けていたが、Flex は MEASURE_COUNT_MAX（=20、配列サイズ）を
+  //   超える値を値域エラーで拒否するため、21以上の予約は必ず「失敗」になっていた。
+  //   子機側の上限を変えたらここも合わせること（case01_Flex/v3.20/src/main.cpp MEASURE_COUNT_MAX）。
+  if (isNaN(avg) || isNaN(median) || avg < 1 || avg > 255 || median < 1 || median > FLEX_MEDIAN_MAX) {
+    ui.alert('平均回数は1〜255、メジアン回数は1〜' + FLEX_MEDIAN_MAX + 'の整数で入力してください（例: 8,8）。');
     return;
   }
 
@@ -2104,6 +2116,23 @@ function triggerRetryStashedNow() {
 // ================================
 // Webhook 受信本体（GET）
 // ================================
+// ★2026-09-22（週次レビュー A14）: Gateway に「もう一度送ってほしい」と伝えるためのロック取得。
+//   Gateway(v1.21〜)は応答本文を読めない（chunked 応答をモデムが扱えない）ため、HTTP 200 で
+//   'error: lock timeout' と返しても成功と区別できず、ダウンリンクの報告を捨てていた。
+//   ここで例外を投げると Google がエラーページ（Content-Length 付き・数KB）を返し、Gateway は
+//   それを失敗として検出して報告を再送する（FW 側の GAS_ERROR_PAGE_MIN_LEN 判定）。
+//   再送で直る一時的な失敗（ロック待ち）だけに使うこと。値の不正などに使うと、同じ報告を
+//   永久に再送し続け、後ろに並んだ報告まで止まる。
+function waitLockOrThrowRetryable_(lock) {
+  try {
+    lock.waitLock(10000);
+  } catch (err) {
+    var e = new Error('lock timeout: ' + err);
+    e.retryable = true;
+    throw e;
+  }
+}
+
 function doGet(e) {
   var p = e.parameter;
 
@@ -2222,7 +2251,7 @@ function doGet(e) {
     // ★予約結果の照合・状態更新が新しい予約と競合しないようにする。
     var lock = LockService.getScriptLock();
     try {
-      lock.waitLock(10000);
+      waitLockOrThrowRetryable_(lock);
 
       var rec = dlGet_(childHex);
 
@@ -2266,8 +2295,9 @@ function doGet(e) {
                dlStatusLabel_(rec) + '（' + rec.attempts + '回目で確定）' + cancelledNote, reportGroup);
       }
     } catch (err) {
-      console.log('Downlink result lock error: ' + err);
-      return ContentService.createTextOutput('error: lock timeout');
+      console.log('Downlink result error: ' + err);
+      if (err && err.retryable) throw err;  // 週次レビュー A14: waitLockOrThrowRetryable_ のコメント参照
+      return ContentService.createTextOutput('error: ' + err);
     } finally {
       try { lock.releaseLock(); } catch (e2) {}
     }
@@ -2294,7 +2324,7 @@ function doGet(e) {
     // ★送信報告の照合・状態更新が新しい予約と競合しないようにする。
     var lock = LockService.getScriptLock();
     try {
-      lock.waitLock(10000);
+      waitLockOrThrowRetryable_(lock);
 
       var sentRec = dlGet_(sentHex);
 
@@ -2324,8 +2354,9 @@ function doGet(e) {
                : ('間隔=' + sentRec.sleep + '分 / 平均=' + sentRec.avg + ' / メジアン=' + sentRec.median),
              sentRec.attempts + '回目（子機からの確認応答を待っています）', sentGroup);
     } catch (err) {
-      console.log('Downlink sent lock error: ' + err);
-      return ContentService.createTextOutput('error: lock timeout');
+      console.log('Downlink sent error: ' + err);
+      if (err && err.retryable) throw err;  // 週次レビュー A14: waitLockOrThrowRetryable_ のコメント参照
+      return ContentService.createTextOutput('error: ' + err);
     } finally {
       try { lock.releaseLock(); } catch (e2) {}
     }
