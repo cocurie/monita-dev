@@ -118,7 +118,7 @@ function onOpen() {
     .addItem('データ送信を停止', 'triggerGatewayStop')
     .addItem('データ送信を再開', 'triggerGatewayStart')
     .addItem('今すぐ送信', 'triggerGatewaySendNow')
-    .addItem('送信間隔を変更', 'triggerGatewaySetInterval')
+    .addItem('バックアップ送信間隔を変更', 'triggerGatewaySetInterval')
     .addItem('ステータス確認', 'triggerGatewayStatusNow')
     .addItem('RTC再同期', 'triggerGatewayRtcResync')
     .addItem('診断ログを吸い上げ', 'triggerGatewayLogDump')
@@ -168,8 +168,8 @@ function triggerGatewaySendNow() {
 function triggerGatewaySetInterval() {
   var ui = SpreadsheetApp.getUi();
   var response = ui.prompt(
-    '送信間隔の変更',
-    '新しい送信間隔を分単位で入力してください（1〜1440分）:',
+    'バックアップ送信間隔の変更',
+    '新しいバックアップ送信間隔を分単位で入力してください（1〜1440分）。子機からの新規データはこの設定に関わらず即座に送信されます:',
     ui.ButtonSet.OK_CANCEL
   );
   if (response.getSelectedButton() !== ui.Button.OK) return;
@@ -180,7 +180,7 @@ function triggerGatewaySetInterval() {
     return;
   }
   PropertiesService.getScriptProperties().setProperty('pending_cmd_' + GW_DEVICE_ID, 'interval:' + minutes);
-  ui.alert('予約しました。次にGatewayがオンラインになったタイミング（最大5分後）で送信間隔を' + minutes + '分に変更します。');
+  ui.alert('予約しました。次にGatewayがオンラインになったタイミング（最大5分後）でバックアップ送信間隔を' + minutes + '分に変更します。');
 }
 
 function triggerGatewayStatusNow() {
@@ -239,8 +239,41 @@ const DATABOX_HEADER = [
 // Gateway状態シート（row_type=info専用）の見出し行
 const GATEWAY_STATUS_HEADER = [
   '受信日時', 'Gateway ID', '群番号', 'FWバージョン', 'XIAO ID', 'SIM IMEI', 'SIM ICCID',
-  'SIM名', 'CSQ', 'SDカード', '送信間隔(分)', '受信済み台数',
+  'SIM名', 'CSQ', 'SDカード', 'バックアップ送信間隔(分)', '受信済み台数',
 ];
+
+// ★2026-09-12: 見出しだけでは意味が分かりにくい項目に、セルのメモとして簡単な説明を入れる。
+// getGatewayStatusSheet()が新規作成する時に自動で付与するほか、既存シートには
+// setupGatewayStatusHeaderNotesOnce()をApps Scriptエディタから手動実行して後付けできる。
+//
+// ★2026-09-24: 「送信間隔(分)」という見出しが、子機の計測データがスプレッドシートへ
+// 反映される頻度だと誤解されやすかった（実際には子機から新しいデータを受信すると
+// ほぼ即座に送信されるため、この値がそのままデータの更新頻度になることは無い）。
+// 見出しを「バックアップ送信間隔(分)」に変更し、実態（新規データが無い間の定期疎通確認・
+// 未送信データが残っていた場合の予備送信に使われる間隔）が伝わるようメモも追加した。
+const GATEWAY_STATUS_NOTES = {
+  'XIAO ID': 'Gatewayに搭載されているマイコン(XIAO nRF52840)固有の識別番号。個体を区別するためのID',
+  'SIM IMEI': '通信モジュール(SIM7080G)固有の識別番号。端末を一意に識別する15桁の番号',
+  'SIM ICCID': 'SIMカード自体の固有番号。通信キャリア側でSIMを管理する際の識別番号',
+  'SIM名': '使用している通信キャリア／SIMプランの名称',
+  'CSQ': '電波強度の指標。0〜31の数値で大きいほど電波が強い（目安: 10以下=弱い、15〜20=普通、20以上=良好、99=圏外）',
+  'SDカード': 'SDカードが認識されているか（1=あり、0=なし）',
+  'バックアップ送信間隔(分)': '子機から新しいデータを受信するとほぼ即座に送信されるため、これは実際のデータ更新頻度ではない。新しいデータが無い間の定期疎通確認や、未送信データが残っていた場合の予備送信に使われる、Gateway自身の間隔設定（既定5分）',
+  '受信済み台数': 'この起動確認を送った時点で、Gatewayが受信済み（未送信でキャッシュ中）だった子機の台数',
+};
+
+function applyGatewayStatusHeaderNotes(sheet) {
+  for (var i = 0; i < GATEWAY_STATUS_HEADER.length; i++) {
+    var note = GATEWAY_STATUS_NOTES[GATEWAY_STATUS_HEADER[i]];
+    if (note) sheet.getRange(1, i + 1).setNote(note);
+  }
+}
+
+// 既存の「Gateway状態」シートに説明メモを後付けしたいときだけ、Apps Scriptエディタの
+// 関数選択で本関数を選び、手動実行する（実行後は不要）。
+function setupGatewayStatusHeaderNotesOnce() {
+  applyGatewayStatusHeaderNotes(getGatewayStatusSheet());
+}
 
 function getSpreadsheet() {
   return SpreadsheetApp.openById(SPREADSHEET_ID);
@@ -263,6 +296,7 @@ function getGatewayStatusSheet() {
   if (!sheet) {
     sheet = ss.insertSheet(GATEWAY_STATUS_SHEET_NAME);
     sheet.appendRow(GATEWAY_STATUS_HEADER);
+    applyGatewayStatusHeaderNotes(sheet);
   }
   return sheet;
 }
@@ -442,7 +476,7 @@ function doGet(e) {
       p.sim || '',       // SIM名
       p.csq || '',       // CSQ
       p.sd || '',        // SDカード
-      p.interval_min || '', // 送信間隔(分)
+      p.interval_min || '', // バックアップ送信間隔(分)
       p.devcount || '',  // 受信済み台数
     ]);
     return ContentService.createTextOutput('OK');

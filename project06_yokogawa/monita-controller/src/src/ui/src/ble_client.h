@@ -33,6 +33,16 @@ void ble_back_to_measure(void);
 // "Disconnect" ボタン: BLE切断してInitial画面へ戻る
 void ble_disconnect(void);
 
+// "Time" ボタン(Setting画面→SetTime画面)
+void ble_open_settime(void);
+
+// "Set Time" ボタン(SetTime画面): スピンボックスのY/M/D/H/Mi/S値をまとめて
+// "SETTIME:YYYYMMDDHHMMSS" として送信
+void ble_set_time(void);
+
+// "Back" ボタン(SetTime画面→Setting画面)
+void ble_back_to_setting(void);
+
 #ifdef __cplusplus
 } /*extern "C"*/
 #endif

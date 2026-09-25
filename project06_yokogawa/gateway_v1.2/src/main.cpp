@@ -230,13 +230,20 @@ static uint8_t  const EXPECTED_PKT_TYPE  = 0x12;             // 横河ver1.3 LoR
 
 // GAS 送信インターバル。LoRaビルドではコントローラーからBLE経由で変更可能（内蔵フラッシュに保存し
 // 再起動後も維持）。BLEビルドではこの既定値のまま（変更手段なし）。
-// ★2026-08-11: 120分 → 60分。子機(Flex v3.20)の送信間隔を60分にしたことに合わせる。
-//   Gatewayは子機ごとに最新1件しか保持しない（updateRecordFromPayload()が上書きする）ため、
-//   送信間隔が子機より長いと、その差の分だけ測定データが失われる。
-//   ※アプリ層WDTはcomputeAppWdtMs(sendIntervalMs)＝送信間隔×1.5で自動追従するので
-//     手当ては不要（CLAUDE.md §7のヒューマンエラー対策）。60分→閾値90分。
-//   ※ハードWDT(WDT_TIMEOUT_MS=120秒)はloop()から常時給餌するため送信間隔とは無関係。
-static uint32_t const SEND_INTERVAL_DEFAULT_MS = 300000;  // 既定 60 分
+// ※アプリ層WDTはcomputeAppWdtMs(sendIntervalMs)＝送信間隔×1.5と固定フロア（現在120分）の
+//   大きい方で自動追従するので、この値を変えてもWDT側の手当ては不要（CLAUDE.md §7）。
+// ※ハードWDT(WDT_TIMEOUT_MS=120秒)はloop()から常時給餌するため送信間隔とは無関係。
+//
+// ★2026-09-24: 5分 → 20分。子機からの新規データ受信時は本来この間隔を待たずに即時送信
+//   されるが（loop()のsendDueByNewData参照）、GAS応答のchunked問題(len=0、httpGetViaFs()
+//   の上のコメント参照)でAT通信中(s_atBusy)の時間が数十秒〜数分に伸びており、この定期
+//   サイクル自体（子機データが無くてもcheckRemoteCmd()のためだけに毎回発生する）が
+//   2台目以降の子機の時刻同期ダウンリンクと衝突する頻度を上げていた（実機で0x02の時刻
+//   同期が繰り返し見送られる事象で確認）。今回の横河納品は子機の計測間隔が短め
+//   （実測10〜15分）で使われる想定のため、それより長い20分に伸ばし、「空」の定期サイクル
+//   （実データが無いのにAT通信だけ発生する回）自体の発生頻度を下げて衝突確率を緩和する
+//   （根本原因のchunked問題自体の解決ではなく緩和策）。
+static uint32_t const SEND_INTERVAL_DEFAULT_MS = 20UL * 60UL * 1000UL;  // 既定 20 分
 static uint32_t       sendIntervalMs           = SEND_INTERVAL_DEFAULT_MS;  // 実行時可変
 
 // ══════════════════════════════════════════════
@@ -278,7 +285,7 @@ static size_t   const ALLOWED_DEVICE_IDS_COUNT = sizeof(ALLOWED_DEVICE_IDS) / si
 // info行（row_type=info）でGASへ送信し、GAS側のシートで実機バージョンを追跡できるようにする。
 // ★project06_yokogawa/gateway_v1.2として分岐した時点のcase02 gateway_v1.20のカウンタ値(96)を
 // そのまま引き継ぎ、以後はこのファイル独自にコミットごとに+1する。
-static uint8_t  const GATEWAY_FW_VERSION = 101;
+static uint8_t  const GATEWAY_FW_VERSION = 110;
 
 // pktType・deviceId が Flex として許可された組み合わせか判定する（★BLE受信専用）
 // ★2026-08-28: LoRaは isAllowedLoRaPacket() を使う。BLEの群分離は第3段階まで後回しと
@@ -437,6 +444,24 @@ bool syncRtcFromNetworkTime() {
   return true;
 }
 
+// ★2026-09-18: SDカードに保存される全ファイル（gwlog.csv/gateway.csv等）の
+// 更新日時が常に2000-01-01になっていた件の原因・対策。
+// arduino-libraries/SD（内部はSdFat）は、ファイル作成・書込のたびにこの
+// dateTimeCallback を呼んでFATタイムスタンプを取得する仕組みになっているが、
+// 本ファームは一度もこれを登録していなかった。未登録の場合SdFatは既定値
+// （2000-01-01 00:00:00相当）を使い続けるため、実際の書込時刻に関わらず
+// Finder上の更新日時が常にこの値のまま変わらなかった。
+// rtc.now()を都度読んで返すコールバックを登録することで、DS3231が
+// （網時刻同期前も含め）現在保持している時刻がそのままファイルに反映される
+// ようになる。同期前は2000-01-01のままだが、syncRtcFromNetworkTime()完了後は
+// 以降の書込から自動的に正しい日時になる（過去に書き込んだファイルの更新日時は
+// 遡って直らない）。
+static void sdFatDateTimeCallback(uint16_t* date, uint16_t* time) {
+  DateTime now = rtc.now();
+  *date = FAT_DATE(now.year(), now.month(), now.day());
+  *time = FAT_TIME(now.hour(), now.minute(), now.second());
+}
+
 // ══════════════════════════════════════════════
 // ウォッチドッグタイマー（nRF52840 内蔵 WDT）
 // 無人運用中にファームがハングした場合、自動リセットで復旧するための安全網。
@@ -480,10 +505,34 @@ static inline void wdtFeed() {
 //
 // マージンは「1サイクル分の送信失敗＋次サイクルでのリトライ成功」を待てる時間。
 // 送信間隔の1.5倍という式は、既存の実運用値（120分間隔→180分)から逆算した係数。
+//
+// ★2026-09-23: 固定フロア（APP_WDT_FLOOR_MS）を追加。
+//
+// 【背景】flushRecords()は送信対象が0件（＝新規計測データなし）の場合、GASへ一切
+// 通信せずreturnするため、以前はlastGasSuccessMsが「実際にデータを送った時」しか
+// 更新されなかった。フィールドユニットの計測間隔はコントローラーから5〜1440分の
+// 範囲で顧客が自由に設定できるため、intervalMs×1.5（既定5分間隔なら7分30秒）を
+// 計測間隔が上回ると、通信自体は正常なのに「一定時間GAS送信成功なし」と誤判定して
+// 無限リブートし得た（CLAUDE.md §7と同種の問題だが、別経路。2026-09-23、Codex
+// レビューで指摘）。
+//
+// 【対策】データの有無に関わらず動く疎通確認checkRemoteCmdOnce()（既定15分間隔、
+// ±3分ジッター。呼び出し元checkRemoteCmd()参照）の成功でもlastGasSuccessMsを
+// 更新するようにした（checkRemoteCmdOnce()内、gasGetText()成功直後を参照）。
+// 当初はこのフロアを「疎通確認の最悪間隔(15+3=18分)の2回分」を目安に30分として
+// いたが、GAS応答のchunked問題（httpGetViaFs()の上のコメント参照）でこの疎通確認
+// 自体が長時間ほぼ成功しない状態が実機で確認された（2026-09-24）。原因（モジュール
+// 側のchunked応答処理）はGateway側だけでは解消できず、かつ本納品での実際の運用
+// パターン（短期のお試し計測か、長期の定点計測か）が未確定のため、一旦「通信が
+// 不安定でも極力再起動させない」方向へ倒し、フロアを120分に引き上げた。将来的に
+// 運用パターンが固まり、より短い復旧時間が必要になった場合は、根本原因
+// （chunked応答対応）の解決とあわせて再検討する。
+static uint32_t const APP_WDT_FLOOR_MS = 120UL * 60UL * 1000UL;  // 120分（2026-09-24変更、旧30分）
 static uint32_t computeAppWdtMs(uint32_t intervalMs) {
-  return intervalMs + intervalMs / 2;  // intervalMs × 1.5
+  uint32_t byInterval = intervalMs + intervalMs / 2;  // intervalMs × 1.5
+  return byInterval > APP_WDT_FLOOR_MS ? byInterval : APP_WDT_FLOOR_MS;
 }
-static uint32_t lastGasSuccessMs = 0;  // 最後にGAS送信が成功した millis()（setup先頭で初期化）
+static uint32_t lastGasSuccessMs = 0;  // 最後にGAS送信 or 疎通確認が成功した millis()（setup先頭で初期化）
 
 // 段階的復旧（★2026-07-21 追加、有野川障害の教訓）:
 // アプリWDTの「30分無送信で全再起動(NVIC_SystemReset)」の前に、より軽く速い一段目として
@@ -862,7 +911,15 @@ bool initNetwork() {
   delay(1000);
 
   // CNACT: IP アドレス取得
-  sendAT("AT+CNACT=0,1", 15000); delay(3000);
+  // ★2026-09-15: 対策①（GAS通信のHTTPTOFS status=200,len=0の長期化対策）。
+  //   PDPコンテキスト確立(CNACT)直後の最初のHTTPTOFS試行で「実ファイルサイズも0」
+  //   （偽陽性ではなく本当にダウンロードできていない）という失敗が実機ログで頻発しており、
+  //   3回連続失敗→PDP再構築→さらに失敗→モデム再起動、という長時間の復旧ループに
+  //   繋がっていた。CNACT直後はモデム内部のTLS/HTTPスタックがまだ完全に安定していない
+  //   可能性があるため、最初のGAS通信を試みるまでの猶予を3秒→8秒に延ばす
+  //   （即効性のある根本原因の特定はログだけでは困難なため、まずはこの猶予延長で
+  //   実機での改善有無を確認する）。
+  sendAT("AT+CNACT=0,1", 15000); delay(8000);
   String cnact = sendAT("AT+CNACT?", 3000);
   bool ipOk = cnact.indexOf("0,1") >= 0;
   simStage("NET4: IP アドレス取得 (CNACT)", ipOk);
@@ -956,8 +1013,9 @@ static uint32_t s_gasFetchOk  = 0;
 static void recoverHttpStack() {
   if (s_fsFailStreak == 3) {
     Serial.println(F("[GAS] 復旧: PDPコンテキストを張り直します"));
+    // ★2026-09-15: 対策①、initNetwork()のCNACT直後と同じ理由で猶予を8秒に延長。
     sendAT("AT+CNACT=0,0", 15000); delay(3000);
-    sendAT("AT+CNACT=0,1", 15000); delay(3000);
+    sendAT("AT+CNACT=0,1", 15000); delay(8000);
   } else if (s_fsFailStreak >= 6) {
     Serial.println(F("[GAS] 復旧: モデムを再起動します"));
     s_fsFailStreak = 0;
@@ -1019,7 +1077,9 @@ static String httpGetViaFs(const String& url, bool wantBody) {
 
   // ★AT+HTTPTOFSは非同期。+HTTPTOFS URCが返った時点ではファイル書き込みが
   //   完了していないことがあるため、Idleになるまで待ってから読む。
-  waitHttpToFsIdle(10000);
+  // ★2026-09-15: 対策①。10秒では足りずファイルサイズ確認時点でまだ書き込み中
+  //   （＝この時点のCFSGFISが0を返す）ケースがあるのではと考え、15秒に延長。
+  waitHttpToFsIdle(15000);
 
   // ★CFSGFISはCFSINITで確保していないと正しい値を返さない。サイズ確認と読み出しを
   //   同じCFSINIT/CFSTERMの中で行う（確保前に確認すると0が返り、正常なデータを捨てる）。
@@ -1217,6 +1277,20 @@ static bool s_forceSendOnce  = false;  // send_nowで次回1回だけ一時停�
 // トリガーすることで解消する。定期送信（sendIntervalMs）自体はダウンリンク予約確認等の
 // フォールバックとして残す。
 static volatile bool s_loraNewDataFlag = false;
+
+// ★2026-09-15追加: 複数子機がほぼ同時（数秒差）にアップリンクしてくると、Gatewayが
+// 最初の1台の受信をきっかけに即座にAT通信(GAS送信)へ入ってしまい、その直後に届く
+// 2台目以降の時刻同期ダウンリンクがs_atBusyで毎回スキップされ続ける事象を実機で確認した
+// （フィールド機0x01・0x02の到着順が毎サイクルほぼ一定のため、後着の0x01が構造的に
+// 永続的に時刻同期できなくなっていた）。
+// 対策: 送信トリガー（新規受信 or 定期送信間隔経過）を検知しても即座にAT通信へ入らず、
+// FLUSH_ARM_BUFFER_MSだけ待ってから実際のフラッシュ処理を始める。この待ち時間の間は
+// まだs_atBusyが立っていないため、ほぼ同時に届く他の子機の時刻同期ダウンリンクも
+// （onUplinkReceived()が呼ばれるたびに）取りこぼさずに送ることができる。
+static const uint32_t FLUSH_ARM_BUFFER_MS = 3000UL;
+static bool     s_flushArmed         = false;
+static uint32_t s_flushArmedMs       = 0;
+static bool     s_flushArmedByNewData = false;
 
 #ifdef COMM_MODE_LORA
 static void saveConfig();  // 後方で定義（送信間隔の永続化。LoRaビルドのみ内蔵フラッシュ保存機構あり）
@@ -1621,6 +1695,11 @@ static bool checkRemoteCmdOnce() {
   String cmd = gasGetText(query);
   if (cmd.length() == 0) return false;
 
+  // ★2026-09-23: GASとの疎通に成功した時点でアプリWDTを給餌する。
+  //   計測データが無い（送るものが無い）だけの正常待機中も、この定期疎通確認さえ
+  //   成功していればWDTが誤発動しない（computeAppWdtMs()のコメント参照）。
+  lastGasSuccessMs = millis();
+
   cmd.trim();
 
 #ifdef COMM_MODE_LORA
@@ -1731,6 +1810,53 @@ void checkRemoteCmd() {
 static bool sdAvailable = false;
 static uint32_t s_sdLogFailCount = 0;  // ★2026-07-25追加: 書き込み失敗の可視化用（従来は失敗が完全に無音だった）
 
+// ★2026-09-18: gateway.csvの列構成を「timestamp,mac,payload_hex,rssi」（旧）から
+// 「...,ch1〜ch8,measured_at」（新、デコード済みセンサー値付き）へ変更した際、
+// 既にSDカードに残っている旧ヘッダーのgateway.csvはそのままでは新しい列のデータと
+// 混ざってヘッダーと中身が食い違ってしまう。起動のたびにヘッダーを確認し、
+// 古い形式であれば中身を消さずにgwarch.csvへ退避してから、新ヘッダーで
+// gateway.csvを作り直す（退避ファイルは1世代のみ保持。既にあれば上書きする）。
+static const char* GATEWAY_CSV_HEADER =
+    "timestamp,mac,payload_hex,rssi,ch1,ch2,ch3,ch4,ch5,ch6_tempC,ch7_V,ch8_V,measured_at";
+
+static void ensureGatewayCsvHeader() {
+  if (!SD.exists("gateway.csv")) {
+    File f = SD.open("gateway.csv", FILE_WRITE);
+    if (f) {
+      f.println(GATEWAY_CSV_HEADER);
+      f.close();
+    }
+    return;
+  }
+
+  File check = SD.open("gateway.csv", FILE_READ);
+  if (!check) return;  // 開けない場合は何もしない（後続のsdLog()側で改めてエラーになる）
+  String firstLine = check.readStringUntil('\n');
+  firstLine.trim();
+  check.close();
+  if (firstLine == GATEWAY_CSV_HEADER) return;  // 既に新形式
+
+  Serial.println(F("[SD] gateway.csvの列構成が旧形式のため移行します（既存データはgwarch.csvへ退避）"));
+  SD.remove("gwarch.csv");  // 前回分の退避ファイルが残っていれば上書き
+
+  File src = SD.open("gateway.csv", FILE_READ);
+  File dst = SD.open("gwarch.csv", FILE_WRITE);
+  if (src && dst) {
+    while (src.available()) dst.write(src.read());
+  } else {
+    Serial.println(F("[SD] gateway.csvの退避に失敗しました（旧ファイルはそのまま残します）"));
+  }
+  if (src) src.close();
+  if (dst) dst.close();
+
+  SD.remove("gateway.csv");
+  File nf = SD.open("gateway.csv", FILE_WRITE);
+  if (nf) {
+    nf.println(GATEWAY_CSV_HEADER);
+    nf.close();
+  }
+}
+
 // gateway.csv への1行書き込み。戻り値は成否（呼び出し側でログ件数の実績と突き合わせられるように）。
 bool sdLog(String line) {
   if (!sdAvailable) return false;
@@ -1773,6 +1899,50 @@ static uint32_t readRtcEpochSafe(uint32_t fallbackEpoch) {
     return fallbackEpoch;
   }
   return (uint32_t)(now.unixtime() - JST_OFFSET_SEC);
+}
+
+// ★2026-09-18: gateway.csvに生のhexだけでなくデコード済みセンサー値も残す
+// （現場でSDカードを直接確認する際、hexを手作業で解読しなくて済むようにするため）。
+// ver1.3のLoRaペイロード（33B、PktType=0x12、内容はupdateRecordFromPayload()の
+// fieldEpoch解説と同じ構造）のみ対応。それ以外（旧BLE 20/24B形式等）は全列空欄で返す
+// （生hexは常に別列で残るため、デコードできない形式でもデータそのものは失われない）。
+// 返り値は必ず","が9個（CH1〜8＋計測日時の9列分）含まれる文字列。
+static String decodePayloadToCsvFields(const uint8_t* payload, uint8_t payloadLen) {
+  if (payloadLen != 33 || payload[0] != 0x12) {
+    return ",,,,,,,,,";  // CH1-8(8列)+計測日時(1列) = 空カンマ9個
+  }
+  String out;
+  for (int ch = 0; ch < 5; ch++) {
+    int32_t v = (int32_t)((uint32_t)payload[2 + ch * 4] |
+                           ((uint32_t)payload[3 + ch * 4] << 8) |
+                           ((uint32_t)payload[4 + ch * 4] << 16) |
+                           ((uint32_t)payload[5 + ch * 4] << 24));
+    out += ",";
+    if (v != (int32_t)0x7FFFFFFF) out += String(v / 100.0f, 2);
+  }
+  int16_t ch6 = (int16_t)((uint16_t)payload[22] | ((uint16_t)payload[23] << 8));
+  int16_t ch7 = (int16_t)((uint16_t)payload[24] | ((uint16_t)payload[25] << 8));
+  int16_t ch8 = (int16_t)((uint16_t)payload[26] | ((uint16_t)payload[27] << 8));
+  out += ",";
+  if (ch6 != (int16_t)0x7FFF) out += String(ch6 / 10.0f, 1);
+  out += ",";
+  if (ch7 != (int16_t)0x7FFF) out += String(ch7 / 1000.0f, 3);
+  out += ",";
+  if (ch8 != (int16_t)0x7FFF) out += String(ch8 / 1000.0f, 3);
+
+  // フィールドユニット自身の計測epoch（JST-naive。updateRecordFromPayload()と同じ解釈）を
+  // そのまま人が読める日時表記にする（Gateway自身のRTC変換は行わない＝生の値をそのまま出す）。
+  uint32_t fieldEpoch = (uint32_t)payload[29] | ((uint32_t)payload[30] << 8) |
+                        ((uint32_t)payload[31] << 16) | ((uint32_t)payload[32] << 24);
+  // RTClibのDateTime(uint32_t)はUnixエポック(1970年起点)を受け取れる。TZ変換は行わず
+  // JST-naiveな生の数字をそのままYYYY-MM-DD HH:MM:SS表記にするだけ（gmtime/localtime不要）。
+  DateTime dt(fieldEpoch);
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+           dt.year(), dt.month(), dt.day(), dt.hour(), dt.minute(), dt.second());
+  out += ",";
+  out += buf;
+  return out;
 }
 
 static void updateRecordFromPayload(const uint8_t mac[6], const uint8_t *payload, uint8_t payloadLen, int rssi) {
@@ -1823,7 +1993,8 @@ static void updateRecordFromPayload(const uint8_t mac[6], const uint8_t *payload
     if (payload[j] < 0x10) hex += '0';
     hex += String(payload[j], HEX);
   }
-  sdLog(getTimestamp() + "," + String(macStr) + "," + hex + "," + String(rssi));
+  sdLog(getTimestamp() + "," + String(macStr) + "," + hex + "," + String(rssi) +
+        decodePayloadToCsvFields(payload, payloadLen));
 #endif
 }
 
@@ -2401,6 +2572,41 @@ static void sendTimeSyncDownlink(uint8_t targetDeviceId) {
 
   // sendDownlinkCommand()と同じ理由でRXを明示的に再武装する（コメント参照）。
   NRF_UARTE1->TASKS_STARTRX = 1;
+}
+
+// ── 起動直後の時刻同期ビーコン（★2026-09-13追加） ──────────────────────
+// 【背景】従来はダウンリンク（時刻同期）が「子機のアップリンク受信をトリガーに約400ms後に
+// 送る」設計だった。そのため、Gatewayを先に起動して初期設定（SIM7080G接続等）を終えてから
+// 子機の電源を入れても、Gatewayが定期送信サイクルのAT通信中(s_atBusy)にちょうど子機の
+// 「最初の」アップリンクが重なると、その回の時刻同期は間に合わない（次のアップリンクまで
+// 持ち越し）。特に電源投入直後の1回目の計測データは、この構造上どうしても間に合わなかった。
+// 【対策】Gatewayの初期設定が完了した時点から一定時間（BOOT_BEACON_DURATION_MS）、
+// 全子機向けブロードキャスト(宛先DeviceID=DOWNLINK_BROADCAST_DEVICE_ID)の時刻同期
+// ダウンリンクを一定間隔(BOOT_BEACON_INTERVAL_MS)で送り続ける。子機側は起動直後・
+// 最初の計測の前にこのビーコンを待ち受けるため、電源投入後いちばん最初の計測から
+// 正しい時刻を使えるようになる。
+static const uint8_t  DOWNLINK_BROADCAST_DEVICE_ID = 0xFF;  // 子機側と一致させること
+static const uint32_t BOOT_BEACON_DURATION_MS      = 120000UL;  // 起動後この時間だけビーコンを送る(2分)
+static const uint32_t BOOT_BEACON_INTERVAL_MS      = 5000UL;    // ビーコンの送信間隔
+
+static bool     s_bootBeaconActive   = false;
+static uint32_t s_bootBeaconStartMs  = 0;
+static uint32_t s_lastBootBeaconMs   = 0;
+
+// loop()から毎回呼ぶ。起動ビーコン期間中、s_atBusyでなければ一定間隔で送信する。
+static void sendBootBeaconIfDue() {
+  if (!s_bootBeaconActive) return;
+  uint32_t now = millis();
+  if (now - s_bootBeaconStartMs >= BOOT_BEACON_DURATION_MS) {
+    s_bootBeaconActive = false;
+    Serial.println(F("[DOWNLINK] 起動ビーコン送信期間を終了します"));
+    return;
+  }
+  if (s_atBusy) return;  // AT通信中は通常のダウンリンクと同じ理由で見送る
+  if (s_lastBootBeaconMs != 0 && (now - s_lastBootBeaconMs) < BOOT_BEACON_INTERVAL_MS) return;
+  s_lastBootBeaconMs = now;
+  Serial.println(F("[DOWNLINK] 起動ビーコン(時刻同期・ブロードキャスト)を送信します"));
+  sendTimeSyncDownlink(DOWNLINK_BROADCAST_DEVICE_ID);
 }
 
 // 子機のアップリンクを検知したときの処理。予約があればダウンリンクを送る。
@@ -3399,7 +3605,8 @@ void flushRecords() {
       if (liveSnap[i].payload[j] < 0x10) hex += '0';
       hex += String(liveSnap[i].payload[j], HEX);
     }
-    if (sdLog(ts + "," + String(mac) + "," + hex + "," + String(liveSnap[i].rssi))) sdWrittenCount++;
+    if (sdLog(ts + "," + String(mac) + "," + hex + "," + String(liveSnap[i].rssi) +
+               decodePayloadToCsvFields(liveSnap[i].payload, liveSnap[i].payloadLen))) sdWrittenCount++;
   }
   if (liveN > 0) {
     Serial.print(F("[SD] ")); Serial.print(sdWrittenCount); Serial.print(F("/")); Serial.print(liveN);
@@ -3867,6 +4074,14 @@ void setup() {
     Serial.println(F("✗ DS3231 が見つかりません（タイムスタンプは millis 基準）"));
   }
 
+  // ★2026-09-18: SDへ書き込むファイルのFATタイムスタンプ（Finder上の「更新日」等）が
+  // 常に2000-01-01のままだった件の対策。SD.begin()より前に登録すること
+  // （sdFatDateTimeCallback()のコメント参照）。RTCが未同期の間は2000-01-01のままだが、
+  // 網時刻同期（syncRtcFromNetworkTime）完了後の書込からは正しい日時になる。
+  if (rtcAvailable) {
+    SdFile::dateTimeCallback(sdFatDateTimeCallback);
+  }
+
   // SD カード初期化（CS直結）
   if (SD.begin(SD_CS_PIN)) {
     sdAvailable = true;
@@ -3890,11 +4105,8 @@ void setup() {
     Serial.print(F("[RESETREAS/SD] 0x")); Serial.print(resetReason, HEX);
     Serial.print(F(" 起動時刻=")); Serial.println(getTimestamp());
 
-    // ヘッダ行がなければ書く
-    if (!SD.exists("gateway.csv")) {
-      File f = SD.open("gateway.csv", FILE_WRITE);
-      if (f) { f.println("timestamp,mac,payload_hex,rssi"); f.close(); }
-    }
+    // ヘッダ行の確認・必要なら新形式へ移行（詳細はensureGatewayCsvHeader()のコメント参照）
+    ensureGatewayCsvHeader();
   } else {
     Serial.println(F("✗ SD カード初期化失敗（SD なしで続行）"));
   }
@@ -4135,6 +4347,19 @@ void setup() {
   }
 #endif
 #endif  // LTEM_SEND_ENABLED
+
+#ifdef COMM_MODE_LORA
+  // ★2026-09-13: 初期設定完了時点から一定時間、時刻同期ビーコンをブロードキャストする
+  // (詳細はsendBootBeaconIfDue()のコメント参照)。STAGE3/4のAT疎通確認に失敗してsetup()を
+  // 途中でreturnした場合はここへ到達せず起動ビーコンは送られないが、その場合はLTE-Mが
+  // 使えていないためs_atBusyで詰まることも無く、従来通りアップリンク直後の同期で足りる。
+  s_bootBeaconActive  = true;
+  s_bootBeaconStartMs = millis();
+  s_lastBootBeaconMs  = 0;
+  Serial.print(F("[DOWNLINK] 起動ビーコン(時刻同期・ブロードキャスト)を"));
+  Serial.print(BOOT_BEACON_DURATION_MS / 1000);
+  Serial.println(F("秒間送信します"));
+#endif
 }
 
 // ══════════════════════════════════════════════
@@ -4157,6 +4382,7 @@ void loop() {
 #ifdef COMM_MODE_LORA
   loraPoll();                 // 受信バッファを読み切り、フレームが完成していればレコードへ反映
   handlePendingBleCommands(); // コントローラーからのBLE設定/コマンド要求を安全なタイミングで実行
+  sendBootBeaconIfDue();      // 起動直後の一定時間、時刻同期ビーコンをブロードキャスト
 #endif
 
   // デバッグ心拍: 10秒ごとに次回送信までの残り時間を表示
@@ -4223,9 +4449,21 @@ void loop() {
   //   スプレッドシートの「計測時刻」が遅れて見える問題があった（Gateway側main.cpp参照）。
   bool sendDueByTimer = (now - lastSend >= sendIntervalMs);
   bool sendDueByNewData = s_loraNewDataFlag;
-  if (sendDueByTimer || sendDueByNewData) {
+
+  // ★2026-09-15: 送信トリガーを検知しても即AT通信に入らず、まず「予約」だけする。
+  //   予約した瞬間の状態(新規受信起因か定期送信起因か)をs_flushArmedByNewDataに固定し、
+  //   その後FLUSH_ARM_BUFFER_MSが経過するまでは他の子機の受信を待つ（詳細は
+  //   s_flushArmed宣言部のコメント参照）。既に予約済みの間に新たな受信が続いても
+  //   再予約はしない（バッファ窓を際限なく延長しないため）。
+  if (!s_flushArmed && (sendDueByTimer || sendDueByNewData)) {
+    s_flushArmed = true;
+    s_flushArmedMs = now;
+    s_flushArmedByNewData = sendDueByNewData;
+  }
+
+  if (s_flushArmed && (now - s_flushArmedMs >= FLUSH_ARM_BUFFER_MS)) {
     lastSend = now;
-    Serial.println(sendDueByNewData ? F("\n=== 新規LoRa受信による即時送信 ===") : F("\n=== 定期送信 ==="));
+    Serial.println(s_flushArmedByNewData ? F("\n=== 新規LoRa受信による即時送信（バッファ後）===") : F("\n=== 定期送信 ==="));
     Serial.print(F("時刻: ")); Serial.println(getTimestamp());
 
 #if TEST_PERIODIC_FAKE_DATA
@@ -4298,6 +4536,7 @@ void loop() {
     //   サイクル完了後にクリアすることで、このサイクル中に取り込み済みの受信を再トリガーの
     //   材料にしない。サイクル完了後に届いた本当に新しい受信だけが次のトリガーになる。
     s_loraNewDataFlag = false;
+    s_flushArmed = false;
   }
 
   // 手動 AT コマンドモード（シリアルから入力）

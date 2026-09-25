@@ -15,6 +15,8 @@ using std::atomic;
 
 #include <SPI.h>
 #include <SD.h>
+#include <time.h>
+#include <sys/time.h>
 
 // ===== SDカード (Dumpコマンドで受信したログの保存先。AVL基板と共通ピン配置) =====
 #define SD_CS_PIN 5
@@ -312,12 +314,21 @@ struct MonitaDevice {
     int16_t chRaw[8];  // CH1-5:µε/mm相当(そのままの値), CH6:0.1℃単位, CH7-8:mV。0x7FFFはNaN
     bool    chOk[8];
     uint32_t lastSeenMs;
+    uint32_t measuredEpoch;  // フィールドユニットの計測時刻(UNIXエポック秒)。0=未対応ファーム(旧20B)
 };
 static std::vector<MonitaDevice> g_devices;
 
 // Mesure画面で表示中のデバイス（GATT接続の有無に関わらず、パッシブ受信値を表示し続ける）
 static bool g_hasSelected = false;
 static NimBLEAddress g_selectedAddr;
+
+// GATT接続中("LIVE:"通知)で受信した最新の計測時刻文字列と、それを受信したコントローラー側millis()。
+// ★2026-09-13: 以前はapplyLiveUpdate()が受信の都度ui_timestampへ絶対時刻のみを書いていたため、
+// パッシブ受信時にあった「◯秒前」併記が接続中は表示されなくなっていた。measureScreenAutoRefresh()側で
+// 定期的に経過秒を計算して併記できるよう、受信時刻をここに保持しておく。
+static char g_liveTimeAbs[40] = "";
+static uint32_t g_liveLastMs = 0;
+static bool g_haveLiveTime = false;
 
 static MonitaDevice* findDeviceByAddress(const NimBLEAddress& addr) {
     for (auto& d : g_devices) {
@@ -330,7 +341,9 @@ class MonitaAdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     void onResult(NimBLEAdvertisedDevice* advertisedDevice) override {
         if (!advertisedDevice->haveManufacturerData()) return;
         std::string md = advertisedDevice->getManufacturerData();
-        if (md.size() != 20) return;
+        // ★2026-09-12: 計測時刻(Epoch, 4B)追加により20B→24Bへ拡張。
+        // 未更新のフィールドユニット(旧ファーム)とも当面併用できるよう、両サイズを受け付ける。
+        if (md.size() != 20 && md.size() != 24) return;
         const uint8_t* b = (const uint8_t*)md.data();
         if (b[0] != MONITA_COMPANY_LO || b[1] != MONITA_COMPANY_HI || b[2] != MONITA_PKT_TYPE) return;
 
@@ -349,6 +362,12 @@ class MonitaAdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
             int16_t v = (int16_t)((uint16_t)b[4 + i * 2] | ((uint16_t)b[5 + i * 2] << 8));
             slot->chOk[i]  = (v != 0x7FFF);
             slot->chRaw[i] = v;
+        }
+        if (md.size() == 24) {
+            slot->measuredEpoch = (uint32_t)b[20] | ((uint32_t)b[21] << 8) |
+                                  ((uint32_t)b[22] << 16) | ((uint32_t)b[23] << 24);
+        } else {
+            slot->measuredEpoch = 0;  // 旧ファーム、計測時刻無し
         }
         slot->lastSeenMs = millis();
     }
@@ -391,6 +410,42 @@ static void set_spinbox_value_async(lv_obj_t* spinbox, int32_t value) {
     lv_async_call(apply_spinbox_update, u);
 }
 
+// ★2026-09-12: ゼロ調(TARE)・ログ転送(DUMP)の結果が画面上に一切出ず、
+// シリアルログでしか確認できなかった（現場での実運用ではシリアルモニタを見られない）ため、
+// 簡易メッセージボックスで結果を表示する。メインループ(LVGLスレッド)から直接呼ぶこと。
+// ★2026-09-13: 以前は独自の"OK"ボタンを持たせていたが、閉じるイベントを紐付けておらず
+// 押しても反応しなかった（実機で確認）。また画面左上に寄って表示される問題もあった。
+// ボタンは無くし、標準の閉じる(×)アイコンのみで閉じる形にして中央表示にする。
+// なお×アイコンはLVGL標準のLV_SYMBOL_CLOSEを使うが、avl_jp_14フォントにはこの記号の
+// グリフが無く四角(tofu)に見えるため、ドロップダウン矢印のときと同様にASCII "x" へ差し替える。
+static void showInfoMsgbox(const char* title, const char* message) {
+    lv_obj_t* mbox = lv_msgbox_create(NULL, title, message, NULL, true);
+    lv_obj_center(mbox);
+    lv_obj_t* closeBtn = lv_msgbox_get_close_btn(mbox);
+    if (closeBtn != NULL) {
+        lv_obj_t* closeLbl = lv_obj_get_child(closeBtn, 0);
+        if (closeLbl != NULL) {
+            lv_label_set_text(closeLbl, "x");
+        }
+    }
+}
+
+// BLE通知コールバック(別タスク)から呼ぶ版。lv_async_call()でLVGLスレッドへ委譲する。
+struct MsgboxInfo { char* title; char* message; };
+static void apply_msgbox_show(void* p) {
+    MsgboxInfo* u = (MsgboxInfo*)p;
+    showInfoMsgbox(u->title, u->message);
+    free(u->title);
+    free(u->message);
+    delete u;
+}
+static void show_msgbox_async(const char* title, const char* message) {
+    MsgboxInfo* u = new MsgboxInfo();
+    u->title = strdup(title);
+    u->message = strdup(message);
+    lv_async_call(apply_msgbox_show, u);
+}
+
 // msgの中から "KEY=" を探し、次の ';' または末尾までの値を返す。見つからなければ isFound=false。
 static String extractField(const String& msg, const char* key, bool& isFound) {
     int idx = msg.indexOf(key);
@@ -430,17 +485,45 @@ static void applyRunStateAsync(bool running) {
         bool running = *(bool*)arg;
         delete (bool*)arg;
         if (running) {
-            lv_label_set_text(ui_Label11, "Status: Running");
+            lv_label_set_text(ui_Label11, "現在の状況：稼働中");
             lv_obj_set_style_text_color(ui_Label11, lv_color_hex(0x00AA00), LV_PART_MAIN);
             lv_obj_add_flag(ui_start, LV_OBJ_FLAG_HIDDEN);
             lv_obj_clear_flag(ui_stop, LV_OBJ_FLAG_HIDDEN);
         } else {
-            lv_label_set_text(ui_Label11, "Status: Stopped");
+            lv_label_set_text(ui_Label11, "現在の状況：停止中");
             lv_obj_set_style_text_color(ui_Label11, lv_color_hex(0x888888), LV_PART_MAIN);
             lv_obj_clear_flag(ui_start, LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(ui_stop, LV_OBJ_FLAG_HIDDEN);
         }
     }, p);
+}
+
+// ★2026-09-20: SDカードに保存されるファイル（DUMPの保存ファイル等）の更新日時が
+// 常に1980-01-01（FATの既定値）になっていた件の対策。コントローラー自身は時計を
+// 持たないため、フィールドユニットからBLEで受け取るTIME文字列（GET応答・LIVE通知の
+// どちらにも含まれる、フィールドユニット自身の計測時刻）を使ってESP32内部の
+// システム時計を設定する。
+// ★ESP32のSD/FATFS実装（ESP-IDF vfs_fat、GatewayのnRチェ52840/SdFatとは別物）には
+// dateTimeCallbackのような登録の仕組みは無く、get_fattime()が内部でシステム時計
+// （time()）を直接参照する作りになっている。そのためsettimeofday()でシステム時計を
+// 設定するだけで、以降のファイル作成・書込のFATタイムスタンプへ自動的に反映される
+// （接続後に一度でも時刻を受け取れば、以降のSD書き込みが正しい日時になる）。
+static void setSystemTimeFromString(const String& timeStr) {
+    int year, mon, day, hh, mm, ss;
+    if (sscanf(timeStr.c_str(), "%d-%d-%d %d:%d:%d", &year, &mon, &day, &hh, &mm, &ss) != 6) return;
+    struct tm tmv = {};
+    tmv.tm_year = year - 1900;
+    tmv.tm_mon  = mon - 1;
+    tmv.tm_mday = day;
+    tmv.tm_hour = hh;
+    tmv.tm_min  = mm;
+    tmv.tm_sec  = ss;
+    time_t t = mktime(&tmv);
+    if (t <= 0) return;
+    struct timeval tv;
+    tv.tv_sec = t;
+    tv.tv_usec = 0;
+    settimeofday(&tv, nullptr);
 }
 
 // "LIVE:CH1=1.94,CH2=1.41,...,CH8=1.884,TIME=2026-08-10 05:51:00" を解析して
@@ -453,7 +536,7 @@ static void applyLiveUpdate(const String& msg) {
     String timeVal = (timeIdx >= 0) ? body.substring(timeIdx + 5) : String("--");
 
     static const char* keys[8]  = {"CH1=", "CH2=", "CH3=", "CH4=", "CH5=", "CH6=", "CH7=", "CH8="};
-    static const char* units[8] = {"uS", "uS", "uS", "mm", "mm", "C", "V", "V"};
+    static const char* units[8] = {"uS", "uS", "uS", "uS", "uS", "C", "V", "V"};
     lv_obj_t* chLabels[8] = {ui_CH1, ui_CH2, ui_CH3, ui_CH4, ui_CH5, ui_CH6, ui_CH7, ui_CH8};
 
     for (int i = 0; i < 8; i++) {
@@ -466,7 +549,11 @@ static void applyLiveUpdate(const String& msg) {
         snprintf(text, sizeof(text), "CH%d:%s%s", i + 1, val.c_str(), units[i]);
         set_label_async(chLabels[i], text);
     }
-    set_label_async(ui_timestamp, "timestamp: " + timeVal);
+    strncpy(g_liveTimeAbs, timeVal.c_str(), sizeof(g_liveTimeAbs) - 1);
+    g_liveTimeAbs[sizeof(g_liveTimeAbs) - 1] = '\0';
+    g_liveLastMs = millis();
+    g_haveLiveTime = true;
+    setSystemTimeFromString(timeVal);
 }
 
 static void bleNotifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
@@ -503,13 +590,15 @@ static void bleNotifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData,
     // GET応答時は、Setting画面のラベルとスピンボックスの現在値の両方を実機の設定に同期する
     // （「現在設定→編集→保存」の流れにするため。GET応答以外ではスピンボックス値は書き換えない
     //   ＝ユーザーが今まさに編集中の値を横から上書きしないようにする）。
-    bool hasInterval, hasN, hasM;
+    bool hasInterval, hasN, hasM, hasTime;
     String intervalVal = extractField(msg, "INTERVAL=", hasInterval);
     String nVal        = extractField(msg, "N=", hasN);
     String mVal        = extractField(msg, "M=", hasM);
+    String getTimeVal  = extractField(msg, "TIME=", hasTime);
+    if (hasTime) setSystemTimeFromString(getTimeVal);
 
     if (hasInterval) {
-        set_label_async(ui_sleepDisplay, "Interval: " + intervalVal + " min.");
+        set_label_async(ui_sleepDisplay, "計測インターバル 現在:" + intervalVal + "分");
         if (hasN && hasM) {
             // 3つ揃っているのはGET応答のときだけ＝実機の現在値をスピンボックスへ反映してよい
             set_spinbox_value_async(ui_Spinbox1, intervalVal.toInt());
@@ -517,31 +606,39 @@ static void bleNotifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData,
             set_spinbox_value_async(ui_Spinbox3, mVal.toInt());
         }
     } else if (msg.startsWith("OK:INTERVAL=")) {
-        set_label_async(ui_sleepDisplay, "Interval: " + msg.substring(12) + " min.");
+        set_label_async(ui_sleepDisplay, "計測インターバル 現在:" + msg.substring(12) + "分");
     } else if (msg == "ERR:INTERVAL") {
         Serial.println("[BLE] Interval設定エラー（5〜1440分の範囲外）");
     }
 
     if (hasN) {
-        set_label_async(ui_Interval, "Average:" + nVal + "times");
+        set_label_async(ui_Interval, "平均化回数 現在:" + nVal + "回");
     } else if (msg.startsWith("OK:AVGN=")) {
-        set_label_async(ui_Interval, "Average:" + msg.substring(8) + "times");
+        set_label_async(ui_Interval, "平均化回数 現在:" + msg.substring(8) + "回");
     } else if (msg == "ERR:AVGN") {
         Serial.println("[BLE] Average回数設定エラー（1〜50の範囲外）");
     }
 
     if (hasM) {
-        set_label_async(ui_Interval1, "Median:" + mVal + "times");
+        set_label_async(ui_Interval1, "中央値回数 現在:" + mVal + "回");
     } else if (msg.startsWith("OK:AVGM=")) {
-        set_label_async(ui_Interval1, "Median:" + msg.substring(8) + "times");
+        set_label_async(ui_Interval1, "中央値回数 現在:" + msg.substring(8) + "回");
     } else if (msg == "ERR:AVGM") {
         Serial.println("[BLE] Median回数設定エラー（1〜25の範囲外）");
     }
 
+    if (msg.startsWith("OK:TIME=")) {
+        Serial.println("[BLE] 時刻設定完了: " + msg.substring(8));
+    } else if (msg == "ERR:SETTIME") {
+        Serial.println("[BLE] 時刻設定エラー");
+    }
+
     if (msg == "OK:TARE") {
         Serial.println("[BLE] Tare完了（CH1-5すべて成功）");
+        show_msgbox_async("ゼロ調", "ゼロ調が完了しました。");
     } else if (msg == "ERR:TARE_PARTIAL") {
         Serial.println("[BLE] Tare一部失敗（CH1-5のいずれかでエラー）");
+        show_msgbox_async("ゼロ調", "一部のチャンネルでゼロ調に失敗しました。");
     }
 
     // GET応答("RUN=1;...")・START/STOP応答("OK:RUN=1"/"OK:RUN=0")のいずれにも対応
@@ -571,7 +668,7 @@ static void refreshDeviceListOptions() {
 
     char options[512];
     if (g_devices.empty()) {
-        snprintf(options, sizeof(options), "No devices found");
+        snprintf(options, sizeof(options), "デバイスが見つかりません");
     } else {
         options[0] = '\0';
         for (size_t i = 0; i < g_devices.size(); i++) {
@@ -621,13 +718,22 @@ static void measureScreenAutoRefresh() {
 
     if (lv_scr_act() != ui_Mesure || !g_hasSelected) return;
 
-    // GATT接続中は ble_client の "LIVE:" Notify が表示を更新するので、
-    // ここでパッシブ受信のキャッシュ値を書き戻して上書きしないようにする。
-    if (pBleClient != nullptr && pBleClient->isConnected()) return;
+    // GATT接続中は ble_client の "LIVE:" Notify がCH値を更新するので、
+    // ここではCH値を上書きしない。ただし時刻ラベルの「◯秒前」は時間経過とともに
+    // 増え続ける必要があるため、Notify受信時刻(g_liveLastMs)から都度計算して更新する。
+    if (pBleClient != nullptr && pBleClient->isConnected()) {
+        if (g_haveLiveTime) {
+            unsigned long agoSec = (unsigned long)((now - g_liveLastMs) / 1000);
+            char ts[72];
+            snprintf(ts, sizeof(ts), "計測時刻: %s (%lu秒前)", g_liveTimeAbs, agoSec);
+            lv_label_set_text(ui_timestamp, ts);
+        }
+        return;
+    }
 
     MonitaDevice* d = findDeviceByAddress(g_selectedAddr);
     if (d == nullptr) {
-        lv_label_set_text(ui_timestamp, "timestamp: (no signal)");
+        lv_label_set_text(ui_timestamp, "計測時刻: (信号なし)");
         return;
     }
 
@@ -644,14 +750,33 @@ static void measureScreenAutoRefresh() {
     lv_label_set_text(ui_CH1, ("CH1:" + fmtCh(0, "uS", 1.0f)).c_str());
     lv_label_set_text(ui_CH2, ("CH2:" + fmtCh(1, "uS", 1.0f)).c_str());
     lv_label_set_text(ui_CH3, ("CH3:" + fmtCh(2, "uS", 1.0f)).c_str());
-    lv_label_set_text(ui_CH4, ("CH4:" + fmtCh(3, "mm", 1.0f)).c_str());
-    lv_label_set_text(ui_CH5, ("CH5:" + fmtCh(4, "mm", 1.0f)).c_str());
+    lv_label_set_text(ui_CH4, ("CH4:" + fmtCh(3, "uS", 1.0f)).c_str());
+    lv_label_set_text(ui_CH5, ("CH5:" + fmtCh(4, "uS", 1.0f)).c_str());
     lv_label_set_text(ui_CH6, ("CH6:" + fmtCh(5, "C", 0.1f)).c_str());
     lv_label_set_text(ui_CH7, ("CH7:" + fmtCh(6, "V", 0.001f)).c_str());
     lv_label_set_text(ui_CH8, ("CH8:" + fmtCh(7, "V", 0.001f)).c_str());
 
-    char ts[32];
-    snprintf(ts, sizeof(ts), "timestamp: %lus ago", (unsigned long)((now - d->lastSeenMs) / 1000));
+    // ★2026-09-12: フィールドユニット側のBLE MSDに計測時刻(Epoch)を追加したので、
+    // 未接続時（パッシブ受信のみ）でも実際の計測時刻をそのまま表示できる
+    // （コントローラー自身は時計を持たないが、フィールドユニットの時刻をそのまま貰う形）。
+    // 旧ファーム（Epoch非対応、20Bのみ）からの受信時はmeasuredEpoch=0のままなので、
+    // その場合だけ従来通り「最後に受信してから何秒か」を表示する。
+    // ★同日追記: 絶対時刻だけだと「次はいつ計測されるのか」が分からず待たされている感が
+    // 強いというフィードバックがあったため、以前あった「何秒前」の表示を併記する形で復活させる
+    // （絶対時刻は残す。lastSeenMsはコントローラー自身のmillis()基準なので、フィールド側との
+    // 時刻同期状態に関わらず常に正しく経過秒を計算できる）。
+    char ts[72];
+    if (d->measuredEpoch != 0) {
+        time_t t = (time_t)d->measuredEpoch;
+        struct tm tmv;
+        gmtime_r(&t, &tmv);
+        char abs[40];
+        strftime(abs, sizeof(abs), "%Y-%m-%d %H:%M:%S", &tmv);
+        unsigned long agoSec = (unsigned long)((now - d->lastSeenMs) / 1000);
+        snprintf(ts, sizeof(ts), "計測時刻: %s (%lu秒前)", abs, agoSec);
+    } else {
+        snprintf(ts, sizeof(ts), "最新受信から%lu秒", (unsigned long)((now - d->lastSeenMs) / 1000));
+    }
     lv_label_set_text(ui_timestamp, ts);
 }
 
@@ -663,6 +788,7 @@ static void dumpWriteIfReady() {
     if (!g_sd_ok || g_dumpBuffer.empty()) {
         Serial.println("[DUMP] SD unavailable or empty buffer, discarding");
         g_dumpBuffer.clear();
+        showInfoMsgbox("ログ転送", "SD未検出またはデータが空のため保存できませんでした。");
         return;
     }
 
@@ -672,11 +798,15 @@ static void dumpWriteIfReady() {
     if (!f) {
         Serial.printf("[DUMP] Failed to open %s for write\n", path);
         g_dumpBuffer.clear();
+        showInfoMsgbox("ログ転送", "SDへの書き込みに失敗しました。");
         return;
     }
     f.write(g_dumpBuffer.data(), g_dumpBuffer.size());
     f.close();
     Serial.printf("[DUMP] Saved %u bytes to %s\n", (unsigned)g_dumpBuffer.size(), path);
+    char okMsg[64];
+    snprintf(okMsg, sizeof(okMsg), "ログ転送が完了しました。（%u バイト）", (unsigned)g_dumpBuffer.size());
+    showInfoMsgbox("ログ転送", okMsg);
     g_dumpBuffer.clear();
 }
 
@@ -800,13 +930,66 @@ extern "C" void ble_open_settings(void) {
     }
 }
 
+extern "C" void ble_open_settime(void) {
+    if (lv_scr_act() != ui_SetTime) {
+        _ui_screen_change(&ui_SetTime, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, &ui_SetTime_screen_init);
+    }
+
+    // ★2026-09-12: 西暦から全て手入力する負担を減らすため、フィールドユニットの
+    // 直近の計測時刻（BLE MSDのEpoch。GATT接続中も並行して受信し続けている）を
+    // スピンボックスの初期値として反映しておく。多少のズレは+/-で微調整すればよく、
+    // 全桁を打ち直すよりずっと手間が少ない。取得できなければデフォルト値のまま。
+    if (g_hasSelected) {
+        MonitaDevice* d = findDeviceByAddress(g_selectedAddr);
+        if (d != nullptr && d->measuredEpoch != 0) {
+            time_t t = (time_t)d->measuredEpoch;
+            struct tm tmv;
+            gmtime_r(&t, &tmv);
+            lv_spinbox_set_value(ui_SpinboxYear,  tmv.tm_year + 1900);
+            lv_spinbox_set_value(ui_SpinboxMonth, tmv.tm_mon + 1);
+            lv_spinbox_set_value(ui_SpinboxDay,   tmv.tm_mday);
+            lv_spinbox_set_value(ui_SpinboxHour,  tmv.tm_hour);
+            lv_spinbox_set_value(ui_SpinboxMin,   tmv.tm_min);
+            lv_spinbox_set_value(ui_SpinboxSec,   tmv.tm_sec);
+        }
+    }
+}
+
+extern "C" void ble_set_time(void) {
+    if (pBleClient == nullptr || !pBleClient->isConnected() || pRxCharacteristic == nullptr) {
+        Serial.println("[BLE] Not connected");
+        return;
+    }
+    int32_t year  = lv_spinbox_get_value(ui_SpinboxYear);
+    int32_t month = lv_spinbox_get_value(ui_SpinboxMonth);
+    int32_t day   = lv_spinbox_get_value(ui_SpinboxDay);
+    int32_t hour  = lv_spinbox_get_value(ui_SpinboxHour);
+    int32_t minute = lv_spinbox_get_value(ui_SpinboxMin);
+    int32_t sec   = lv_spinbox_get_value(ui_SpinboxSec);
+
+    char cmd[24];
+    snprintf(cmd, sizeof(cmd), "SETTIME:%04ld%02ld%02ld%02ld%02ld%02ld",
+             (long)year, (long)month, (long)day, (long)hour, (long)minute, (long)sec);
+    Serial.printf("[BLE] send: %s\n", cmd);
+    pRxCharacteristic->writeValue(cmd);
+}
+
+extern "C" void ble_back_to_setting(void) {
+    if (lv_scr_act() != ui_Setting) {
+        _ui_screen_change(&ui_Setting, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, &ui_Setting_screen_init);
+    }
+    if (pBleClient != nullptr && pBleClient->isConnected() && pRxCharacteristic != nullptr) {
+        pRxCharacteristic->writeValue("GET");
+    }
+}
+
 extern "C" void ble_back_to_measure(void) {
     if (lv_scr_act() != ui_Mesure) {
         _ui_screen_change(&ui_Mesure, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, &ui_Mesure_screen_init);
     }
 }
 
-extern "C" void ble_disconnect(void) {
+static void performDisconnect() {
     if (pBleClient != nullptr && pBleClient->isConnected()) {
         pBleClient->disconnect();
     }
@@ -814,6 +997,34 @@ extern "C" void ble_disconnect(void) {
     if (lv_scr_act() != ui_Initial) {
         _ui_screen_change(&ui_Initial, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, &ui_Initial_screen_init);
     }
+}
+
+// 誤タップでの切断・計測中断を防ぐため、確認ダイアログを挟んでから切断する
+// （電源OFFダイアログ(show_poweroff_dialog、下記)と同じ部品・パターンを流用）。
+static lv_obj_t* g_disconnect_mbox = nullptr;
+
+static void disconnect_mbox_event_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        lv_obj_t* mbox = lv_event_get_current_target(e);
+        const char* txt = lv_msgbox_get_active_btn_text(mbox);
+        if (txt != nullptr && strcmp(txt, "はい") == 0) {
+            performDisconnect();
+        }
+        lv_msgbox_close(mbox);
+    } else if (code == LV_EVENT_DELETE) {
+        g_disconnect_mbox = nullptr;
+    }
+}
+
+extern "C" void ble_disconnect(void) {
+    if (g_disconnect_mbox != nullptr) return;
+    static const char* btns[] = { "はい", "いいえ", "" };
+    // ★2026-09-12: 右上の閉じる(×)ボタンは「いいえ」と機能が重複するため無効化(false)。
+    g_disconnect_mbox = lv_msgbox_create(NULL, "切断", "切断しますか？", btns, false);
+    lv_obj_center(g_disconnect_mbox);
+    lv_obj_add_event_cb(g_disconnect_mbox, disconnect_mbox_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(g_disconnect_mbox, disconnect_mbox_event_cb, LV_EVENT_DELETE, NULL);
 }
 
 // ===== 電源OFF処理 (AVLファーム perform_safe_poweroff() を移植) =====
@@ -864,7 +1075,10 @@ static void show_poweroff_dialog() {
     if (g_poweroff_mbox != nullptr) return;
 
     static const char * btns[] = { "はい", "いいえ", "" };
-    g_poweroff_mbox = lv_msgbox_create(NULL, "電源OFF", "電源を切りますか？", btns, true);
+    // ★2026-09-20: 右上の閉じる(×)ボタンは「いいえ」と機能が重複するうえ、
+    // avl_jp_14フォントにLV_SYMBOL_CLOSEのグリフが無く四角(tofu)に見えていたため、
+    // ble_disconnect()の確認ダイアログと同様に無効化(false)する。
+    g_poweroff_mbox = lv_msgbox_create(NULL, "電源OFF", "電源を切りますか？", btns, false);
     lv_obj_center(g_poweroff_mbox);
     lv_obj_add_event_cb(g_poweroff_mbox, poweroff_mbox_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(g_poweroff_mbox, poweroff_mbox_event_cb, LV_EVENT_DELETE, NULL);
@@ -926,6 +1140,9 @@ void setup()
     analogSetPinAttenuation(Sensor_VP, ADC_11db);
 
     SPI.begin(18, 19, 23);
+    // ★2026-09-20: この時点ではまだシステム時計が未設定のため、フィールドユニットと
+    // 接続してTIME文字列を受け取る（setSystemTimeFromString()参照）までは、
+    // 書き込まれるファイルの日時はFAT既定値（1980-01-01）のままになる。
     g_sd_ok = SD.begin(SD_CS_PIN);
     Serial.println(g_sd_ok ? "[OK] SD card" : "[WARN] SD card not found");
 

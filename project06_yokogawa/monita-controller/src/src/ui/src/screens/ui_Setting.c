@@ -5,7 +5,7 @@
 
 #include "../ui.h"
 
-lv_obj_t *ui_Setting = NULL;lv_obj_t *ui_sleepDisplay = NULL;lv_obj_t *ui_Button5 = NULL;lv_obj_t *ui_Label6 = NULL;lv_obj_t *ui_Button8 = NULL;lv_obj_t *ui_Label10 = NULL;lv_obj_t *ui_Interval = NULL;lv_obj_t *ui_Dump = NULL;lv_obj_t *ui_Label15 = NULL;lv_obj_t *ui_Back = NULL;lv_obj_t *ui_Label8 = NULL;lv_obj_t *ui_Button4 = NULL;lv_obj_t *ui_Label5 = NULL;lv_obj_t *ui_Spinbox1 = NULL;lv_obj_t *ui_Button9 = NULL;lv_obj_t *ui_Label4 = NULL;lv_obj_t *ui_Button10 = NULL;lv_obj_t *ui_Label16 = NULL;lv_obj_t *ui_Spinbox2 = NULL;lv_obj_t *ui_Button12 = NULL;lv_obj_t *ui_Label18 = NULL;lv_obj_t *ui_Spinbox3 = NULL;lv_obj_t *ui_Button13 = NULL;lv_obj_t *ui_Label19 = NULL;lv_obj_t *ui_Button7 = NULL;lv_obj_t *ui_Label9 = NULL;lv_obj_t *ui_Interval1 = NULL;
+lv_obj_t *ui_Setting = NULL;lv_obj_t *ui_SettingTitle = NULL;lv_obj_t *ui_SettingPanel = NULL;lv_obj_t *ui_sleepDisplay = NULL;lv_obj_t *ui_Button5 = NULL;lv_obj_t *ui_Label6 = NULL;lv_obj_t *ui_Button8 = NULL;lv_obj_t *ui_Label10 = NULL;lv_obj_t *ui_Interval = NULL;lv_obj_t *ui_Dump = NULL;lv_obj_t *ui_Label15 = NULL;lv_obj_t *ui_Back = NULL;lv_obj_t *ui_Label8 = NULL;lv_obj_t *ui_Button4 = NULL;lv_obj_t *ui_Label5 = NULL;lv_obj_t *ui_Spinbox1 = NULL;lv_obj_t *ui_Button9 = NULL;lv_obj_t *ui_Label4 = NULL;lv_obj_t *ui_Button10 = NULL;lv_obj_t *ui_Label16 = NULL;lv_obj_t *ui_Spinbox2 = NULL;lv_obj_t *ui_Button12 = NULL;lv_obj_t *ui_Label18 = NULL;lv_obj_t *ui_Spinbox3 = NULL;lv_obj_t *ui_Button13 = NULL;lv_obj_t *ui_Label19 = NULL;lv_obj_t *ui_Button7 = NULL;lv_obj_t *ui_Label9 = NULL;lv_obj_t *ui_Interval1 = NULL;lv_obj_t *ui_btnOpenSetTime = NULL;lv_obj_t *ui_btnOpenSetTimeLbl = NULL;
 // event funtions
 void ui_event_Button5( lv_event_t * e) {
     lv_event_code_t event_code = lv_event_get_code(e);
@@ -87,6 +87,14 @@ if ( event_code == LV_EVENT_CLICKED) {
 }
 }
 
+void ui_event_btnOpenSetTime( lv_event_t * e) {
+    lv_event_code_t event_code = lv_event_get_code(e);
+
+if ( event_code == LV_EVENT_CLICKED) {
+      on_open_settime_clicked( e );
+}
+}
+
 // build funtions
 
 void ui_Setting_screen_init(void)
@@ -94,38 +102,62 @@ void ui_Setting_screen_init(void)
 ui_Setting = lv_obj_create(NULL);
 lv_obj_clear_flag( ui_Setting, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
 
-ui_sleepDisplay = lv_label_create(ui_Setting);
+ui_SettingTitle = lv_label_create(ui_Setting);
+lv_obj_set_width( ui_SettingTitle, LV_SIZE_CONTENT);  /// 1
+lv_obj_set_height( ui_SettingTitle, LV_SIZE_CONTENT);   /// 1
+lv_obj_set_x( ui_SettingTitle, 140 );
+lv_obj_set_y( ui_SettingTitle, 4 );
+lv_label_set_text(ui_SettingTitle,"設定");
+
+// ★2026-09-11: 手書きレイアウト案に合わせ、Interval/Average/Medianの3行を
+// 1つの枠(パネル)にまとめて表示する。
+ui_SettingPanel = lv_obj_create(ui_Setting);
+lv_obj_set_width( ui_SettingPanel, 304);
+lv_obj_set_height( ui_SettingPanel, 168);
+lv_obj_set_x( ui_SettingPanel, 8 );
+lv_obj_set_y( ui_SettingPanel, 32 );
+lv_obj_clear_flag( ui_SettingPanel, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
+
+ui_sleepDisplay = lv_label_create(ui_SettingPanel);
 lv_obj_set_width( ui_sleepDisplay, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_sleepDisplay, LV_SIZE_CONTENT);   /// 1
-lv_obj_set_x( ui_sleepDisplay, -75 );
-lv_obj_set_y( ui_sleepDisplay, -62 );
-lv_obj_set_align( ui_sleepDisplay, LV_ALIGN_CENTER );
-lv_label_set_text(ui_sleepDisplay,"Interval: -- min.");
+lv_obj_set_x( ui_sleepDisplay, 10 );
+lv_obj_set_y( ui_sleepDisplay, 12 );
+lv_label_set_text(ui_sleepDisplay,"計測インターバル 現在:--分");
+lv_obj_set_style_text_color(ui_sleepDisplay, lv_color_hex(0x1E5FAE), LV_PART_MAIN);
 
-ui_Button5 = lv_btn_create(ui_Setting);
-lv_obj_set_width( ui_Button5, 100);
-lv_obj_set_height( ui_Button5, 25);
-lv_obj_set_x( ui_Button5, 63 );
-lv_obj_set_y( ui_Button5, 92 );
-lv_obj_set_align( ui_Button5, LV_ALIGN_CENTER );
-lv_obj_add_state( ui_Button5, LV_STATE_USER_1 );     /// States
-lv_obj_add_flag( ui_Button5, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
-lv_obj_clear_flag( ui_Button5, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
-lv_obj_set_style_bg_color(ui_Button5, lv_color_hex(0x188C6F), LV_PART_MAIN | LV_STATE_USER_1 );
-lv_obj_set_style_bg_opa(ui_Button5, 255, LV_PART_MAIN| LV_STATE_USER_1);
+ui_Button7 = lv_btn_create(ui_SettingPanel);
+lv_obj_set_width( ui_Button7, 16);
+lv_obj_set_height( ui_Button7, 28);
+lv_obj_set_x( ui_Button7, 198 );
+lv_obj_set_y( ui_Button7, 8 );
+lv_obj_add_flag( ui_Button7, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
+lv_obj_clear_flag( ui_Button7, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
 
-ui_Label6 = lv_label_create(ui_Button5);
-lv_obj_set_width( ui_Label6, LV_SIZE_CONTENT);  /// 1
-lv_obj_set_height( ui_Label6, LV_SIZE_CONTENT);   /// 1
-lv_obj_set_align( ui_Label6, LV_ALIGN_CENTER );
-lv_label_set_text(ui_Label6,"Tare");
+ui_Label9 = lv_label_create(ui_Button7);
+lv_obj_set_width( ui_Label9, LV_SIZE_CONTENT);  /// 1
+lv_obj_set_height( ui_Label9, LV_SIZE_CONTENT);   /// 1
+lv_obj_set_align( ui_Label9, LV_ALIGN_CENTER );
+lv_label_set_text(ui_Label9,"-");
 
-ui_Button8 = lv_btn_create(ui_Setting);
+ui_Spinbox1 = lv_spinbox_create(ui_SettingPanel);
+lv_obj_set_width( ui_Spinbox1, 48);
+lv_obj_set_height( ui_Spinbox1, 28);
+lv_obj_set_x( ui_Spinbox1, 216 );
+lv_obj_set_y( ui_Spinbox1, 8 );
+lv_spinbox_set_digit_format( ui_Spinbox1, 2, 2);
+lv_spinbox_set_range( ui_Spinbox1, 5,1440 );
+lv_spinbox_set_cursor_pos(ui_Spinbox1, 1 - 1);
+// ★2026-09-12: デフォルトテーマの上下パディングが非対称で、height=28の枠内で
+// テキストが下寄りに見えていたため、上下を揃えて垂直中央に近づける。
+lv_obj_set_style_pad_top(ui_Spinbox1, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
+lv_obj_set_style_pad_bottom(ui_Spinbox1, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+ui_Button8 = lv_btn_create(ui_SettingPanel);
 lv_obj_set_width( ui_Button8, 16);
-lv_obj_set_height( ui_Button8, 24);
-lv_obj_set_x( ui_Button8, -32 );
-lv_obj_set_y( ui_Button8, -27 );
-lv_obj_set_align( ui_Button8, LV_ALIGN_CENTER );
+lv_obj_set_height( ui_Button8, 28);
+lv_obj_set_x( ui_Button8, 266 );
+lv_obj_set_y( ui_Button8, 8 );
 lv_obj_add_flag( ui_Button8, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
 lv_obj_clear_flag( ui_Button8, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
 
@@ -135,24 +167,155 @@ lv_obj_set_height( ui_Label10, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_align( ui_Label10, LV_ALIGN_CENTER );
 lv_label_set_text(ui_Label10,"+");
 
-ui_Interval = lv_label_create(ui_Setting);
+ui_Interval = lv_label_create(ui_SettingPanel);
 lv_obj_set_width( ui_Interval, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_Interval, LV_SIZE_CONTENT);   /// 1
-lv_obj_set_x( ui_Interval, 67 );
-lv_obj_set_y( ui_Interval, -88 );
-lv_obj_set_align( ui_Interval, LV_ALIGN_CENTER );
-lv_label_set_text(ui_Interval,"Average:--times");
+lv_obj_set_x( ui_Interval, 10 );
+lv_obj_set_y( ui_Interval, 50 );
+lv_label_set_text(ui_Interval,"平均化回数 現在:--回");
+lv_obj_set_style_text_color(ui_Interval, lv_color_hex(0x1E5FAE), LV_PART_MAIN);
+
+ui_Button9 = lv_btn_create(ui_SettingPanel);
+lv_obj_set_width( ui_Button9, 16);
+lv_obj_set_height( ui_Button9, 28);
+lv_obj_set_x( ui_Button9, 198 );
+lv_obj_set_y( ui_Button9, 46 );
+lv_obj_add_flag( ui_Button9, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
+lv_obj_clear_flag( ui_Button9, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
+
+ui_Label4 = lv_label_create(ui_Button9);
+lv_obj_set_width( ui_Label4, LV_SIZE_CONTENT);  /// 1
+lv_obj_set_height( ui_Label4, LV_SIZE_CONTENT);   /// 1
+lv_obj_set_align( ui_Label4, LV_ALIGN_CENTER );
+lv_label_set_text(ui_Label4,"-");
+
+ui_Spinbox2 = lv_spinbox_create(ui_SettingPanel);
+lv_obj_set_width( ui_Spinbox2, 40);
+lv_obj_set_height( ui_Spinbox2, 28);
+lv_obj_set_x( ui_Spinbox2, 216 );
+lv_obj_set_y( ui_Spinbox2, 46 );
+lv_spinbox_set_digit_format( ui_Spinbox2, 2, 2);
+lv_spinbox_set_range( ui_Spinbox2, 1,50 );
+lv_spinbox_set_cursor_pos(ui_Spinbox2, 1 - 1);
+lv_obj_set_style_pad_top(ui_Spinbox2, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
+lv_obj_set_style_pad_bottom(ui_Spinbox2, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+ui_Button10 = lv_btn_create(ui_SettingPanel);
+lv_obj_set_width( ui_Button10, 16);
+lv_obj_set_height( ui_Button10, 28);
+lv_obj_set_x( ui_Button10, 258 );
+lv_obj_set_y( ui_Button10, 46 );
+lv_obj_add_flag( ui_Button10, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
+lv_obj_clear_flag( ui_Button10, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
+
+ui_Label16 = lv_label_create(ui_Button10);
+lv_obj_set_width( ui_Label16, LV_SIZE_CONTENT);  /// 1
+lv_obj_set_height( ui_Label16, LV_SIZE_CONTENT);   /// 1
+lv_obj_set_align( ui_Label16, LV_ALIGN_CENTER );
+lv_label_set_text(ui_Label16,"+");
+
+ui_Interval1 = lv_label_create(ui_SettingPanel);
+lv_obj_set_width( ui_Interval1, LV_SIZE_CONTENT);  /// 1
+lv_obj_set_height( ui_Interval1, LV_SIZE_CONTENT);   /// 1
+lv_obj_set_x( ui_Interval1, 10 );
+lv_obj_set_y( ui_Interval1, 88 );
+lv_label_set_text(ui_Interval1,"中央値回数 現在:--回");
+lv_obj_set_style_text_color(ui_Interval1, lv_color_hex(0x1E5FAE), LV_PART_MAIN);
+
+ui_Button12 = lv_btn_create(ui_SettingPanel);
+lv_obj_set_width( ui_Button12, 16);
+lv_obj_set_height( ui_Button12, 28);
+lv_obj_set_x( ui_Button12, 198 );
+lv_obj_set_y( ui_Button12, 84 );
+lv_obj_add_flag( ui_Button12, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
+lv_obj_clear_flag( ui_Button12, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
+
+ui_Label18 = lv_label_create(ui_Button12);
+lv_obj_set_width( ui_Label18, LV_SIZE_CONTENT);  /// 1
+lv_obj_set_height( ui_Label18, LV_SIZE_CONTENT);   /// 1
+lv_obj_set_align( ui_Label18, LV_ALIGN_CENTER );
+lv_label_set_text(ui_Label18,"-");
+
+ui_Spinbox3 = lv_spinbox_create(ui_SettingPanel);
+lv_obj_set_width( ui_Spinbox3, 37);
+lv_obj_set_height( ui_Spinbox3, 28);
+lv_obj_set_x( ui_Spinbox3, 216 );
+lv_obj_set_y( ui_Spinbox3, 84 );
+lv_spinbox_set_digit_format( ui_Spinbox3, 2, 2);
+lv_spinbox_set_range( ui_Spinbox3, 1,25 );
+lv_spinbox_set_cursor_pos(ui_Spinbox3, 1 - 1);
+lv_obj_set_style_pad_top(ui_Spinbox3, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
+lv_obj_set_style_pad_bottom(ui_Spinbox3, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+ui_Button13 = lv_btn_create(ui_SettingPanel);
+lv_obj_set_width( ui_Button13, 16);
+lv_obj_set_height( ui_Button13, 28);
+lv_obj_set_x( ui_Button13, 255 );
+lv_obj_set_y( ui_Button13, 84 );
+lv_obj_add_flag( ui_Button13, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
+lv_obj_clear_flag( ui_Button13, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
+
+ui_Label19 = lv_label_create(ui_Button13);
+lv_obj_set_width( ui_Label19, LV_SIZE_CONTENT);  /// 1
+lv_obj_set_height( ui_Label19, LV_SIZE_CONTENT);   /// 1
+lv_obj_set_align( ui_Label19, LV_ALIGN_CENTER );
+lv_label_set_text(ui_Label19,"+");
+
+ui_Button4 = lv_btn_create(ui_SettingPanel);
+lv_obj_set_width( ui_Button4, 160);
+lv_obj_set_height( ui_Button4, 28);
+lv_obj_set_x( ui_Button4, 72 );
+lv_obj_set_y( ui_Button4, 116 );
+lv_obj_add_flag( ui_Button4, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
+lv_obj_clear_flag( ui_Button4, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
+
+ui_Label5 = lv_label_create(ui_Button4);
+lv_obj_set_width( ui_Label5, LV_SIZE_CONTENT);  /// 1
+lv_obj_set_height( ui_Label5, LV_SIZE_CONTENT);   /// 1
+lv_obj_set_align( ui_Label5, LV_ALIGN_CENTER );
+lv_label_set_text(ui_Label5,"変更する");
+
+ui_Back = lv_btn_create(ui_Setting);
+lv_obj_set_width( ui_Back, 50);
+lv_obj_set_height( ui_Back, 24);
+lv_obj_set_x( ui_Back, 6 );
+lv_obj_set_y( ui_Back, 6 );
+lv_obj_add_state( ui_Back, LV_STATE_EDITED );     /// States
+lv_obj_add_flag( ui_Back, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
+lv_obj_clear_flag( ui_Back, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
+lv_obj_set_style_bg_color(ui_Back, lv_color_hex(0x5C5C5C), LV_PART_MAIN | LV_STATE_EDITED );
+lv_obj_set_style_bg_opa(ui_Back, 255, LV_PART_MAIN| LV_STATE_EDITED);
+
+ui_Label8 = lv_label_create(ui_Back);
+lv_obj_set_width( ui_Label8, LV_SIZE_CONTENT);  /// 1
+lv_obj_set_height( ui_Label8, LV_SIZE_CONTENT);   /// 1
+lv_obj_set_align( ui_Label8, LV_ALIGN_CENTER );
+lv_label_set_text(ui_Label8,"戻る");
+
+// ★2026-09-11: Time/ログ転送/ゼロ調を、パネルの下に横並びの3ボタンとして再配置
+ui_btnOpenSetTime = lv_btn_create(ui_Setting);
+lv_obj_set_width( ui_btnOpenSetTime, 96);
+lv_obj_set_height( ui_btnOpenSetTime, 28);
+lv_obj_set_x( ui_btnOpenSetTime, 8 );
+lv_obj_set_y( ui_btnOpenSetTime, 206 );
+lv_obj_add_flag( ui_btnOpenSetTime, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
+lv_obj_clear_flag( ui_btnOpenSetTime, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
+
+ui_btnOpenSetTimeLbl = lv_label_create(ui_btnOpenSetTime);
+lv_obj_set_width( ui_btnOpenSetTimeLbl, LV_SIZE_CONTENT);  /// 1
+lv_obj_set_height( ui_btnOpenSetTimeLbl, LV_SIZE_CONTENT);   /// 1
+lv_obj_set_align( ui_btnOpenSetTimeLbl, LV_ALIGN_CENTER );
+lv_label_set_text(ui_btnOpenSetTimeLbl,"時刻設定");
 
 ui_Dump = lv_btn_create(ui_Setting);
-lv_obj_set_width( ui_Dump, 100);
-lv_obj_set_height( ui_Dump, 25);
-lv_obj_set_x( ui_Dump, -75 );
-lv_obj_set_y( ui_Dump, 93 );
-lv_obj_set_align( ui_Dump, LV_ALIGN_CENTER );
+lv_obj_set_width( ui_Dump, 96);
+lv_obj_set_height( ui_Dump, 28);
+lv_obj_set_x( ui_Dump, 112 );
+lv_obj_set_y( ui_Dump, 206 );
 lv_obj_add_state( ui_Dump, LV_STATE_USER_1 );     /// States
 lv_obj_add_flag( ui_Dump, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
 lv_obj_clear_flag( ui_Dump, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
-lv_obj_set_style_bg_color(ui_Dump, lv_color_hex(0x188C6F), LV_PART_MAIN | LV_STATE_USER_1 );
+lv_obj_set_style_bg_color(ui_Dump, lv_color_hex(0xD9822B), LV_PART_MAIN | LV_STATE_USER_1 );
 lv_obj_set_style_bg_opa(ui_Dump, 255, LV_PART_MAIN| LV_STATE_USER_1);
 lv_obj_set_style_bg_img_recolor(ui_Dump, lv_color_hex(0x5DFF40), LV_PART_MAIN| LV_STATE_USER_1);
 lv_obj_set_style_bg_img_recolor_opa(ui_Dump, 100, LV_PART_MAIN| LV_STATE_USER_1);
@@ -164,152 +327,24 @@ ui_Label15 = lv_label_create(ui_Dump);
 lv_obj_set_width( ui_Label15, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_Label15, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_align( ui_Label15, LV_ALIGN_CENTER );
-lv_label_set_text(ui_Label15,"Dump");
+lv_label_set_text(ui_Label15,"ログ転送");
 
-ui_Back = lv_btn_create(ui_Setting);
-lv_obj_set_width( ui_Back, 55);
-lv_obj_set_height( ui_Back, 27);
-lv_obj_set_x( ui_Back, 14 );
-lv_obj_set_y( ui_Back, 11 );
-lv_obj_add_state( ui_Back, LV_STATE_EDITED );     /// States
-lv_obj_add_flag( ui_Back, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
-lv_obj_clear_flag( ui_Back, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
-lv_obj_set_style_bg_color(ui_Back, lv_color_hex(0x5C5C5C), LV_PART_MAIN | LV_STATE_EDITED );
-lv_obj_set_style_bg_opa(ui_Back, 255, LV_PART_MAIN| LV_STATE_EDITED);
+ui_Button5 = lv_btn_create(ui_Setting);
+lv_obj_set_width( ui_Button5, 96);
+lv_obj_set_height( ui_Button5, 28);
+lv_obj_set_x( ui_Button5, 216 );
+lv_obj_set_y( ui_Button5, 206 );
+lv_obj_add_state( ui_Button5, LV_STATE_USER_1 );     /// States
+lv_obj_add_flag( ui_Button5, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
+lv_obj_clear_flag( ui_Button5, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
+lv_obj_set_style_bg_color(ui_Button5, lv_color_hex(0xD9822B), LV_PART_MAIN | LV_STATE_USER_1 );
+lv_obj_set_style_bg_opa(ui_Button5, 255, LV_PART_MAIN| LV_STATE_USER_1);
 
-ui_Label8 = lv_label_create(ui_Back);
-lv_obj_set_width( ui_Label8, LV_SIZE_CONTENT);  /// 1
-lv_obj_set_height( ui_Label8, LV_SIZE_CONTENT);   /// 1
-lv_obj_set_align( ui_Label8, LV_ALIGN_CENTER );
-lv_label_set_text(ui_Label8,"Back");
-
-ui_Button4 = lv_btn_create(ui_Setting);
-lv_obj_set_width( ui_Button4, 236);
-lv_obj_set_height( ui_Button4, 28);
-lv_obj_set_x( ui_Button4, -5 );
-lv_obj_set_y( ui_Button4, 36 );
-lv_obj_set_align( ui_Button4, LV_ALIGN_CENTER );
-lv_obj_add_flag( ui_Button4, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
-lv_obj_clear_flag( ui_Button4, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
-
-ui_Label5 = lv_label_create(ui_Button4);
-lv_obj_set_width( ui_Label5, LV_SIZE_CONTENT);  /// 1
-lv_obj_set_height( ui_Label5, LV_SIZE_CONTENT);   /// 1
-lv_obj_set_align( ui_Label5, LV_ALIGN_CENTER );
-lv_label_set_text(ui_Label5,"Apply");
-
-ui_Spinbox1 = lv_spinbox_create(ui_Setting);
-lv_obj_set_width( ui_Spinbox1, 68);
-lv_obj_set_height( ui_Spinbox1, 33);
-lv_obj_set_x( ui_Spinbox1, -76 );
-lv_obj_set_y( ui_Spinbox1, -27 );
-lv_obj_set_align( ui_Spinbox1, LV_ALIGN_CENTER );
-lv_spinbox_set_digit_format( ui_Spinbox1, 2, 2);
-lv_spinbox_set_range( ui_Spinbox1, 1,1440 );
-lv_spinbox_set_cursor_pos(ui_Spinbox1, 1 - 1);
-
-ui_Button9 = lv_btn_create(ui_Setting);
-lv_obj_set_width( ui_Button9, 14);
-lv_obj_set_height( ui_Button9, 22);
-lv_obj_set_x( ui_Button9, 37 );
-lv_obj_set_y( ui_Button9, -59 );
-lv_obj_set_align( ui_Button9, LV_ALIGN_CENTER );
-lv_obj_add_flag( ui_Button9, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
-lv_obj_clear_flag( ui_Button9, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
-
-ui_Label4 = lv_label_create(ui_Button9);
-lv_obj_set_width( ui_Label4, LV_SIZE_CONTENT);  /// 1
-lv_obj_set_height( ui_Label4, LV_SIZE_CONTENT);   /// 1
-lv_obj_set_align( ui_Label4, LV_ALIGN_CENTER );
-lv_label_set_text(ui_Label4,"-");
-
-ui_Button10 = lv_btn_create(ui_Setting);
-lv_obj_set_width( ui_Button10, 16);
-lv_obj_set_height( ui_Button10, 24);
-lv_obj_set_x( ui_Button10, 96 );
-lv_obj_set_y( ui_Button10, -59 );
-lv_obj_set_align( ui_Button10, LV_ALIGN_CENTER );
-lv_obj_add_flag( ui_Button10, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
-lv_obj_clear_flag( ui_Button10, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
-
-ui_Label16 = lv_label_create(ui_Button10);
-lv_obj_set_width( ui_Label16, LV_SIZE_CONTENT);  /// 1
-lv_obj_set_height( ui_Label16, LV_SIZE_CONTENT);   /// 1
-lv_obj_set_align( ui_Label16, LV_ALIGN_CENTER );
-lv_label_set_text(ui_Label16,"+");
-
-ui_Spinbox2 = lv_spinbox_create(ui_Setting);
-lv_obj_set_width( ui_Spinbox2, 40);
-lv_obj_set_height( ui_Spinbox2, 33);
-lv_obj_set_x( ui_Spinbox2, 67 );
-lv_obj_set_y( ui_Spinbox2, -59 );
-lv_obj_set_align( ui_Spinbox2, LV_ALIGN_CENTER );
-lv_spinbox_set_digit_format( ui_Spinbox2, 2, 2);
-lv_spinbox_set_range( ui_Spinbox2, 0,7200 );
-lv_spinbox_set_cursor_pos(ui_Spinbox2, 1 - 1);
-
-ui_Button12 = lv_btn_create(ui_Setting);
-lv_obj_set_width( ui_Button12, 15);
-lv_obj_set_height( ui_Button12, 22);
-lv_obj_set_x( ui_Button12, 35 );
-lv_obj_set_y( ui_Button12, -1 );
-lv_obj_set_align( ui_Button12, LV_ALIGN_CENTER );
-lv_obj_add_flag( ui_Button12, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
-lv_obj_clear_flag( ui_Button12, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
-
-ui_Label18 = lv_label_create(ui_Button12);
-lv_obj_set_width( ui_Label18, LV_SIZE_CONTENT);  /// 1
-lv_obj_set_height( ui_Label18, LV_SIZE_CONTENT);   /// 1
-lv_obj_set_align( ui_Label18, LV_ALIGN_CENTER );
-lv_label_set_text(ui_Label18,"-");
-
-ui_Spinbox3 = lv_spinbox_create(ui_Setting);
-lv_obj_set_width( ui_Spinbox3, 37);
-lv_obj_set_height( ui_Spinbox3, 33);
-lv_obj_set_x( ui_Spinbox3, 65 );
-lv_obj_set_y( ui_Spinbox3, -2 );
-lv_obj_set_align( ui_Spinbox3, LV_ALIGN_CENTER );
-lv_spinbox_set_digit_format( ui_Spinbox3, 2, 2);
-lv_spinbox_set_range( ui_Spinbox3, 0,7200 );
-lv_spinbox_set_cursor_pos(ui_Spinbox3, 1 - 1);
-
-ui_Button13 = lv_btn_create(ui_Setting);
-lv_obj_set_width( ui_Button13, 15);
-lv_obj_set_height( ui_Button13, 24);
-lv_obj_set_x( ui_Button13, 94 );
-lv_obj_set_y( ui_Button13, -1 );
-lv_obj_set_align( ui_Button13, LV_ALIGN_CENTER );
-lv_obj_add_flag( ui_Button13, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
-lv_obj_clear_flag( ui_Button13, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
-
-ui_Label19 = lv_label_create(ui_Button13);
-lv_obj_set_width( ui_Label19, LV_SIZE_CONTENT);  /// 1
-lv_obj_set_height( ui_Label19, LV_SIZE_CONTENT);   /// 1
-lv_obj_set_align( ui_Label19, LV_ALIGN_CENTER );
-lv_label_set_text(ui_Label19,"+");
-
-ui_Button7 = lv_btn_create(ui_Setting);
-lv_obj_set_width( ui_Button7, 15);
-lv_obj_set_height( ui_Button7, 25);
-lv_obj_set_x( ui_Button7, -121 );
-lv_obj_set_y( ui_Button7, -27 );
-lv_obj_set_align( ui_Button7, LV_ALIGN_CENTER );
-lv_obj_add_flag( ui_Button7, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
-lv_obj_clear_flag( ui_Button7, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
-
-ui_Label9 = lv_label_create(ui_Button7);
-lv_obj_set_width( ui_Label9, LV_SIZE_CONTENT);  /// 1
-lv_obj_set_height( ui_Label9, LV_SIZE_CONTENT);   /// 1
-lv_obj_set_align( ui_Label9, LV_ALIGN_CENTER );
-lv_label_set_text(ui_Label9,"-");
-
-ui_Interval1 = lv_label_create(ui_Setting);
-lv_obj_set_width( ui_Interval1, LV_SIZE_CONTENT);  /// 1
-lv_obj_set_height( ui_Interval1, LV_SIZE_CONTENT);   /// 1
-lv_obj_set_x( ui_Interval1, 66 );
-lv_obj_set_y( ui_Interval1, -28 );
-lv_obj_set_align( ui_Interval1, LV_ALIGN_CENTER );
-lv_label_set_text(ui_Interval1,"Median:--times");
+ui_Label6 = lv_label_create(ui_Button5);
+lv_obj_set_width( ui_Label6, LV_SIZE_CONTENT);  /// 1
+lv_obj_set_height( ui_Label6, LV_SIZE_CONTENT);   /// 1
+lv_obj_set_align( ui_Label6, LV_ALIGN_CENTER );
+lv_label_set_text(ui_Label6,"ゼロ調");
 
 lv_obj_add_event_cb(ui_Button5, ui_event_Button5, LV_EVENT_ALL, NULL);
 lv_obj_add_event_cb(ui_Button8, ui_event_Button8, LV_EVENT_ALL, NULL);
@@ -321,6 +356,7 @@ lv_obj_add_event_cb(ui_Button10, ui_event_Button10, LV_EVENT_ALL, NULL);
 lv_obj_add_event_cb(ui_Button12, ui_event_Button12, LV_EVENT_ALL, NULL);
 lv_obj_add_event_cb(ui_Button13, ui_event_Button13, LV_EVENT_ALL, NULL);
 lv_obj_add_event_cb(ui_Button7, ui_event_Button7, LV_EVENT_ALL, NULL);
+lv_obj_add_event_cb(ui_btnOpenSetTime, ui_event_btnOpenSetTime, LV_EVENT_ALL, NULL);
 
 }
 
@@ -330,6 +366,8 @@ void ui_Setting_screen_destroy(void)
 
 // NULL screen variables
 ui_Setting= NULL;
+ui_SettingTitle= NULL;
+ui_SettingPanel= NULL;
 ui_sleepDisplay= NULL;
 ui_Button5= NULL;
 ui_Label6= NULL;
@@ -356,5 +394,7 @@ ui_Label19= NULL;
 ui_Button7= NULL;
 ui_Label9= NULL;
 ui_Interval1= NULL;
+ui_btnOpenSetTime= NULL;
+ui_btnOpenSetTimeLbl= NULL;
 
 }

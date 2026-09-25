@@ -37,6 +37,14 @@ lv_obj_set_x( ui_Dropdown1, 0 );
 lv_obj_set_y( ui_Dropdown1, -33 );
 lv_obj_set_align( ui_Dropdown1, LV_ALIGN_CENTER );
 lv_obj_add_flag( ui_Dropdown1, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
+// ★2026-09-12: LV_FONT_DEFAULTはlv_conf.hでavl_jp_14（日本語サブセットフォント）に
+// 差し替え済みだが、このフォントにはLVGL標準の開閉矢印シンボル(LV_SYMBOL_DOWN)の
+// グリフが含まれていない。一度は組み込みフォント(lv_font_montserrat_14)へ差し替えて
+// 試したが、そちらは逆に日本語グリフを一切持たないため、プレースホルダー
+// 「デバイスが見つかりません」等が全て文字化けする回帰を起こした（実機で確認）。
+// ドロップダウンの矢印記号とテキストは同じフォント・同じ描画で扱われ分離できないため、
+// フォントの差し替えではなく、矢印記号自体をこのフォントに含まれるASCII文字に置き換える。
+lv_dropdown_set_symbol(ui_Dropdown1, "v");
 
 ui_Button2 = lv_btn_create(ui_DviceList);
 lv_obj_set_width( ui_Button2, 100);
@@ -53,7 +61,7 @@ ui_Label3 = lv_label_create(ui_Button2);
 lv_obj_set_width( ui_Label3, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_Label3, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_align( ui_Label3, LV_ALIGN_CENTER );
-lv_label_set_text(ui_Label3,"Connect");
+lv_label_set_text(ui_Label3,"接続");
 
 ui_Button3 = lv_btn_create(ui_DviceList);
 lv_obj_set_width( ui_Button3, 100);
@@ -70,7 +78,7 @@ ui_Label2 = lv_label_create(ui_Button3);
 lv_obj_set_width( ui_Label2, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_Label2, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_align( ui_Label2, LV_ALIGN_CENTER );
-lv_label_set_text(ui_Label2,"Re-scan");
+lv_label_set_text(ui_Label2,"再スキャン");
 
 lv_obj_add_event_cb(ui_Button2, ui_event_Button2, LV_EVENT_ALL, NULL);
 lv_obj_add_event_cb(ui_Button3, ui_event_Button3, LV_EVENT_ALL, NULL);

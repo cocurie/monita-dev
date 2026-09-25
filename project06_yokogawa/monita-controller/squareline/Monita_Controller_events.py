@@ -42,3 +42,15 @@ def on_stop_clicked(event_struct):
 def on_settings_clicked(event_struct):
     return
 
+
+def on_open_settime_clicked(event_struct):
+    return
+
+
+def on_settime_back_clicked(event_struct):
+    return
+
+
+def on_settime_apply_clicked(event_struct):
+    return
+

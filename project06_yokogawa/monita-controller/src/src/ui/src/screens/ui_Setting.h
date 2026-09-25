@@ -50,6 +50,9 @@ extern void ui_event_Button7( lv_event_t * e);
 extern lv_obj_t *ui_Button7;
 extern lv_obj_t *ui_Label9;
 extern lv_obj_t *ui_Interval1;
+extern void ui_event_btnOpenSetTime( lv_event_t * e);
+extern lv_obj_t *ui_btnOpenSetTime;
+extern lv_obj_t *ui_btnOpenSetTimeLbl;
 // CUSTOM VARIABLES
 
 #ifdef __cplusplus

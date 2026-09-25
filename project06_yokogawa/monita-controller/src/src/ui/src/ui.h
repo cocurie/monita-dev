@@ -20,6 +20,7 @@ extern "C" {
 #include "screens/ui_DviceList.h"
 #include "screens/ui_Setting.h"
 #include "screens/ui_Mesure.h"
+#include "screens/ui_SetTime.h"
 
 ///////////////////// VARIABLES ////////////////////
 

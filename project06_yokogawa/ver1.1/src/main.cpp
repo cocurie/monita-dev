@@ -50,7 +50,7 @@
 // ---- 計測間隔・平均化のデフォルト値 ----
 // 実際に使う値は起動時にNVSから読み込む（NVSに保存が無い初回のみ、この値を使う）。
 // 計測間隔は分単位で管理する（秒単位の細かい制御は運用上不要なため）。
-static const uint32_t MEASURE_INTERVAL_MIN_DEFAULT = 1;  // 計測間隔（分）
+static const uint32_t MEASURE_INTERVAL_MIN_DEFAULT = 0.5;  // 計測間隔（分）
 static const uint8_t  AVG_N_DEFAULT = 5;   // 1回の測定あたりの平均サンプル数
 static const uint8_t  AVG_M_DEFAULT = 5;   // 平均値をM回とり、その中央値(メジアン)を採用
 
@@ -93,7 +93,7 @@ static const ChannelType CH_TYPE[5] = {
 // （2Vでは内部PGAのゲイン圧縮により不安定だったため。詳細: test_results/CH1_strain_test_2V_20260804.md）。
 // 係数1110は3V実測（印加200〜1000µε）でほぼ1:1・誤差1〜2%程度を確認済み（2026/08/04）。
 // offset[ch] はチャンネルごとのゼロ点補正値。デフォルト0、TAREコマンドで更新しNVSに保存する。
-static constexpr float STRAIN_DISP_COEFF = 1110.0f;
+static constexpr float STRAIN_DISP_COEFF = 684.0f;
 
 // ---- SDカード ----
 #define SD_LOG_ENABLED_DEFAULT true   // 起動時デフォルトでSD保存を有効にする
@@ -162,8 +162,30 @@ static const size_t   DUMP_CHUNK_SIZE   = 180;  // BLE_PREFERRED_MTU-3 以下に
 #define SD_MOSI       D10
 #define SD_CS         D7
 
+// ver1.2: E+励起電圧ライン（2V）のON/OFFスイッチ用MOSFET(2SJ496)のGate駆動ピン。
+// 回路: 3V3→1N5818→2SJ496(P-ch, Gate=D3, R7でSourceへプルアップ)→MCP1700(2V)→E+バス(CH1-5)
+// Pチャネルのため active-low：D3=LOWでON、D3=HIGH(またはHi-Z)でOFF（R7プルアップによりデフォルトOFF）
+#define EPLUS_SW_PIN  D3
+
 // MUX切替後、HX711読み出し開始までの待ち時間（接触不良/信号なまり対策で調整）
 static const uint16_t MUX_SETTLE_MS = 50;
+
+// E+をONにしてから計測を始めるまでの待ち時間（MCP1700の起動・ブリッジ電流の安定待ち）
+static const uint16_t EPLUS_SETTLE_MS = 30;
+
+static bool g_eplus_on = false;
+
+static void eplusOn() {
+    if (g_eplus_on) return;
+    digitalWrite(EPLUS_SW_PIN, LOW);   // Gate=LOW → Pチャネル ON
+    delay(EPLUS_SETTLE_MS);
+    g_eplus_on = true;
+}
+
+static void eplusOff() {
+    digitalWrite(EPLUS_SW_PIN, HIGH);  // Gate=HIGH → OFF（R7プルアップと合わせデフォルトOFFにもなる）
+    g_eplus_on = false;
+}
 
 // ============================================================================
 // 実行時設定（NVS永続化） — 計測間隔・平均化回数・デバイスID・チャンネルオフセット
@@ -221,17 +243,20 @@ static bool mcpInit() {
 }
 
 // ch(0〜4) → 74HC4051物理ピン: 0=Y0(pin13) 1=Y1(pin14) 2=Y2(pin15) 3=Y3(pin12) 4=Y4(pin1)
+//
+// 実配線（ver1.2 PCBネットリストで確認、2026/08/10）: GP0→S0, GP1→S1, GP2→S2（クロスなし直結）。
+// 以前はブレッドボード実測を根拠にGP2→S0/GP0→S2という逆順で書いていたが、これはブレッドボードの
+// 手配線とPCBの配線が異なっていたため。逆順のままだとchの3bitが反転されて伝わり、
+// ch=1↔4(CH2⇔CH5)が入れ替わって見え、ch=3(CH4)は未接続のY6が選ばれてしまい常に無応答になっていた。
 static bool muxSelect(uint8_t ch) {
-    uint8_t val = ((ch & 0x01) << 2)   // S0(bit0)→GP2
-                | ((ch & 0x02) << 0)   // S1(bit1)→GP1
-                | ((ch & 0x04) >> 2);  // S2(bit2)→GP0
+    uint8_t val = ch & 0x07;  // bit0(S0)→GP0, bit1(S1)→GP1, bit2(S2)→GP2 のみでよい
     return mcpWrite(MCP_GPIO, val);
 }
 
 // CH番号(0=CH1〜4=CH5) → MUX ch(0〜4) の対応表。
-// 実配線でCH2/CH5が入れ替わっていたため、ソフト側でスワップして吸収している
-// （2026/08/04、ひずみ発生装置での実測で判明。CH2⇔CH5の物理配線は未修正）。
-static const uint8_t CH_TO_MUX[5] = { 0, 4, 2, 3, 1 };  // CH1,CH2,CH3,CH4,CH5
+// muxSelect()のビット順バグを補正するための入れ替えだったため、バグ修正に伴い恒等対応に戻した
+// （2026/08/10）。
+static const uint8_t CH_TO_MUX[5] = { 0, 1, 2, 3, 4 };  // CH1,CH2,CH3,CH4,CH5
 
 // ============================================================================
 // HX711 — ビットバング読み出し（全CH共通 PD_SCK/DOUT、MUX選択後に呼ぶ）
@@ -499,6 +524,9 @@ struct Measurement {
 static Measurement measureAll() {
     Measurement m = {};
 
+    // E+（ブリッジ励起2V）はHX711計測中だけON。ブリッジ電流(120Ω負荷で十数mA)を
+    // 計測時以外は流さないことで消費電力を抑える。
+    eplusOn();
     for (uint8_t ch = 0; ch < 5; ch++) {
         muxSelect(CH_TO_MUX[ch]);
         delay(MUX_SETTLE_MS);
@@ -507,6 +535,7 @@ static Measurement measureAll() {
         m.hx_raw[ch]  = raw;
         m.hx_phys[ch] = m.hx_ok[ch] ? hx711ToPhysical(raw, ch) : NAN;
     }
+    eplusOff();
 
     if (g_mcp9600_addr) {
         float t = mcp9600ReadTemp(g_mcp9600_addr);
@@ -535,9 +564,11 @@ static Measurement measureAll() {
 
 // 現在のMUX位置のままチャンネルchを再計測し、その生値をゼロ点として記録する（TAREコマンド用）
 static float tareChannel(uint8_t ch) {
+    eplusOn();
     muxSelect(CH_TO_MUX[ch]);
     delay(MUX_SETTLE_MS);
     float raw = hx711ReadAveraged();
+    eplusOff();
     if (isnan(raw)) return NAN;
     g_ch_offset[ch] = raw;
     settingsSaveOffset(ch);
@@ -1019,6 +1050,10 @@ void setup() {
     pinMode(HX711_PD_SCK, OUTPUT);
     pinMode(HX711_DOUT, INPUT_PULLUP);
     digitalWrite(HX711_PD_SCK, LOW);
+
+    pinMode(EPLUS_SW_PIN, OUTPUT);
+    digitalWrite(EPLUS_SW_PIN, HIGH);  // 起動直後はE+ OFF（R7プルアップと合わせて安全側）
+    g_eplus_on = false;
 
     if (mcpInit()) Serial.println("[OK] MCP23008");
     else           Serial.println("[ERROR] MCP23008 初期化失敗");

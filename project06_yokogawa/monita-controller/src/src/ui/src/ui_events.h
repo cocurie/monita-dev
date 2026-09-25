@@ -21,6 +21,9 @@ void on_start_clicked(lv_event_t * e);
 void on_stop_clicked(lv_event_t * e);
 void on_disconnect_clicked(lv_event_t * e);
 void on_settings_clicked(lv_event_t * e);
+void on_open_settime_clicked(lv_event_t * e);
+void on_settime_apply_clicked(lv_event_t * e);
+void on_settime_back_clicked(lv_event_t * e);
 
 #ifdef __cplusplus
 } /*extern "C"*/

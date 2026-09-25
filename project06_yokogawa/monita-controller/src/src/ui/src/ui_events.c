@@ -60,3 +60,18 @@ void on_settings_clicked(lv_event_t * e)
 {
 	ble_open_settings();
 }
+
+void on_open_settime_clicked(lv_event_t * e)
+{
+	ble_open_settime();
+}
+
+void on_settime_apply_clicked(lv_event_t * e)
+{
+	ble_set_time();
+}
+
+void on_settime_back_clicked(lv_event_t * e)
+{
+	ble_back_to_setting();
+}

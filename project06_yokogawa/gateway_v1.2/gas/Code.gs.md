@@ -248,6 +248,32 @@ const GATEWAY_STATUS_HEADER = [
   'SIM名', 'CSQ', 'SDカード', '送信間隔(分)', '受信済み台数',
 ];
 
+// ★2026-09-12: 見出しだけでは意味が分かりにくい項目に、セルのメモとして簡単な説明を入れる。
+// getGatewayStatusSheet()が新規作成する時に自動で付与するほか、既存シートには
+// setupGatewayStatusHeaderNotesOnce()をApps Scriptエディタから手動実行して後付けできる。
+const GATEWAY_STATUS_NOTES = {
+  'XIAO ID': 'Gatewayに搭載されているマイコン(XIAO nRF52840)固有の識別番号。個体を区別するためのID',
+  'SIM IMEI': '通信モジュール(SIM7080G)固有の識別番号。端末を一意に識別する15桁の番号',
+  'SIM ICCID': 'SIMカード自体の固有番号。通信キャリア側でSIMを管理する際の識別番号',
+  'SIM名': '使用している通信キャリア／SIMプランの名称',
+  'CSQ': '電波強度の指標。0〜31の数値で大きいほど電波が強い（目安: 10以下=弱い、15〜20=普通、20以上=良好、99=圏外）',
+  'SDカード': 'SDカードが認識されているか（1=あり、0=なし）',
+  '受信済み台数': 'この起動確認を送った時点で、Gatewayが受信済み（未送信でキャッシュ中）だった子機の台数',
+};
+
+function applyGatewayStatusHeaderNotes(sheet) {
+  for (var i = 0; i < GATEWAY_STATUS_HEADER.length; i++) {
+    var note = GATEWAY_STATUS_NOTES[GATEWAY_STATUS_HEADER[i]];
+    if (note) sheet.getRange(1, i + 1).setNote(note);
+  }
+}
+
+// 既存の「Gateway状態」シートに説明メモを後付けしたいときだけ、Apps Scriptエディタの
+// 関数選択で本関数を選び、手動実行する（実行後は不要）。
+function setupGatewayStatusHeaderNotesOnce() {
+  applyGatewayStatusHeaderNotes(getGatewayStatusSheet());
+}
+
 function getSpreadsheet() {
   return SpreadsheetApp.openById(SPREADSHEET_ID);
 }
@@ -269,6 +295,7 @@ function getGatewayStatusSheet() {
   if (!sheet) {
     sheet = ss.insertSheet(GATEWAY_STATUS_SHEET_NAME);
     sheet.appendRow(GATEWAY_STATUS_HEADER);
+    applyGatewayStatusHeaderNotes(sheet);
   }
   return sheet;
 }

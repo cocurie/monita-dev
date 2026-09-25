@@ -6,7 +6,7 @@
 #include "../ui.h"
 
 lv_obj_t *uic_stop;
-lv_obj_t *ui_Mesure = NULL;lv_obj_t *ui_CH1 = NULL;lv_obj_t *ui_CH2 = NULL;lv_obj_t *ui_CH3 = NULL;lv_obj_t *ui_CH4 = NULL;lv_obj_t *ui_CH5 = NULL;lv_obj_t *ui_CH6 = NULL;lv_obj_t *ui_CH7 = NULL;lv_obj_t *ui_CH8 = NULL;lv_obj_t *ui_start = NULL;lv_obj_t *ui_Label12 = NULL;lv_obj_t *ui_stop = NULL;lv_obj_t *ui_Label13 = NULL;lv_obj_t *ui_timestamp = NULL;lv_obj_t *ui_discnnect = NULL;lv_obj_t *ui_Label14 = NULL;lv_obj_t *ui_discnnect1 = NULL;lv_obj_t *ui_settingBotton = NULL;lv_obj_t *ui_Label11 = NULL;
+lv_obj_t *ui_Mesure = NULL;lv_obj_t *ui_MesureTitle = NULL;lv_obj_t *ui_CH1 = NULL;lv_obj_t *ui_CH2 = NULL;lv_obj_t *ui_CH3 = NULL;lv_obj_t *ui_CH4 = NULL;lv_obj_t *ui_CH5 = NULL;lv_obj_t *ui_CH6 = NULL;lv_obj_t *ui_CH7 = NULL;lv_obj_t *ui_CH8 = NULL;lv_obj_t *ui_start = NULL;lv_obj_t *ui_Label12 = NULL;lv_obj_t *ui_stop = NULL;lv_obj_t *ui_Label13 = NULL;lv_obj_t *ui_timestamp = NULL;lv_obj_t *ui_discnnect = NULL;lv_obj_t *ui_Label14 = NULL;lv_obj_t *ui_discnnect1 = NULL;lv_obj_t *ui_settingBotton = NULL;lv_obj_t *ui_Label11 = NULL;
 // event funtions
 void ui_event_start( lv_event_t * e) {
     lv_event_code_t event_code = lv_event_get_code(e);
@@ -47,60 +47,67 @@ void ui_Mesure_screen_init(void)
 ui_Mesure = lv_obj_create(NULL);
 lv_obj_clear_flag( ui_Mesure, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
 
+ui_MesureTitle = lv_label_create(ui_Mesure);
+lv_obj_set_width( ui_MesureTitle, LV_SIZE_CONTENT);  /// 1
+lv_obj_set_height( ui_MesureTitle, LV_SIZE_CONTENT);   /// 1
+lv_obj_set_x( ui_MesureTitle, 120 );
+lv_obj_set_y( ui_MesureTitle, 6 );
+lv_label_set_text(ui_MesureTitle,"計測結果");
+
 ui_CH1 = lv_label_create(ui_Mesure);
 lv_obj_set_width( ui_CH1, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_CH1, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_x( ui_CH1, 33 );
-lv_obj_set_y( ui_CH1, 18 );
+lv_obj_set_y( ui_CH1, 26 );
 lv_label_set_text(ui_CH1,"CH1:--uS");
 
 ui_CH2 = lv_label_create(ui_Mesure);
 lv_obj_set_width( ui_CH2, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_CH2, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_x( ui_CH2, 33 );
-lv_obj_set_y( ui_CH2, 47 );
+lv_obj_set_y( ui_CH2, 55 );
 lv_label_set_text(ui_CH2,"CH2:--uS");
 
 ui_CH3 = lv_label_create(ui_Mesure);
 lv_obj_set_width( ui_CH3, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_CH3, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_x( ui_CH3, 33 );
-lv_obj_set_y( ui_CH3, 80 );
+lv_obj_set_y( ui_CH3, 88 );
 lv_label_set_text(ui_CH3,"CH3:--uS");
 
 ui_CH4 = lv_label_create(ui_Mesure);
 lv_obj_set_width( ui_CH4, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_CH4, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_x( ui_CH4, 33 );
-lv_obj_set_y( ui_CH4, 110 );
-lv_label_set_text(ui_CH4,"CH4:--mm");
+lv_obj_set_y( ui_CH4, 118 );
+lv_label_set_text(ui_CH4,"CH4:--uS");
 
 ui_CH5 = lv_label_create(ui_Mesure);
 lv_obj_set_width( ui_CH5, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_CH5, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_x( ui_CH5, 162 );
-lv_obj_set_y( ui_CH5, 17 );
-lv_label_set_text(ui_CH5,"CH5:--mm");
+lv_obj_set_y( ui_CH5, 25 );
+lv_label_set_text(ui_CH5,"CH5:--uS");
 
 ui_CH6 = lv_label_create(ui_Mesure);
 lv_obj_set_width( ui_CH6, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_CH6, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_x( ui_CH6, 162 );
-lv_obj_set_y( ui_CH6, 47 );
+lv_obj_set_y( ui_CH6, 55 );
 lv_label_set_text(ui_CH6,"CH6:-- temp");
 
 ui_CH7 = lv_label_create(ui_Mesure);
 lv_obj_set_width( ui_CH7, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_CH7, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_x( ui_CH7, 161 );
-lv_obj_set_y( ui_CH7, 80 );
+lv_obj_set_y( ui_CH7, 88 );
 lv_label_set_text(ui_CH7,"CH7:--V");
 
 ui_CH8 = lv_label_create(ui_Mesure);
 lv_obj_set_width( ui_CH8, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_CH8, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_x( ui_CH8, 161 );
-lv_obj_set_y( ui_CH8, 111 );
+lv_obj_set_y( ui_CH8, 119 );
 lv_label_set_text(ui_CH8,"CH8:--V");
 
 ui_start = lv_btn_create(ui_Mesure);
@@ -118,7 +125,7 @@ ui_Label12 = lv_label_create(ui_start);
 lv_obj_set_width( ui_Label12, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_Label12, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_align( ui_Label12, LV_ALIGN_CENTER );
-lv_label_set_text(ui_Label12,"Start");
+lv_label_set_text(ui_Label12,"開始");
 
 ui_stop = lv_btn_create(ui_Mesure);
 lv_obj_set_width( ui_stop, 99);
@@ -136,14 +143,16 @@ ui_Label13 = lv_label_create(ui_stop);
 lv_obj_set_width( ui_Label13, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_Label13, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_align( ui_Label13, LV_ALIGN_CENTER );
-lv_label_set_text(ui_Label13,"Stop");
+lv_label_set_text(ui_Label13,"停止");
 
 ui_timestamp = lv_label_create(ui_Mesure);
 lv_obj_set_width( ui_timestamp, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_timestamp, LV_SIZE_CONTENT);   /// 1
-lv_obj_set_x( ui_timestamp, 34 );
+// ★2026-09-13: 「計測時刻: YYYY-MM-DD HH:MM:SS (999秒前)」まで表示すると
+// x=34起点では画面右端(320px)を超えて右側が切れてしまうため、左に寄せる。
+lv_obj_set_x( ui_timestamp, 4 );
 lv_obj_set_y( ui_timestamp, 145 );
-lv_label_set_text(ui_timestamp,"timestamp:--");
+lv_label_set_text(ui_timestamp,"最新計測時刻:--");
 
 ui_discnnect = lv_btn_create(ui_Mesure);
 lv_obj_set_width( ui_discnnect, 100);
@@ -153,12 +162,14 @@ lv_obj_set_y( ui_discnnect, 99 );
 lv_obj_set_align( ui_discnnect, LV_ALIGN_CENTER );
 lv_obj_add_flag( ui_discnnect, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
 lv_obj_clear_flag( ui_discnnect, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
+lv_obj_set_style_bg_color(ui_discnnect, lv_color_hex(0xD9534F), LV_PART_MAIN | LV_STATE_DEFAULT );
+lv_obj_set_style_bg_opa(ui_discnnect, 255, LV_PART_MAIN| LV_STATE_DEFAULT);
 
 ui_Label14 = lv_label_create(ui_discnnect);
 lv_obj_set_width( ui_Label14, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_Label14, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_align( ui_Label14, LV_ALIGN_CENTER );
-lv_label_set_text(ui_Label14,"Disconnect");
+lv_label_set_text(ui_Label14,"BLE切断");
 
 ui_discnnect1 = lv_btn_create(ui_Mesure);
 lv_obj_set_width( ui_discnnect1, 97);
@@ -179,14 +190,14 @@ ui_settingBotton = lv_label_create(ui_discnnect1);
 lv_obj_set_width( ui_settingBotton, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_settingBotton, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_align( ui_settingBotton, LV_ALIGN_CENTER );
-lv_label_set_text(ui_settingBotton,"Setting");
+lv_label_set_text(ui_settingBotton,"設定");
 
 ui_Label11 = lv_label_create(ui_Mesure);
 lv_obj_set_width( ui_Label11, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_Label11, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_x( ui_Label11, 133 );
 lv_obj_set_y( ui_Label11, 176 );
-lv_label_set_text(ui_Label11,"Status: --");
+lv_label_set_text(ui_Label11,"現在の状況：--");
 
 lv_obj_add_event_cb(ui_start, ui_event_start, LV_EVENT_ALL, NULL);
 lv_obj_add_event_cb(ui_stop, ui_event_stop, LV_EVENT_ALL, NULL);
@@ -202,6 +213,7 @@ void ui_Mesure_screen_destroy(void)
 
 // NULL screen variables
 ui_Mesure= NULL;
+ui_MesureTitle= NULL;
 ui_CH1= NULL;
 ui_CH2= NULL;
 ui_CH3= NULL;

@@ -69,7 +69,7 @@ static const uint32_t MEASURE_INTERVAL_MIN_DEFAULT = 5;  // 計測間隔（分�
 static const uint8_t  AVG_N_DEFAULT = 5;   // 1回の測定あたりの平均サンプル数
 static const uint8_t  AVG_M_DEFAULT = 5;   // 平均値をM回とり、その中央値(メジアン)を採用
 
-static const uint32_t INTERVAL_MIN_MIN = 5;      // 最短1分
+static const uint32_t INTERVAL_MIN_MIN = 5;      // 最短5分
 static const uint32_t INTERVAL_MIN_MAX = 1440;   // 最長24時間
 static const uint8_t  AVG_N_MIN = 1, AVG_N_MAX = 50;
 static const uint8_t  AVG_M_MIN = 1, AVG_M_MAX = 25;  // g_hxSamples[] のサイズと連動
@@ -106,9 +106,18 @@ static const ChannelType CH_TYPE[5] = {
 //
 // HX711 VCC=3V（規定動作範囲2.6〜5.5V内）で運用。2Vはレギュレーターを介さず3Vに戻した
 // （2Vでは内部PGAのゲイン圧縮により不安定だったため。詳細: test_results/CH1_strain_test_2V_20260804.md）。
-// 係数1110は3V実測（印加200〜1000µε）でほぼ1:1・誤差1〜2%程度を確認済み（2026/08/04）。
 // offset[ch] はチャンネルごとのゼロ点補正値。デフォルト0、TAREコマンドで更新しNVSに保存する。
-static constexpr float STRAIN_DISP_COEFF = 684.0f;
+//
+// ★2026-09-15: 納品機0001基板でのひずみ発生装置による実測（100〜5000µε、CH1・2・4・5）で、
+// 684だと全域で一貫して約-1.0〜-1.2%低く出ることを確認。CH1・2・4・5は684×0.989≈676〜677に
+// 綺麗に収束したため、676へ変更した。CH3のみ約-2.1%（最適値は約669〜670）と他chより
+// 明確に外れているが、再測定でも再現した安定した個体差（センサーのゲージファクターばらつき
+// の範囲内）であり、故障・配線ミスの兆候ではない。CH1〜5は本定数を共有しているため、
+// 676への変更でCH3の誤差は-2.1%→-0.9%程度まで改善するが完全には解消しない
+// （詳細: 02_案件/project06_yokogawa/260915_ver1.3_納品機_動作検証記録.md）。
+// この定数は全ビルド共通（デバイスごとの個別値は持てない）ため、他基板（0002等）に
+// そのまま使う場合は同様の実機検証を別途行うこと。
+static constexpr float STRAIN_DISP_COEFF = 676.0f;
 
 // ---- SDカード ----
 #define SD_LOG_ENABLED_DEFAULT true   // 起動時デフォルトでSD保存を有効にする
@@ -1328,6 +1337,12 @@ static const uint16_t DOWNLINK_COMPANY_ID   = 0xC0DE;  // gateway_v1.2側と一�
 static const uint8_t  DOWNLINK_PKT_TYPE     = 0x81;
 static const uint8_t  DL_FLAG_TIME          = 1u << 0;
 static const uint32_t DOWNLINK_RX_WINDOW_MS = 2500;    // 送信直後、この時間だけ受信を待つ
+// ★2026-09-13: Gatewayが起動直後(初期設定完了後)に一定時間ブロードキャストする
+// 起動ビーコン(宛先DeviceID=0xFF)向け。子機はまだ自分のDeviceIDを知らせていない
+// 起動直後の段階でも、このIDへの一致だけで「自分宛」として受け取れるようにする。
+static const uint8_t  DOWNLINK_BROADCAST_DEVICE_ID = 0xFF;
+// 起動直後、最初の計測・送信を始める前にGatewayの起動ビーコンを待ち受ける時間。
+static const uint32_t BOOT_TIME_SYNC_LISTEN_MS = 10000;
 
 // 受信バイトを状態機械で処理し、フレーム(+RSSI)が完成するたびに中身を確認する。
 // windowMsが経過するまでポーリングを続ける（複数フレーム来ても最後まで処理する）。
@@ -1365,7 +1380,7 @@ static void loraTryReceiveDownlink(uint32_t windowMs) {
                         body[0] == (uint8_t)(DOWNLINK_COMPANY_ID >> 8) &&
                         body[1] == (uint8_t)(DOWNLINK_COMPANY_ID & 0xFF) &&
                         body[2] == DOWNLINK_PKT_TYPE &&
-                        body[3] == g_device_id) {
+                        (body[3] == g_device_id || body[3] == DOWNLINK_BROADCAST_DEVICE_ID)) {
                         uint8_t flags = body[4];
                         if (flags & DL_FLAG_TIME) {
                             uint16_t year = 2000 + body[5];
@@ -1646,6 +1661,18 @@ void setup() {
     Serial.println(g_sd_ok ? "[OK] SD カード" : "[WARN] SD カード 未検出");
 
     commInit();
+
+#if defined(COMM_USE_LORA)
+    // ★2026-09-13: 電源ON直後・最初の計測/送信を行う前に、Gatewayが起動直後2分間だけ
+    // 出す起動ビーコン(宛先DeviceID=0xFF、時刻同期)を短時間待ち受ける。
+    // これにより「Gateway起動→子機起動→アップリンク直後の同期」という従来の
+    // 流れでは間に合わなかった、電源投入後いちばん最初の計測分から正しい時刻を
+    // 使えるようにする(GatewayがAT通信中(s_atBusy)でビーコンを出せていない場合や
+    // ビーコン期間(2分)を過ぎてから子機を起動した場合は、従来通りアップリンク直後の
+    // 同期に委ねる。RTCはFIELD_BUILD_EPOCHで初期化済みなので受信できなくても問題ない)。
+    Serial.printf("[LORA] 起動ビーコン待受: %lu ms\n", (unsigned long)BOOT_TIME_SYNC_LISTEN_MS);
+    loraTryReceiveDownlink(BOOT_TIME_SYNC_LISTEN_MS);
+#endif
 
     debugPrintHelp();
 
